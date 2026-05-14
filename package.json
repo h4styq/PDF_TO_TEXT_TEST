@@ -1,0 +1,19 @@
+{
+  "name": "invoice-pdf-to-sheet",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google Apps Script: parse Russian invoices (УПД / счета-фактуры) from PDF files on Google Drive into a Google Spreadsheet",
+  "scripts": {
+    "lint": "eslint '**/*.gs'",
+    "lint:fix": "eslint '**/*.gs' --fix",
+    "push": "clasp push",
+    "pull": "clasp pull",
+    "open": "clasp open",
+    "logs": "clasp logs"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.4.2",
+    "eslint": "^8.57.0",
+    "eslint-plugin-googleappsscript": "^1.0.1"
+  }
+}
