@@ -190,11 +190,14 @@ function pdfToExtracted_(pdfFileId) {
   let docTable = null;
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
+  const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
+  const hasAnyExternal = hasGemini || hasOcr;
+  Logger.log('API-ключи: Gemini=' + (hasGemini ? 'да' : 'нет') + ', OCR.space=' + (hasOcr ? 'да' : 'нет'));
 
   if (quality.readable) {
     docTable = extractMainGoodsTableFromDoc_(body);
     const tableEmpty = !docTable || !docTable.rows || !docTable.rows.length;
-    if (tableEmpty && hasGemini) {
+    if (tableEmpty && hasAnyExternal) {
       Logger.log(
         'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
       );
@@ -213,6 +216,11 @@ function pdfToExtracted_(pdfFileId) {
           Logger.log('Подставлен текст из ' + improved.source + ' (таблица из Doc была пуста).');
         }
       }
+    } else if (tableEmpty && !hasAnyExternal) {
+      Logger.log(
+        'ВНИМАНИЕ: таблица товаров не найдена и нет API-ключей для внешнего распознавания. ' +
+        'Добавьте GEMINI_API_KEY и/или OCR_SPACE_API_KEY в Свойствах скрипта (Проект → Свойства проекта → Свойства скрипта).'
+      );
     }
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
@@ -286,22 +294,34 @@ function tryExternalTextExtraction_(pdfFileId) {
   const props = PropertiesService.getScriptProperties();
   const geminiKey = props.getProperty('GEMINI_API_KEY');
   if (geminiKey) {
+    Logger.log('Пробуем распознавание через Gemini (' + GEMINI_MODEL + ')…');
     const g = tryGeminiPdfExtract_(pdfFileId, geminiKey);
     if (g && g.text && g.text.length > 80) {
       const merged = mergeExternalExtractIntoPlainText_(g.text);
       if (analyzeDocTextQuality_(merged).readable || looksStructuredGemini_(g.text)) {
+        Logger.log('Gemini: получен читаемый текст (' + g.text.length + ' симв.).');
         return { text: g.text, source: 'gemini' };
       }
-      Logger.log('Gemini: ответ есть, но слабый по качеству — при наличии ключа пробуем OCR.space');
+      Logger.log('Gemini: ответ есть (' + g.text.length + ' симв.), но слабый по качеству — пробуем OCR.space');
+    } else {
+      Logger.log('Gemini: не удалось получить текст' + (g && g.text ? ' (слишком короткий: ' + g.text.length + ' симв.)' : '') + '.');
     }
+  } else {
+    Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
   }
   const ocrKey = props.getProperty('OCR_SPACE_API_KEY');
   if (ocrKey) {
+    Logger.log('Пробуем распознавание через OCR.space…');
     const o = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
     if (o && o.text && o.text.length > 40) {
+      Logger.log('OCR.space: получен текст (' + o.text.length + ' симв.).');
       return { text: o.text, source: 'ocr.space' };
     }
+    Logger.log('OCR.space: не удалось получить текст.');
+  } else {
+    Logger.log('OCR_SPACE_API_KEY не задан — пропускаем OCR.space.');
   }
+  Logger.log('Внешнее распознавание не дало результата.');
   return null;
 }
 
