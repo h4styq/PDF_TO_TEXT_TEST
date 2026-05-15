@@ -47,7 +47,9 @@ const GEMINI_TEXT_MAX_ATTEMPTS = 1;
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
 /** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
-const PAUSE_BETWEEN_PDF_MS = 25000;
+const PAUSE_BETWEEN_PDF_MS = 10000;
+/** Макс. строк товаров на один PDF после фильтрации (защита от «мусора» OCR). */
+const MAX_GOODS_ROWS_PER_PDF = 10;
 /**
  * Для PDF >1 МБ на бесплатном OCR.space: временно «доступ по ссылке» и запрос по URL Drive.
  * false — только загрузка файла (лимит ~1 МБ).
@@ -163,7 +165,8 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
         pack.docTable,
         pack.textLength,
         pack.conversionOk,
-        pack.conversionNote
+        pack.conversionNote,
+        pack.textSource
       );
       maxTableCols = Math.max(maxTableCols, parsed.tableWidth);
       rows.push({ fileName: file.getName(), fileId: file.getId(), parsed: parsed });
@@ -215,6 +218,7 @@ function pdfToExtracted_(pdfFileId) {
   let quality = analyzeDocTextQuality_(text);
   let docTable = null;
   let usedExternalApi = false;
+  let textSource = 'google-doc';
   let externalFailNote = '';
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
@@ -242,6 +246,7 @@ function pdfToExtracted_(pdfFileId) {
           } else {
             quality = q2;
           }
+          textSource = improved.source || 'external';
           Logger.log('Подставлен текст из ' + improved.source + ' (таблица из Doc была пуста).');
         }
       } else if (!improved) {
@@ -267,6 +272,7 @@ function pdfToExtracted_(pdfFileId) {
       } else {
         quality = q3;
       }
+      textSource = improved.source || 'external';
       Logger.log('После внешнего распознавания (' + improved.source + '): readable=' + quality.readable);
       docTable = null;
     } else {
@@ -285,6 +291,7 @@ function pdfToExtracted_(pdfFileId) {
     conversionOk: quality.readable,
     conversionNote: note,
     usedExternalApi: usedExternalApi,
+    textSource: textSource,
   };
 }
 
@@ -1118,8 +1125,9 @@ function splitHeaderAndDataFromMatrix_(matrix) {
  * @param {number} textLength
  * @param {boolean} [conversionOk]
  * @param {string} [conversionNote]
+ * @param {string} [textSource] google-doc | gemini | ocr.space | …
  */
-function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNote) {
+function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNote, textSource) {
   if (conversionOk === false) {
     const advice =
       ' Рекомендации: распознать текст в Acrobat/ABBYY и сохранить поисковый PDF; или выгрузить PDF из учётной системы с текстовым слоем; повёрнутые страницы — выпрямить до OCR. В Google — Document AI / Vision API; на ПК — Python (PyMuPDF, pytesseract).';
@@ -1162,22 +1170,40 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   invoiceLine = splitHdr.invoiceLine;
   seller = splitHdr.seller || seller;
   paymentDoc = splitHdr.paymentDoc || paymentDoc;
+  if (paymentDoc && /основание\s+передачи/i.test(paymentDoc)) {
+    const bm = paymentDoc.match(/основание\s+передачи[^:]*:\s*(.+)/i);
+    if (bm && !basisFromHdr) {
+      basisFromHdr = bm[1].replace(/\s+/g, ' ').trim();
+    }
+    paymentDoc = extractPaymentDoc_(text) || '';
+  }
+
+  const fromOcr = textSource === 'ocr.space' || isLikelyOcrUnstructured_(text);
 
   let table = null;
   if (docTable && docTable.rows && docTable.rows.length) {
     table = docTable;
     Logger.log('Таблица из Google Doc: строк данных ' + table.rows.length + ', колонок ' + table.width);
   } else {
-    table = parseGeminiTableSection_(text);
+    if (fromOcr) {
+      table = parseOcrProductRowsOnly_(text);
+    }
+    if (!table || !table.rows.length) {
+      table = parseGeminiTableSection_(text);
+    }
     if (!table || !table.rows.length) {
       const tableBlock = extractTableBlock_(text);
       table = parseTableFromBlock_(tableBlock);
     }
-    Logger.log('Таблица из текста: строк ' + (table && table.rows ? table.rows.length : 0));
+    Logger.log('Таблица из текста: строк ' + (table && table.rows ? table.rows.length : 0) + (fromOcr ? ' (источник OCR)' : ''));
   }
 
   if (table && table.rows && table.rows.length) {
+    const beforeFilter = table.rows.length;
     table.rows = normalizeGoodsTableRows_(table.rows);
+    if (beforeFilter !== table.rows.length) {
+      Logger.log('Фильтр строк таблицы: ' + beforeFilter + ' → ' + table.rows.length);
+    }
     table.header = CANONICAL_UPD_HEADERS.slice();
     table.width = CANONICAL_UPD_HEADERS.length;
   }
@@ -1296,6 +1322,136 @@ function splitCrammedHeaderFields_(invoiceLine, seller, paymentDoc) {
   return { invoiceLine: inv, seller: sel, paymentDoc: pay };
 }
 
+function isLikelyOcrUnstructured_(text) {
+  if (String(text || '').indexOf('===TABLE===') !== -1) {
+    return false;
+  }
+  let n = 0;
+  if (/покупатель\s*:/i.test(text)) {
+    n++;
+  }
+  if (/инн\s*\/?\s*кпп\s+покупателя/i.test(text)) {
+    n++;
+  }
+  if (/количество\s+то-/i.test(text)) {
+    n++;
+  }
+  if (/адрес:\s*\d{6}/i.test(text)) {
+    n++;
+  }
+  return n >= 2;
+}
+
+function isOcrNoiseLine_(line) {
+  const l = String(line || '').trim();
+  if (!l || l.length < 4) {
+    return true;
+  }
+  if (/^(покупатель|продавец|грузоотправитель|грузополучатель|адрес|инн|кпп|валюта|идентификатор)/i.test(l)) {
+    return true;
+  }
+  if (/^основание\s+передачи/i.test(l)) {
+    return true;
+  }
+  if (/количество\s+то-|код\s+стоимость|стоимость\s+то-/i.test(l)) {
+    return true;
+  }
+  if (/^ви-|^кларации|^п\/п\s*работ|^н[\s\*°]*п\s/i.test(l) && l.length < 40) {
+    return true;
+  }
+  if (/^[0-9]{1,2}\s+[0-9]{1,2}[a-zа-я]?\s*$/i.test(l)) {
+    return true;
+  }
+  if (/^[-—]\s*$/.test(l)) {
+    return true;
+  }
+  if (/^\(\d{1,2}\)\s*$/.test(l)) {
+    return true;
+  }
+  return false;
+}
+
+function looksLikeProductDataLine_(line) {
+  if (isOcrNoiseLine_(line)) {
+    return false;
+  }
+  const l = String(line || '').trim();
+  if (l.length < 10) {
+    return false;
+  }
+  const cyr = (l.match(/[а-яА-ЯёЁ]/g) || []).length;
+  if (cyr < 6) {
+    return false;
+  }
+  const hasNumbers = /\d+[.,]\d{2}|\d{3,}|796|,\d{3}/.test(l);
+  const hasProductHint =
+    /наконечник|колодк|доставк|розетк|услуг|кабель|упаковк|г\d{3,}|45\.\d{3}|gx\d/i.test(l) || cyr >= 12;
+  return hasNumbers && hasProductHint;
+}
+
+function cleanProductName_(name) {
+  return String(name || '')
+    .replace(/^\d+\s*[А-Яа-яA-Za-z]\.\s*/, '')
+    .replace(/^\d+\s+[А-Яа-яA-Z]\.\s*/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isGarbageMappedRow_(mapped) {
+  const name = cleanProductName_(mapped[1]);
+  if (!name || name.length < 8) {
+    return true;
+  }
+  if (isOcrNoiseLine_(name)) {
+    return true;
+  }
+  if (/^основание\s+передачи/i.test(name)) {
+    return true;
+  }
+  if (isDeliveryServiceRow_(name)) {
+    return !!(mapped[11] || mapped[7] || mapped[10]);
+  }
+  const hasMetric = !!(mapped[5] || mapped[6] || mapped[7] || mapped[11]);
+  const hasUnit = mapped[4] && /шт|кг/i.test(mapped[4]);
+  const hasOkei = mapped[3] === '796';
+  return !(hasMetric || hasUnit || hasOkei);
+}
+
+/** Строки товаров из «сырого» OCR-текста (без шапки УПД и мусорных строк). */
+function parseOcrProductRowsOnly_(text) {
+  const lines = normalizeText_(text).split('\n');
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i].replace(/\u00a0/g, ' ').trim();
+    if (!looksLikeProductDataLine_(line)) {
+      continue;
+    }
+    if (/^доставка\s+товара/i.test(line) && line.length < 120 && i + 1 < lines.length) {
+      let j = i + 1;
+      while (j < lines.length && j < i + 4) {
+        const extra = lines[j].replace(/\u00a0/g, ' ').trim();
+        if (extra && !isOcrNoiseLine_(extra) && !looksLikeProductDataLine_(extra)) {
+          line = line + ' ' + extra;
+        }
+        j++;
+      }
+    }
+    const cells = splitTableLine_(line);
+    if (cells.length >= 2) {
+      rows.push(cells);
+    }
+  }
+  if (!rows.length) {
+    return null;
+  }
+  Logger.log('OCR: найдено кандидатов в строки товаров: ' + rows.length);
+  return {
+    header: CANONICAL_UPD_HEADERS.slice(),
+    rows: rows,
+    width: maxRowLen_(rows),
+  };
+}
+
 /** Таблица из блока ===TABLE=== (TAB). */
 function parseGeminiTableSection_(text) {
   const n = normalizeText_(text);
@@ -1322,6 +1478,9 @@ function parseGeminiTableSection_(text) {
   for (let i = start; i < lines.length; i++) {
     if (/Всего\s+к\s+оплате|^Итого\b/i.test(lines[i])) {
       break;
+    }
+    if (isOcrNoiseLine_(lines[i])) {
+      continue;
     }
     const cells = splitTableLine_(lines[i]);
     if (!cells.length) {
@@ -1886,7 +2045,7 @@ function semanticMapGoodsRow_(cells, seqNum) {
   while (pos < tokens.length && !isStrongMetricStart_(tokens[pos], nameParts.length > 0)) {
     nameParts.push(tokens[pos++]);
   }
-  out[1] = nameParts.join(' ').trim();
+  out[1] = cleanProductName_(nameParts.join(' ').trim());
 
   const pool = tokens.slice(pos);
 
@@ -1913,7 +2072,18 @@ function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
 function normalizeGoodsTableRows_(rows) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
-    out.push(alignRowToCanonicalGoodsColumns_(rows[i], i + 1));
+    const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
+    mapped[1] = cleanProductName_(mapped[1]);
+    if (!isGarbageMappedRow_(mapped)) {
+      out.push(mapped);
+    }
+  }
+  for (let j = 0; j < out.length; j++) {
+    out[j][0] = String(j + 1);
+  }
+  if (out.length > MAX_GOODS_ROWS_PER_PDF) {
+    Logger.log('Ограничение строк таблицы: ' + out.length + ' → ' + MAX_GOODS_ROWS_PER_PDF);
+    return out.slice(0, MAX_GOODS_ROWS_PER_PDF);
   }
   return out;
 }
@@ -1948,7 +2118,14 @@ function extractAfterLabel_(text, label) {
 function extractPaymentDoc_(text) {
   const re = /К\s+платежно[-\s]*расчетному\s+документу\s*№\s*([^\n\r]+)/i;
   const m = text.match(re);
-  return m ? m[1].trim() : '';
+  if (!m) {
+    return '';
+  }
+  const val = m[1].trim();
+  if (/основание\s+передачи/i.test(val)) {
+    return '';
+  }
+  return val;
 }
 
 function extractTableBlock_(text) {
@@ -2023,6 +2200,9 @@ function parseTableFromBlock_(block) {
     }
     if (/^Основание\s+передачи/i.test(line)) {
       break;
+    }
+    if (isOcrNoiseLine_(line)) {
+      continue;
     }
     const cells = splitTableLine_(line);
     if (cells.length === 0) {
