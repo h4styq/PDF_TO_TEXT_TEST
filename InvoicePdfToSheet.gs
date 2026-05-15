@@ -1443,6 +1443,9 @@ function isQuantity_(t) {
   if (/^\d{1,4}[.,]\d{2}$/.test(compact)) {
     return false;
   }
+  if (isCountryCode_(s)) {
+    return false;
+  }
   const n = parseRuNumber_(s);
   if (isNaN(n) || n <= 0 || n >= 1000000) {
     return false;
@@ -1517,7 +1520,182 @@ function isKodVidaTovara_(t) {
   if (!s || isOkeiCode_(s) || isUnitDesignation_(s)) {
     return false;
   }
-  return /^--$|^\-{1,2}$|^\d{1,2}$/.test(s);
+  return /^--$|^—$|^-$/.test(s) || /^\d$/.test(s);
+}
+
+/** Целое число в графе «количество» или «цена» (не ОКЕИ, не код страны). */
+function isPlainInteger_(t) {
+  const s = String(t || '').trim();
+  const compact = s.replace(/\s/g, '');
+  if (!/^\d{1,7}$/.test(compact)) {
+    return false;
+  }
+  if (isOkeiCode_(s) || isCountryCode_(s)) {
+    return false;
+  }
+  return true;
+}
+
+function isDeliveryServiceRow_(name) {
+  return /доставк|транспорт|перевозк/i.test(String(name || ''));
+}
+
+/**
+ * Строка «Доставка» без количества/цены — только итоговая сумма (часто с НДС).
+ */
+function assignDeliveryRowMetrics_(pool, out) {
+  let best = '';
+  let bestN = 0;
+  for (let i = 0; i < pool.length; i++) {
+    const t = pool[i];
+    if (looksLikeMoneySum_(t) || isMoney_(t)) {
+      const n = parseRuNumber_(t);
+      if (!isNaN(n) && n > bestN) {
+        bestN = n;
+        best = t;
+      }
+    }
+  }
+  if (best) {
+    out[11] = best;
+  }
+  for (let i = 0; i < pool.length; i++) {
+    if (isVatRate_(pool[i])) {
+      out[9] = pool[i];
+    }
+    if (isExcise_(pool[i])) {
+      out[8] = pool[i];
+    }
+  }
+}
+
+/**
+ * Порядок граф УПД после единицы измерения: кол-во → цена → стоимость без НДС → акциз → % → НДС → с НДС → страна.
+ */
+function assignMetricsInDocumentOrder_(pool, out) {
+  let phase = 0;
+
+  for (let i = 0; i < pool.length; i++) {
+    const t = pool[i];
+    if (!t) {
+      continue;
+    }
+
+    if (isKodVidaTovara_(t)) {
+      if (!out[2]) {
+        out[2] = t;
+      }
+      continue;
+    }
+    if (isOkeiCodeWithContext_(t, pool[i + 1] || '')) {
+      if (!out[3]) {
+        out[3] = t;
+      }
+      continue;
+    }
+    if (isUnitDesignation_(t)) {
+      if (!out[4]) {
+        out[4] = t;
+      }
+      continue;
+    }
+
+    if (phase === 0) {
+      if (isCountryCode_(t) || isCountryName_(t) || isDeclReg_(t)) {
+        phase = 7;
+        i--;
+        continue;
+      }
+      if (isPlainInteger_(t)) {
+        out[5] = t;
+        phase = 1;
+        continue;
+      }
+      if (isUnitPrice_(t)) {
+        phase = 1;
+        i--;
+        continue;
+      }
+      if (looksLikeMoneySum_(t)) {
+        phase = 2;
+        i--;
+        continue;
+      }
+    }
+
+    if (phase === 1) {
+      if (isUnitPrice_(t) || isPlainInteger_(t)) {
+        out[6] = t;
+        phase = 2;
+        continue;
+      }
+      if (looksLikeMoneySum_(t)) {
+        phase = 2;
+        i--;
+        continue;
+      }
+    }
+
+    if (phase === 2) {
+      if (looksLikeMoneySum_(t) || (isMoney_(t) && !isVatRate_(t))) {
+        out[7] = t;
+        phase = 3;
+        continue;
+      }
+    }
+
+    if (phase === 3) {
+      if (isExcise_(t)) {
+        out[8] = t;
+        phase = 4;
+        continue;
+      }
+      if (isVatRate_(t)) {
+        phase = 4;
+        i--;
+        continue;
+      }
+    }
+
+    if (phase === 4) {
+      if (isVatRate_(t)) {
+        out[9] = t;
+        phase = 5;
+        continue;
+      }
+    }
+
+    if (phase === 5) {
+      if (looksLikeMoneySum_(t) || isMoney_(t)) {
+        out[10] = t;
+        phase = 6;
+        continue;
+      }
+    }
+
+    if (phase === 6) {
+      if (looksLikeMoneySum_(t) || isMoney_(t)) {
+        out[11] = t;
+        phase = 7;
+        continue;
+      }
+    }
+
+    if (phase >= 7) {
+      if (isCountryCode_(t) && !out[12]) {
+        out[12] = t;
+        continue;
+      }
+      if (isCountryName_(t) && !out[13]) {
+        out[13] = t;
+        continue;
+      }
+      if (isDeclReg_(t) && !out[14]) {
+        out[14] = t;
+        continue;
+      }
+    }
+  }
 }
 
 function isStrongMetricStart_(t, hasName) {
@@ -1572,67 +1750,22 @@ function semanticMapGoodsRow_(cells, seqNum) {
 
   const pool = tokens.slice(pos);
 
-  out[2] = takeFromPool_(pool, isKodVidaTovara_);
   if (!out[3]) {
     out[3] = takeOkeiFromPool_(pool);
   }
   if (!out[4]) {
     out[4] = takeFromPool_(pool, isUnitDesignation_);
   }
-  if (!out[5]) {
-    out[5] = takeFromPool_(pool, isQuantity_);
-  }
-  if (!out[6]) {
-    out[6] = takeFromPool_(pool, isUnitPrice_);
-  }
-  if (!out[7]) {
-    out[7] = takeFromPool_(pool, isMoney_);
-  }
-  if (!out[8]) {
-    out[8] = takeFromPool_(pool, isExcise_);
-  }
-  if (!out[9]) {
-    out[9] = takeFromPool_(pool, isVatRate_);
-  }
-  if (!out[10]) {
-    out[10] = takeFromPool_(pool, isMoney_);
-  }
-  if (!out[11]) {
-    out[11] = takeFromPool_(pool, isMoney_);
-  }
-  if (!out[12]) {
-    out[12] = takeFromPool_(pool, isCountryCode_);
-  }
-  if (!out[13]) {
-    out[13] = takeFromPool_(pool, isCountryName_);
-  }
-  if (!out[14]) {
-    out[14] = takeFromPool_(pool, isDeclReg_);
-  }
-  if (pool.length) {
-    const tail = pool.join(' ').trim();
-    if (tail && !out[14]) {
-      out[14] = tail;
-    } else if (tail && !out[1]) {
-      out[1] = tail;
-    }
+
+  if (isDeliveryServiceRow_(out[1])) {
+    assignDeliveryRowMetrics_(pool, out);
+  } else {
+    assignMetricsInDocumentOrder_(pool, out);
   }
 
   if (!out[3] && out[2] && isOkeiCode_(out[2])) {
     out[3] = out[2];
     out[2] = '';
-  }
-
-  if (!out[5] && out[6] && out[7]) {
-    const price = parseRuNumber_(out[6]);
-    const cost = parseRuNumber_(out[7]);
-    if (price > 0 && cost > 0) {
-      const q = Math.round((cost / price) * 1000) / 1000;
-      if (q > 0 && q < 1000000) {
-        out[5] = String(q);
-        Logger.log('Количество вычислено из стоимости/цены: ' + out[5]);
-      }
-    }
   }
 
   return out;
