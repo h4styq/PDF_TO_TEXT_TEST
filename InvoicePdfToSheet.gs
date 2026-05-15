@@ -44,7 +44,7 @@ const GEMINI_MAX_BACKOFF_MS = 20000;
 /** Повторы для запасного пути «только текст Doc» */
 const GEMINI_TEXT_MAX_ATTEMPTS = 1;
 /** Запасные модели при 429/недоступности основной */
-const GEMINI_FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
+const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
 /** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
 const PAUSE_BETWEEN_PDF_MS = 25000;
@@ -60,7 +60,6 @@ const OCR_TRY_DRIVE_URL_FOR_LARGE = true;
  */
 const USE_CANONICAL_TABLE_HEADERS = true;
 const CANONICAL_UPD_HEADERS = [
-  'Код товара/работ, услуг',
   '№ п/п',
   'Наименование товара (описание выполненных работ, оказанных услуг), имущественного права',
   'Код вида товара',
@@ -649,8 +648,12 @@ function getGeminiInvoicePrompt_() {
     'Строка: «К платежно-расчетному документу №» и номер(а).\n' +
     'Строка с «Основание передачи (сдачи) / получения (приемки)» и текст основания; при наличии рядом «Счёт № …» — добавь в той же или следующей строке.\n' +
     '===TABLE===\n' +
-    'Первая строка блока — заголовки граф таблицы товаров, разделённые символом TAB (табуляция).\n' +
-    'Далее каждая строка — одна строка таблицы тем же числом колонок (TAB). Не включай строку «Всего к оплате» и итоги после неё.\n' +
+    'Колонки таблицы (ровно в этом порядке, разделитель TAB), без колонки «код товара»:\n' +
+    '№ п/п | Наименование товара | Код вида товара | Единица измерения: код | Единица измерения: условное обозначение | ' +
+    'Цена за единицу | Стоимость без налога | Акциз | Налоговая ставка | Сумма налога | Стоимость с налогом | ' +
+    'Страна: цифровой код | Страна: краткое наименование | Рег. номер декларации/партии\n' +
+    'В колонке № п/п только порядковый номер строки: 1, 2, 3… Первая строка — заголовки, далее строки данных (TAB). ' +
+    'Не включай «Всего к оплате» и итоги.\n' +
     '===END===\n' +
     'Если фрагмента нет — оставь маркер и пустую секцию. Не выдумывай суммы и реквизиты.'
   );
@@ -809,9 +812,9 @@ function showRecognitionSetupHelp() {
       '1) Расширения → Apps Script → слева «Свойства проекта» (шестерёнка) → «Свойства скрипта».\n\n' +
       '2) Добавьте свойство:\n' +
       '   • GEMINI_API_KEY — ключ: https://aistudio.google.com/apikey\n' +
-      '     (модель ' +
+      '     (модель по умолчанию ' +
       GEMINI_MODEL +
-      ' читает PDF; при ошибке модели смените константу GEMINI_MODEL в коде.)\n\n' +
+      '; в свойствах GEMINI_MODEL не указывайте gemini-1.5-flash — даёт HTTP 404.)\n\n' +
       '   ИЛИ свойство:\n' +
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
@@ -1134,30 +1137,55 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
       ? ' Мало текста после конвертации PDF (часто скан или «картинка»). Нужен OCR или PDF с текстовым слоем.'
       : '';
 
-  let invoiceLine = extractInvoiceHeader_(text);
+  const structuredHdr = parseStructuredHeaderBlock_(text);
+  let invoiceLine = structuredHdr ? structuredHdr.invoiceLine : '';
+  let seller = structuredHdr ? structuredHdr.seller : '';
+  let paymentDoc = structuredHdr ? structuredHdr.paymentDoc : '';
+  let basisFromHdr = structuredHdr ? structuredHdr.basis : '';
+
+  if (!invoiceLine) {
+    invoiceLine = extractInvoiceHeader_(text);
+  }
   if (!invoiceLine) {
     invoiceLine = extractInvoiceHeaderAlt_(text);
   }
-  const seller = extractSeller_(text);
-  const paymentDoc = extractPaymentDoc_(text);
+  if (!seller) {
+    seller = extractSeller_(text);
+  }
+  if (!paymentDoc) {
+    paymentDoc = extractPaymentDoc_(text);
+  }
+  const splitHdr = splitCrammedHeaderFields_(invoiceLine, seller, paymentDoc);
+  invoiceLine = splitHdr.invoiceLine;
+  seller = splitHdr.seller || seller;
+  paymentDoc = splitHdr.paymentDoc || paymentDoc;
 
   let table = null;
   if (docTable && docTable.rows && docTable.rows.length) {
     table = docTable;
     Logger.log('Таблица из Google Doc: строк данных ' + table.rows.length + ', колонок ' + table.width);
   } else {
-    const tableBlock = extractTableBlock_(text);
-    table = parseTableFromBlock_(tableBlock);
-    Logger.log('Таблица из текста: строк ' + (table.rows ? table.rows.length : 0));
+    table = parseGeminiTableSection_(text);
+    if (!table || !table.rows.length) {
+      const tableBlock = extractTableBlock_(text);
+      table = parseTableFromBlock_(tableBlock);
+    }
+    Logger.log('Таблица из текста: строк ' + (table && table.rows ? table.rows.length : 0));
+  }
+
+  if (table && table.rows && table.rows.length) {
+    table.rows = normalizeGoodsTableRows_(table.rows);
+    table.header = CANONICAL_UPD_HEADERS.slice();
+    table.width = CANONICAL_UPD_HEADERS.length;
   }
 
   if ((!table || !table.rows.length) && textHint) {
     invoiceLine = (invoiceLine || '') + textHint.trim();
   }
 
-  const basis = extractBasis_(text);
+  let basis = basisFromHdr || extractBasis_(text);
 
-  const tw = table && table.width ? table.width : 0;
+  const tw = table && table.width ? table.width : CANONICAL_UPD_HEADERS.length;
   return {
     invoiceLine: invoiceLine,
     seller: seller,
@@ -1184,13 +1212,193 @@ function normalizeText_(t) {
 }
 
 function extractInvoiceHeader_(text) {
-  const re = /Счет[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
+  const re =
+    /Сч[её]т[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
   const m = text.match(re);
   if (!m) {
     return '';
   }
   const num = m[1].replace(/\s+/g, ' ').trim();
   return ('Счет-фактура № ' + num + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+}
+
+/** Поля из блока ===HEADER=== ответа Gemini. */
+function parseStructuredHeaderBlock_(text) {
+  const n = normalizeText_(text);
+  if (n.indexOf('===HEADER===') === -1) {
+    return null;
+  }
+  const hm = n.match(/===HEADER===\s*([\s\S]*?)(?====TABLE===|$)/i);
+  if (!hm) {
+    return null;
+  }
+  const lines = hm[1]
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  let invoiceLine = '';
+  let seller = '';
+  let paymentDoc = '';
+  let basis = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!invoiceLine && /^(Сч[её]т[-\s]*фактура|УПД|Универсальн)/i.test(line)) {
+      invoiceLine = line;
+      continue;
+    }
+    if (!seller && /\bПродавец\s*:?/i.test(line)) {
+      seller = line.replace(/^.*?Продавец\s*:?\s*/i, '').trim();
+      continue;
+    }
+    if (!paymentDoc && /К\s+платежно[-\s]*расчетному\s+документу/i.test(line)) {
+      paymentDoc = line.replace(/^.*?документу\s*№\s*/i, '').trim();
+      if (!paymentDoc) {
+        paymentDoc = line.replace(/^.*?документу\s*/i, '').trim();
+      }
+      continue;
+    }
+    if (!basis && /Основание\s+передачи/i.test(line)) {
+      basis = line.replace(/^.*?приемки\)\s*/i, '').trim();
+    }
+  }
+  if (!invoiceLine && !seller && !paymentDoc) {
+    return null;
+  }
+  return { invoiceLine: invoiceLine, seller: seller, paymentDoc: paymentDoc, basis: basis };
+}
+
+/** Если счёт-фактура, продавец и платёжный документ слиплись в одну ячейку. */
+function splitCrammedHeaderFields_(invoiceLine, seller, paymentDoc) {
+  let inv = invoiceLine || '';
+  let sel = seller || '';
+  let pay = paymentDoc || '';
+  if (inv && /\bПродавец\s*:/i.test(inv)) {
+    const m = inv.match(
+      /^(Сч[её]т[-\s]*фактура\s*№[\s\S]*?)(?:\s+Продавец\s*:\s*)([\s\S]*?)(?:\s+К\s+платежно[-\s]*расчетному\s+документу\s*№\s*([\s\S]*))?$/i
+    );
+    if (m) {
+      inv = m[1].replace(/\s+/g, ' ').trim();
+      if (!sel) {
+        sel = (m[2] || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!pay && m[3]) {
+        pay = m[3].replace(/\s+/g, ' ').trim();
+      }
+    }
+  }
+  return { invoiceLine: inv, seller: sel, paymentDoc: pay };
+}
+
+/** Таблица из блока ===TABLE=== (TAB). */
+function parseGeminiTableSection_(text) {
+  const n = normalizeText_(text);
+  const tm = n.match(/===TABLE===\s*([\s\S]*?)(?====END===|$)/i);
+  if (!tm) {
+    return null;
+  }
+  const lines = tm[1]
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  if (!lines.length) {
+    return null;
+  }
+  let start = 0;
+  if (/наименован|№\s*п\/п|код\s+вида/i.test(lines[0]) && !/^\d+\t/.test(lines[0])) {
+    start = 1;
+  }
+  const rows = [];
+  for (let i = start; i < lines.length; i++) {
+    if (/Всего\s+к\s+оплате|^Итого\b/i.test(lines[i])) {
+      break;
+    }
+    const cells = splitTableLine_(lines[i]);
+    if (!cells.length) {
+      continue;
+    }
+    rows.push(cells);
+  }
+  if (!rows.length) {
+    return null;
+  }
+  return {
+    header: CANONICAL_UPD_HEADERS.slice(),
+    rows: rows,
+    width: maxRowLen_(rows),
+  };
+}
+
+function looksLikeSeqNumber_(s) {
+  return /^\d{1,4}$/.test(String(s || '').trim());
+}
+
+/** Артикул / код номенклатуры (не порядковый № п/п и не сумма). */
+function looksLikeProductCode_(s) {
+  const t = String(s || '').trim();
+  if (!t || looksLikeSeqNumber_(t)) {
+    return false;
+  }
+  if (/^\d{1,3}([.,]\d{2})?$/.test(t)) {
+    return false;
+  }
+  if (/^00-\d+/.test(t)) {
+    return true;
+  }
+  if (/^\d{3,}\s+\d{3,}$/.test(t)) {
+    return true;
+  }
+  if (t.length >= 4 && /^[\dA-Za-zА-Яа-я.\-()\s]+$/.test(t) && !/^(без\s+акциза|\d+%)$/i.test(t)) {
+    return !/^\d+([.,]\d{1,2})?$/.test(t.replace(/\s/g, ''));
+  }
+  return false;
+}
+
+function stripLeadingProductCodeColumn_(row) {
+  let r = row.slice();
+  const canonLen = CANONICAL_UPD_HEADERS.length;
+  while (r.length > canonLen) {
+    if (r.length >= 2 && looksLikeSeqNumber_(r[0]) && looksLikeProductCode_(r[1])) {
+      r = [r[0]].concat(r.slice(2));
+      continue;
+    }
+    if (r.length >= 2 && looksLikeProductCode_(r[0]) && looksLikeSeqNumber_(r[1])) {
+      r = r.slice(1);
+      continue;
+    }
+    if (looksLikeProductCode_(r[0])) {
+      r = r.slice(1);
+      continue;
+    }
+    break;
+  }
+  return r;
+}
+
+/** Выравнивание под CANONICAL_UPD_HEADERS; № п/п = порядковый номер по документу. */
+function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
+  let row = stripLeadingProductCodeColumn_(cells);
+  row = padRow_(row, CANONICAL_UPD_HEADERS.length);
+  if (row.length > CANONICAL_UPD_HEADERS.length) {
+    row = row.slice(0, CANONICAL_UPD_HEADERS.length);
+  }
+  row[0] = String(seqNum);
+  return row;
+}
+
+function normalizeGoodsTableRows_(rows) {
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    out.push(alignRowToCanonicalGoodsColumns_(rows[i], i + 1));
+  }
+  return out;
 }
 
 /** Текст после слова «Продавец» (с двоеточием или без). */
