@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-17-epribor';
+const SCRIPT_VERSION = '2026-05-18-epribor-gemini';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2159,8 +2159,15 @@ function looksLikeProductDataLine_(line) {
   return hasNumbers && hasProductHint;
 }
 
+/** Gemini/OCR иногда склеивают № строки с артикулом: «145.7373.9002» → «45.7373.9002». */
+function fixGluedRowNumBefore45Article_(name) {
+  return String(name || '')
+    .trim()
+    .replace(/^([12])(45\.7373\.\d{4})/i, '$2');
+}
+
 function stripOcrJunkPrefixFromName_(name) {
-  let n = String(name || '').trim();
+  let n = fixGluedRowNumBefore45Article_(String(name || '').trim());
   n = n.replace(/^(\d{1,4}\s+){1,4}(?=(?:GX|Услуг|45\.|Г\d))/i, '');
   n = n.replace(/^\d{1,2}\s+(?=[A-Za-zА-ЯЁёGxУ])/i, '');
   return n.trim();
@@ -3691,6 +3698,10 @@ function semanticMapGoodsRow_(cells, seqNum) {
     out[2] = '';
   }
 
+  if (!out[3] && !isDeliveryServiceRow_(out[1]) && out[4] && /^шт\.?$/i.test(String(out[4]).trim())) {
+    out[3] = '796';
+  }
+
   return out;
 }
 
@@ -4190,6 +4201,27 @@ function normalizeGoldenText_(v) {
     .toLowerCase();
 }
 
+/** Сверка «К платежно-расчетному документу»: № и хвост « г.» не обязательны. */
+function normalizeGoldenPaymentDocCompare_(v) {
+  let s = normalizeGoldenText_(v).replace(/^№\s*/, '');
+  s = s.replace(/\s*г\.?\s*$/i, '').trim();
+  return s;
+}
+
+/** Сверка основания: Nº / № / nº после lower-case. */
+function normalizeGoldenBasisCompare_(v) {
+  let s = normalizeGoldenText_(v).replace(/\s*\[\d+\]\s*$/, '');
+  s = s.replace(/n\u00ba/gi, '№').replace(/n\s*°/gi, '№');
+  s = s.replace(/\s*№\s*/g, ' № ');
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeGoldenProductNameCompare_(v) {
+  return normalizeGoldenText_(v)
+    .replace(/[''`´]/g, "'")
+    .replace(/\)\s*'/g, ')');
+}
+
 function normalizeGoldenMoney_(v) {
   const t = String(v || '')
     .replace(/\u00a0/g, '')
@@ -4209,8 +4241,8 @@ function goldenCellsEqual_(got, expected, colIndex) {
     return normalizeGoldenMoney_(g) === normalizeGoldenMoney_(e);
   }
   if (colIndex === 1) {
-    const gn = normalizeGoldenText_(g).replace(/[''`]/g, "'");
-    const en = normalizeGoldenText_(e).replace(/[''`]/g, "'");
+    const gn = normalizeGoldenProductNameCompare_(g);
+    const en = normalizeGoldenProductNameCompare_(e);
     if (gn === en) {
       return true;
     }
@@ -4238,16 +4270,20 @@ function compareParsedToGolden_(fileName, parsed) {
     const exp = golden[key] || '';
     const gotN =
       key === 'basis'
-        ? normalizeGoldenText_(got).replace(/\s*\[\d+\]\s*$/, '')
-        : key === 'invoiceLine'
-          ? normalizeGoldenInvoiceLine_(got)
-          : normalizeGoldenText_(got);
+        ? normalizeGoldenBasisCompare_(got)
+        : key === 'paymentDoc'
+          ? normalizeGoldenPaymentDocCompare_(got)
+          : key === 'invoiceLine'
+            ? normalizeGoldenInvoiceLine_(got)
+            : normalizeGoldenText_(got);
     const expN =
       key === 'basis'
-        ? normalizeGoldenText_(exp).replace(/\s*\[\d+\]\s*$/, '')
-        : key === 'invoiceLine'
-          ? normalizeGoldenInvoiceLine_(exp)
-          : normalizeGoldenText_(exp);
+        ? normalizeGoldenBasisCompare_(exp)
+        : key === 'paymentDoc'
+          ? normalizeGoldenPaymentDocCompare_(exp)
+          : key === 'invoiceLine'
+            ? normalizeGoldenInvoiceLine_(exp)
+            : normalizeGoldenText_(exp);
     if (gotN !== expN && exp) {
       diffs.push(label + ': ожидалось «' + exp + '», получено «' + got + '»');
     }
