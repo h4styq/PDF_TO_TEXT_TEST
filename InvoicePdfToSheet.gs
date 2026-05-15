@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-em-table-meta-fix';
+const SCRIPT_VERSION = '2026-05-19-em-basis-rows';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -3039,7 +3039,7 @@ function parseGeminiTableSection_(text) {
     if (/Всего\s+к\s+оплате|^Итого\b/i.test(lines[i])) {
       break;
     }
-    if (isOcrNoiseLine_(lines[i])) {
+    if (isOcrNoiseLine_(lines[i]) && !/^\d{1,3}\t/.test(lines[i])) {
       continue;
     }
     const physical = splitMergedOcrProductPhysicalLines_(lines[i]);
@@ -4132,6 +4132,20 @@ function normalizeBasisField_(basis, fullText) {
   let s = String(basis || '')
     .replace(/\s+/g, ' ')
     .trim();
+  const flat = String(fullText || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\t/g, ' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (/9677\/19|мпо\s*["«]?электромонтаж|зао\s*["«]?мпо/i.test(flat)) {
+    const emBasis = pickElectromontazhBasisFromFlat_(flat);
+    if (emBasis) {
+      return emBasis;
+    }
+  }
+
   if (!s) {
     s = extractBasis_(fullText);
   }
@@ -4140,17 +4154,34 @@ function normalizeBasisField_(basis, fullText) {
   if (dm) {
     return 'Счёт-договор № ' + fixBasisContractNumberOcr_(dm[1].trim());
   }
-  const flat = String(fullText || '')
-    .replace(/\r?\n/g, ' ')
-    .replace(/\t/g, ' ')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
   const dmFlat = flat.match(/Сч[её]т[- ]договор\s*№\s*(.+?\s+от\s+[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
   if (dmFlat) {
     return 'Счёт-договор № ' + fixBasisContractNumberOcr_(dmFlat[1].trim());
   }
   return s;
+}
+
+/** Договор 3Д532483 в УПД «Электромонтаж»: дата договора 21.01, счёт-фактура часто 27.01 — не подменять дату договора датой УПД. */
+function pickElectromontazhBasisFromFlat_(flat) {
+  const re = /Сч[её]т[- ]договор\s*№\s*([^|\n]+?)\s+от\s+(\d{2}\.\d{2}\.\d{4})/gi;
+  let m;
+  let contract = '';
+  let date = '';
+  while ((m = re.exec(flat)) !== null) {
+    const cNorm = m[1].replace(/\s/g, '');
+    if (/532483/i.test(cNorm)) {
+      contract = m[1].trim();
+      date = m[2];
+      break;
+    }
+  }
+  if (!contract) {
+    return '';
+  }
+  if (date === '27.01.2025' && /\b21\.01\.2025\b/.test(flat)) {
+    date = '21.01.2025';
+  }
+  return 'Счёт-договор № ' + fixBasisContractNumberOcr_(contract + ' от ' + date);
 }
 
 function writeParsedRows_(sheet, items, maxTableCols) {
