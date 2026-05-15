@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-18-epribor-gemini';
+const SCRIPT_VERSION = '2026-05-18-electromontazh';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1479,6 +1479,7 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   basis = String(basis || '')
     .replace(/\s*\[\d+\]\s*$/g, '')
     .trim();
+  basis = normalizeBasisField_(basis, text);
 
   const tw = table && table.width ? table.width : CANONICAL_UPD_HEADERS.length;
   return {
@@ -1569,6 +1570,7 @@ function formatOcrInvoiceLine_(num, datePart) {
 
 function normalizeGoldenInvoiceLine_(v) {
   return normalizeGoldenText_(v)
+    .replace(/ё/g, 'е')
     .replace(/(\d{4})\s*г\.?/gi, '$1г')
     .replace(/\s+/g, ' ')
     .trim();
@@ -1952,7 +1954,7 @@ function parsePlainHeaderLinesFromText_(text) {
       continue;
     }
     if (!basis && /Основание\s+передачи/i.test(line)) {
-      basis = line.replace(/^.*?приемки\)\s*/i, '').trim();
+      basis = line.replace(/^.*?при[её]мки\)\s*/i, '').trim();
       continue;
     }
     if (!basis && /^Сч[её]т\s+\d+/i.test(line)) {
@@ -2009,7 +2011,7 @@ function parseStructuredHeaderBlock_(text) {
       continue;
     }
     if (!basis && /Основание\s+передачи/i.test(line)) {
-      basis = line.replace(/^.*?приемки\)\s*/i, '').trim();
+      basis = line.replace(/^.*?при[её]мки\)\s*/i, '').trim();
     }
   }
   if (!invoiceLine && !seller && !paymentDoc) {
@@ -2903,6 +2905,32 @@ function parseTabularProductLines_(text) {
   };
 }
 
+function splitMergedGeminiTablePhysicalLines_(line) {
+  const l = String(line || '').trim();
+  if (!l || l.indexOf('\t') === -1) {
+    return [l];
+  }
+  let idx = l.search(/\t2\t/i);
+  if (idx < 0) {
+    idx = l.search(/\t2\s+/i);
+  }
+  if (idx < 0) {
+    return [l];
+  }
+  const tail = l.substring(idx + 1).trim();
+  if (!/^2[\t\s]+/i.test(tail)) {
+    return [l];
+  }
+  if (!/Доставка\s+товара/i.test(tail)) {
+    return [l];
+  }
+  const head = l.substring(0, idx).trim();
+  if (head.length < 15) {
+    return [l];
+  }
+  return [head, tail];
+}
+
 /** Таблица из блока ===TABLE=== (TAB). */
 function parseGeminiTableSection_(text) {
   const n = normalizeText_(text);
@@ -2933,11 +2961,14 @@ function parseGeminiTableSection_(text) {
     if (isOcrNoiseLine_(lines[i])) {
       continue;
     }
-    const cells = splitTableLine_(lines[i]);
-    if (!cells.length) {
-      continue;
+    const physical = splitMergedGeminiTablePhysicalLines_(lines[i]);
+    for (let p = 0; p < physical.length; p++) {
+      const cells = splitTableLine_(physical[p]);
+      if (!cells.length) {
+        continue;
+      }
+      rows.push(cells);
     }
-    rows.push(cells);
   }
   if (!rows.length) {
     return parseTabularProductLines_(n);
@@ -3954,18 +3985,48 @@ function maxRowLen_(rows) {
 }
 
 function extractBasis_(text) {
-  const label = 'Основание передачи (сдачи) / получения (приемки)';
-  const idx = text.indexOf(label);
-  if (idx === -1) {
+  const t = normalizeText_(text);
+  const lm = t.match(/Основание\s+передачи\s*\([^)]*\)\s*\/\s*получения\s*\([^)]*\)\s*:?\s*/i);
+  if (!lm) {
     return '';
   }
-  const fromLabel = text.substring(idx + label.length).replace(/^[\s:\-–—]*/, '');
+  const fromLabel = t.substring(lm.index + lm[0].length).replace(/^[\s:\-–—]*/, '');
   const firstLine = (fromLabel.split('\n')[0] || fromLabel).replace(/\s+/g, ' ').trim();
   const accMatch = fromLabel.match(/Счет\s*№\s*([^\n\r]+)/i);
   if (accMatch) {
     return (firstLine + ' | Счет № ' + accMatch[1].trim()).trim();
   }
   return firstLine;
+}
+
+function stripVerboseBasisPrefix_(s) {
+  return String(s || '')
+    .replace(/^Основание\s+передачи\s*\([^)]*\)\s*\/\s*получения\s*\([^)]*\)\s*:?\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** OCR/Gemini: «ЗД532483» вместо «3Д532483». */
+function fixBasisContractNumberOcr_(afterNumSign) {
+  let x = String(afterNumSign || '').trim();
+  x = x.replace(/^ЗД(\d)/i, '3Д$1');
+  x = x.replace(/^([Зз])\s*\.?\s*Д(\d)/i, '3Д$2');
+  return x;
+}
+
+function normalizeBasisField_(basis, fullText) {
+  let s = String(basis || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!s) {
+    s = extractBasis_(fullText);
+  }
+  s = stripVerboseBasisPrefix_(s);
+  const dm = s.match(/Сч[её]т[-–—]?\s*договор\s*№\s*(.+)/i);
+  if (dm) {
+    return 'Счёт-договор № ' + fixBasisContractNumberOcr_(dm[1].trim());
+  }
+  return s;
 }
 
 function writeParsedRows_(sheet, items, maxTableCols) {
@@ -4213,6 +4274,9 @@ function normalizeGoldenBasisCompare_(v) {
   let s = normalizeGoldenText_(v).replace(/\s*\[\d+\]\s*$/, '');
   s = s.replace(/n\u00ba/gi, '№').replace(/n\s*°/gi, '№');
   s = s.replace(/\s*№\s*/g, ' № ');
+  s = s.replace(/^основание\s+передачи\s*\([^)]*\)\s*\/\s*получения\s*\([^)]*\)\s*/i, '').trim();
+  s = s.replace(/ё/g, 'е');
+  s = s.replace(/сч[её]т[- ]договор\s*№\s*зд(\d)/gi, 'счет-договор № 3д$1');
   return s.replace(/\s+/g, ' ').trim();
 }
 
