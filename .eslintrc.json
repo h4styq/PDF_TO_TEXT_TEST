@@ -9,7 +9,7 @@
     "sourceType": "script"
   },
   "rules": {
-    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_|runGoldenCheckDart4230_|runGoldenCheckEpribor11400_)$" }],
+    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_|runGoldenCheckDart4230_|runGoldenCheckEpribor11400_|runGoldenCheckElectromontazh13215_)$" }],
     "no-undef": "error",
     "no-redeclare": "warn",
     "no-prototype-builtins": "off",

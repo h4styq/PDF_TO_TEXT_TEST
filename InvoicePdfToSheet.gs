@@ -92,6 +92,7 @@ function onOpen() {
     .addSeparator()
     .addItem('Сверить Дарт 4230 с эталоном', 'runGoldenCheckDart4230_')
     .addItem('Сверить Э прибор 11400 с эталоном', 'runGoldenCheckEpribor11400_')
+    .addItem('Сверить Электромонтаж 13215 с эталоном', 'runGoldenCheckElectromontazh13215_')
     .addToUi();
 }
 
@@ -1453,6 +1454,9 @@ function looksLikeProductDataLine_(line) {
   if (l.length < 10) {
     return false;
   }
+  if (/^доставка\s+товара/i.test(l)) {
+    return /адрес\s+доставки|\d+[.,]\d{2}/i.test(l);
+  }
   if (looksLikeOcrProductSkuLine_(l)) {
     return /\d+[.,]\d{2}|796|,\d{3}|\d+\s*%|без\s+акциза/i.test(l);
   }
@@ -1562,6 +1566,31 @@ function repairScrambledOcrRow_(mapped) {
   fixQtyPriceCostSlots_(mapped);
 }
 
+/** Строка «Доставка товара» без ОКЕИ/шт — только суммы и адрес в наименовании. */
+function tokenizeOcrDeliveryLine_(line) {
+  const l = String(line || '').replace(/\u00a0/g, ' ').trim();
+  const tokens = [];
+  let sm = l.match(/^(\d{1,2})\s+/);
+  let rest = l;
+  if (sm) {
+    tokens.push(sm[1]);
+    rest = l.substring(sm[0].length).trim();
+  }
+  const cut = rest.search(/\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2}|без\s+акциза|\d{1,2}\s*%/i);
+  const name = cut > 0 ? rest.substring(0, cut).trim() : rest;
+  if (name) {
+    tokens.push(name);
+  }
+  tokens.push('-');
+  const tail = cut > 0 ? rest.substring(cut) : '';
+  const parts =
+    tail.match(/(\d{1,2}\s*%|без\s+акциза|\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2})/gi) || [];
+  for (let i = 0; i < parts.length; i++) {
+    tokens.push(parts[i].trim());
+  }
+  return tokens.length >= 2 ? tokens : splitTableLine_(l);
+}
+
 /**
  * Разбор одной OCR-строки товара (часто без TAB, с «796 шт» в середине).
  */
@@ -1586,6 +1615,9 @@ function tokenizeOcrProductLine_(line) {
     });
   if (wide.length >= 6) {
     return wide;
+  }
+  if (/^доставка\s+товара/i.test(l) && l.indexOf('796') === -1) {
+    return tokenizeOcrDeliveryLine_(l);
   }
   const okeiMatch = l.match(/(?:^|\s)(796)\s+(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
   if (!okeiMatch) {
@@ -1651,12 +1683,21 @@ function parseOcrProductRowsOnly_(text) {
     if (!looksLikeProductDataLine_(line)) {
       continue;
     }
-    if (/^доставка\s+товара/i.test(line) && line.length < 120 && i + 1 < lines.length) {
+    if (/^доставка\s+товара/i.test(line) && i + 1 < lines.length) {
       let j = i + 1;
-      while (j < lines.length && j < i + 4) {
+      while (j < lines.length && j < i + 6) {
         const extra = lines[j].replace(/\u00a0/g, ' ').trim();
-        if (extra && !isOcrNoiseLine_(extra) && !looksLikeProductDataLine_(extra)) {
+        if (
+          extra &&
+          !isOcrNoiseLine_(extra) &&
+          (/адрес\s+доставки|москва|ленинск|собода|доставк/i.test(extra) || extra.length < 120)
+        ) {
           line = line + ' ' + extra;
+          if (/90[.,]\d{2}|543|452[.,]\d{2}/.test(extra)) {
+            break;
+          }
+        } else if (looksLikeProductDataLine_(extra)) {
+          break;
         }
         j++;
       }
@@ -2085,20 +2126,36 @@ function isDeliveryServiceRow_(name) {
  * Строка «Доставка» без количества/цены — только итоговая сумма (часто с НДС).
  */
 function assignDeliveryRowMetrics_(pool, out) {
-  let best = '';
-  let bestN = 0;
+  const amounts = [];
   for (let i = 0; i < pool.length; i++) {
     const t = pool[i];
     if (looksLikeMoneySum_(t) || isMoney_(t)) {
       const n = parseRuNumber_(t);
-      if (!isNaN(n) && n > bestN) {
-        bestN = n;
-        best = t;
+      if (!isNaN(n) && n > 0) {
+        amounts.push({ t: t, n: n });
       }
     }
   }
-  if (best) {
-    out[11] = best;
+  amounts.sort(function (a, b) {
+    return a.n - b.n;
+  });
+  if (amounts.length >= 1) {
+    out[7] = amounts[0].t;
+  }
+  if (amounts.length >= 3) {
+    out[10] = amounts[amounts.length - 2].t;
+    out[11] = amounts[amounts.length - 1].t;
+  } else if (amounts.length === 2) {
+    out[11] = amounts[1].t;
+    if (!out[10]) {
+      const cost = parseRuNumber_(amounts[0].t);
+      const total = parseRuNumber_(amounts[1].t);
+      if (total > cost) {
+        out[10] = formatRuMoney_(total - cost);
+      }
+    }
+  } else if (amounts.length === 1) {
+    out[11] = amounts[0].t;
   }
   for (let i = 0; i < pool.length; i++) {
     if (isVatRate_(pool[i])) {
@@ -2107,7 +2164,14 @@ function assignDeliveryRowMetrics_(pool, out) {
     if (isExcise_(pool[i])) {
       out[8] = pool[i];
     }
+    if (isKodVidaTovara_(pool[i]) && !out[2]) {
+      out[2] = pool[i];
+    }
   }
+  if (!out[2]) {
+    out[2] = '-';
+  }
+  fixQtyPriceCostSlots_(out);
 }
 
 /**
@@ -2481,6 +2545,13 @@ function extractSellerByNameHint_(text) {
   }
   if (/электроприбор/i.test(chunk)) {
     return 'ООО "Электроприбор"';
+  }
+  if (/электромонтаж/i.test(chunk) || /мпо\s+электромонтаж/i.test(text)) {
+    return 'ЗАО "МПО Электромонтаж"';
+  }
+  const zao = text.match(/ЗАО\s*["«]?\s*([^"»\n]{3,80})/i);
+  if (zao && /электромонтаж/i.test(zao[1])) {
+    return 'ЗАО "МПО Электромонтаж"';
   }
   return m[1] + ' "' + chunk + '"';
 }
