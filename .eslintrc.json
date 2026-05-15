@@ -19,11 +19,7 @@
     {
       "files": ["*.gs"],
       "globals": {
-        "MimeType": "readonly",
-        "CANONICAL_UPD_HEADERS": "readonly",
-        "SOURCE_FOLDER_ID": "readonly",
-        "pdfToExtracted_": "readonly",
-        "parseInvoiceData_": "readonly"
+        "MimeType": "readonly"
       }
     }
   ]
