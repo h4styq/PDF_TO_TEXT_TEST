@@ -47,7 +47,7 @@ const GEMINI_TEXT_MAX_ATTEMPTS = 1;
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
 /** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
-const PAUSE_BETWEEN_PDF_MS = 10000;
+const PAUSE_BETWEEN_PDF_MS = 30000;
 /** Макс. строк товаров на один PDF после фильтрации (защита от «мусора» OCR). */
 const MAX_GOODS_ROWS_PER_PDF = 10;
 /**
