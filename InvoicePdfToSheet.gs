@@ -1496,13 +1496,7 @@ function isExcise_(t) {
 
 function isCountryCode_(t) {
   const s = String(t || '').trim();
-  if (!/^\d{3}$/.test(s)) {
-    return false;
-  }
-  if (/^(156|643|840|380|051|112|276|392)$/.test(s)) {
-    return true;
-  }
-  return /^\d{3}$/.test(s) && !/^(796|166|055|006|715|898)$/.test(s);
+  return /^(156|643|840|380|051|112|276|392|124|410|158|704|356)$/.test(s);
 }
 
 function isCountryName_(t) {
@@ -1517,10 +1511,19 @@ function isDeclReg_(t) {
 
 function isKodVidaTovara_(t) {
   const s = String(t || '').trim();
-  if (!s || isOkeiCode_(s) || isUnitDesignation_(s)) {
-    return false;
+  return /^--$|^—$|^-$/.test(s);
+}
+
+/** Пропуск «0», «без акциза», «20%» между количеством и ценой. */
+function shouldSkipInQtyPricePhases_(t) {
+  const s = String(t || '').trim();
+  if (!s) {
+    return true;
   }
-  return /^--$|^—$|^-$/.test(s) || /^\d$/.test(s);
+  if (isExcise_(s) || isVatRate_(s)) {
+    return true;
+  }
+  return s === '0';
 }
 
 /** Целое число в графе «количество» или «цена» (не ОКЕИ, не код страны). */
@@ -1533,11 +1536,51 @@ function isPlainInteger_(t) {
   if (isOkeiCode_(s) || isCountryCode_(s)) {
     return false;
   }
-  return true;
+  const n = parseRuNumber_(s);
+  return !isNaN(n) && n > 0;
 }
 
+/** Стоимость без НДС: сумма с копейками или крупное целое (3125, 4083). */
+function isCostWithoutVat_(t) {
+  if (looksLikeMoneySum_(t)) {
+    return true;
+  }
+  if (isPlainInteger_(t)) {
+    return parseRuNumber_(t) >= 100;
+  }
+  return isMoney_(t) && !isVatRate_(t);
+}
+
+/** Цена попала в «стоимость», кол-во×цена → стоимость. */
+function fixQtyPriceCostSlots_(out) {
+  const q = parseRuNumber_(out[5]);
+  if (q > 0 && out[7] && !out[6]) {
+    const v = parseRuNumber_(out[7]);
+    if (!isNaN(v) && v > 0) {
+      out[6] = out[7];
+      out[7] = '';
+    }
+  }
+  const q2 = parseRuNumber_(out[5]);
+  const p2 = parseRuNumber_(out[6]);
+  if (q2 > 0 && p2 > 0 && !out[7]) {
+    const derived = Math.round(q2 * p2 * 100) / 100;
+    if (derived > 0) {
+      out[7] = String(derived).replace('.', ',');
+    }
+  }
+}
+
+/** Только строка без кол-ва/цены (итоговая доставка), не «услуги доставки и упаковки» с номенклатурой. */
 function isDeliveryServiceRow_(name) {
-  return /доставк|транспорт|перевозк/i.test(String(name || ''));
+  const n = String(name || '').trim();
+  if (/^доставка\s+товара/i.test(n)) {
+    return true;
+  }
+  if (/доставк.*адрес\s+доставки/i.test(n)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1600,6 +1643,10 @@ function assignMetricsInDocumentOrder_(pool, out) {
       continue;
     }
 
+    if (shouldSkipInQtyPricePhases_(t)) {
+      continue;
+    }
+
     if (phase === 0) {
       if (isCountryCode_(t) || isCountryName_(t) || isDeclReg_(t)) {
         phase = 7;
@@ -1616,7 +1663,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
         i--;
         continue;
       }
-      if (looksLikeMoneySum_(t)) {
+      if (looksLikeMoneySum_(t) || isCostWithoutVat_(t)) {
         phase = 2;
         i--;
         continue;
@@ -1629,7 +1676,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
         phase = 2;
         continue;
       }
-      if (looksLikeMoneySum_(t)) {
+      if (looksLikeMoneySum_(t) || isCostWithoutVat_(t)) {
         phase = 2;
         i--;
         continue;
@@ -1637,7 +1684,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
     }
 
     if (phase === 2) {
-      if (looksLikeMoneySum_(t) || (isMoney_(t) && !isVatRate_(t))) {
+      if (isCostWithoutVat_(t)) {
         out[7] = t;
         phase = 3;
         continue;
@@ -1750,17 +1797,11 @@ function semanticMapGoodsRow_(cells, seqNum) {
 
   const pool = tokens.slice(pos);
 
-  if (!out[3]) {
-    out[3] = takeOkeiFromPool_(pool);
-  }
-  if (!out[4]) {
-    out[4] = takeFromPool_(pool, isUnitDesignation_);
-  }
-
   if (isDeliveryServiceRow_(out[1])) {
     assignDeliveryRowMetrics_(pool, out);
   } else {
     assignMetricsInDocumentOrder_(pool, out);
+    fixQtyPriceCostSlots_(out);
   }
 
   if (!out[3] && out[2] && isOkeiCode_(out[2])) {
