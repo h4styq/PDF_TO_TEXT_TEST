@@ -1356,7 +1356,7 @@ function isOcrNoiseLine_(line) {
   if (/количество\s+то-|код\s+стоимость|стоимость\s+то-/i.test(l)) {
     return true;
   }
-  if (/^ви-|^кларации|^п\/п\s*работ|^н[\s\*°]*п\s/i.test(l) && l.length < 40) {
+  if (/^ви-|^кларации|^п\/п\s*работ|^н[\s*°]*п\s/i.test(l) && l.length < 40) {
     return true;
   }
   if (/^[0-9]{1,2}\s+[0-9]{1,2}[a-zа-я]?\s*$/i.test(l)) {
@@ -1583,6 +1583,9 @@ function isUnitDesignation_(t) {
 /** Сумма с копейками / разрядами («3 125,00»), не количество. */
 function looksLikeMoneySum_(t) {
   const s = String(t || '').trim();
+  if (isQuantityThousandths_(s)) {
+    return false;
+  }
   if (/\d[\d\s]{2,}[.,]\d{2}$/.test(s)) {
     return true;
   }
@@ -1595,6 +1598,9 @@ function looksLikeMoneySum_(t) {
 function isQuantity_(t) {
   const s = String(t || '').trim();
   if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isVatRate_(s)) {
+    return false;
+  }
+  if (isQuantityThousandths_(s)) {
     return false;
   }
   if (/^\d{1,2}\s*%$/.test(s) || looksLikeMoneySum_(s)) {
@@ -1648,19 +1654,25 @@ function isMoney_(t) {
   return !isNaN(n) && n >= 500;
 }
 
-/** Количество в формате УПД: «700,000» = 700 (три знака после запятой). */
+/** Количество в формате УПД: «700,000» / «700.000» = 700 (три знака после разделителя). */
 function isQuantityThousandths_(t) {
-  const s = String(t || '').trim();
-  return /^\d{1,7},\d{3}$/.test(s);
+  const s = String(t || '')
+    .trim()
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s/g, '');
+  return /^\d{1,7}[.,]\d{3}$/.test(s);
 }
 
 function normalizeQuantityToken_(t) {
-  const s = String(t || '').trim();
-  const m = s.match(/^(\d{1,7}),\d{3}$/);
+  const s = String(t || '')
+    .trim()
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s/g, '');
+  const m = s.match(/^(\d{1,7})[.,]\d{3}$/);
   if (m) {
     return m[1];
   }
-  return s;
+  return String(t || '').trim();
 }
 
 function isQuantityFormatted_(t) {
@@ -1687,7 +1699,7 @@ function isCountryCode_(t) {
 
 function isCountryName_(t) {
   const s = String(t || '').trim();
-  return /^[A-Za-zА-Яа-яЁё\-]{3,}$/.test(s) && !isUnitDesignation_(s) && !isOkeiCode_(s) && !isMoney_(s);
+  return /^[A-Za-zА-Яа-яЁё-]{3,}$/.test(s) && !isUnitDesignation_(s) && !isOkeiCode_(s) && !isMoney_(s);
 }
 
 function isDeclReg_(t) {
@@ -1740,12 +1752,15 @@ function isCostWithoutVat_(t) {
   return isMoney_(t) && !isVatRate_(t);
 }
 
-/** Цена попала в «стоимость», кол-во×цена → стоимость. */
+/** Цена попала в «стоимость», кол-во×цена → стоимость; при пустом кол-ве — из стоимости/цены. */
 function fixQtyPriceCostSlots_(out) {
+  if (out[5]) {
+    out[5] = normalizeQuantityToken_(out[5]);
+  }
   const q = parseRuNumber_(out[5]);
   if (q > 0 && out[7] && !out[6]) {
     const v = parseRuNumber_(out[7]);
-    if (!isNaN(v) && v > 0) {
+    if (!isNaN(v) && v > 0 && isUnitPrice_(out[7])) {
       out[6] = out[7];
       out[7] = '';
     }
@@ -1756,6 +1771,19 @@ function fixQtyPriceCostSlots_(out) {
     const derived = Math.round(q2 * p2 * 100) / 100;
     if (derived > 0) {
       out[7] = String(derived).replace('.', ',');
+    }
+  }
+  const q3 = parseRuNumber_(out[5]);
+  const p3 = parseRuNumber_(out[6]);
+  const c3 = parseRuNumber_(out[7]);
+  if ((isNaN(q3) || q3 <= 0) && p3 > 0 && c3 > 0) {
+    const derivedQ = c3 / p3;
+    const rounded =
+      Math.abs(derivedQ - Math.round(derivedQ)) < 0.05
+        ? Math.round(derivedQ)
+        : Math.round(derivedQ * 1000) / 1000;
+    if (rounded > 0 && rounded < 1000000) {
+      out[5] = String(rounded).replace('.', ',');
     }
   }
 }
@@ -1860,7 +1888,16 @@ function assignMetricsInDocumentOrder_(pool, out) {
     }
 
     if (phase === 1) {
-      if (isUnitPrice_(t) || isPlainInteger_(t)) {
+      if (isUnitPrice_(t)) {
+        out[6] = t;
+        phase = 2;
+        continue;
+      }
+      if (isQuantityFormatted_(t) && !out[5]) {
+        out[5] = normalizeQuantityToken_(t);
+        continue;
+      }
+      if (isPlainInteger_(t)) {
         out[6] = t;
         phase = 2;
         continue;
@@ -2004,29 +2041,69 @@ function isStrongMetricStart_(t, hasName) {
   );
 }
 
-function takeFromPool_(pool, pred) {
-  for (let i = 0; i < pool.length; i++) {
-    if (pred(pool[i])) {
-      return pool.splice(i, 1)[0];
-    }
+/**
+ * Строка из ===TABLE=== Gemini уже с TAB-колонками — сохраняем позиции, не перетасовываем токены.
+ */
+function tryMapPrestructuredRow_(cells, seqNum) {
+  let r = stripLeadingProductCodeColumn_(
+    cells.map(function (x) {
+      return String(x || '').trim();
+    })
+  );
+  if (r.length < 8) {
+    return null;
   }
-  return '';
-}
-
-function takeOkeiFromPool_(pool) {
-  for (let i = 0; i < pool.length; i++) {
-    const next = pool[i + 1] || '';
-    if (isOkeiCodeWithContext_(pool[i], next)) {
-      return pool.splice(i, 1)[0];
-    }
+  let start = 0;
+  if (looksLikeSeqNumber_(r[0])) {
+    start = 1;
   }
-  return '';
+  const metricCount = CANONICAL_UPD_HEADERS.length - 2;
+  if (r.length - start < metricCount + 1) {
+    return null;
+  }
+  const tailStart = r.length - metricCount;
+  const name = cleanProductName_(r.slice(start, tailStart).join(' ').trim());
+  if (name.length < 4) {
+    return null;
+  }
+  const tail = r.slice(tailStart);
+  const structured =
+    isKodVidaTovara_(tail[0]) ||
+    isOkeiCodeWithContext_(tail[1], tail[2] || '') ||
+    isUnitDesignation_(tail[2]) ||
+    isQuantityFormatted_(tail[3]) ||
+    isUnitPrice_(tail[4]) ||
+    looksLikeMoneySum_(tail[5]) ||
+    looksLikeMoneySum_(tail[6]);
+  if (!structured) {
+    return null;
+  }
+  const out = [];
+  for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
+    out.push('');
+  }
+  out[0] = String(seqNum);
+  out[1] = name;
+  for (let i = 0; i < metricCount; i++) {
+    let v = tail[i] || '';
+    if (i === 3 && v) {
+      v = normalizeQuantityToken_(v);
+    }
+    out[2 + i] = v;
+  }
+  fixQtyPriceCostSlots_(out);
+  return out;
 }
 
 /**
  * Смысловое выравнивание: 796→код ОКЕИ, шт→условное обозначение, количество и суммы на свои места.
  */
 function semanticMapGoodsRow_(cells, seqNum) {
+  const prestructured = tryMapPrestructuredRow_(cells, seqNum);
+  if (prestructured) {
+    return prestructured;
+  }
+
   const out = [];
   for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
     out.push('');
