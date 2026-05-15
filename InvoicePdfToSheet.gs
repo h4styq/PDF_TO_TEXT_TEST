@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-em-split-table';
+const SCRIPT_VERSION = '2026-05-19-em-table-meta-fix';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2143,7 +2143,7 @@ function isOcrInvoiceMetaLine_(line) {
   if (/^[0-9]{1,2}\s*-\s*сч[её]т/i.test(l)) {
     return true;
   }
-  if (/основание\s+передачи|адрес\s+доставки|молодежная|жуковск/i.test(l) && !/^доставка\s+товара/i.test(l) && !/наконечник|колодк|00-\d|[ГG]\d{4}\./i.test(l)) {
+  if (/основание\s+передачи|адрес\s+доставки|молодежная|жуковск/i.test(l) && !/^доставка\s+товара/i.test(l) && !/\bДоставка\s+товара\b/i.test(l) && !/наконечник|колодк|00-\d|[ГG]\d{4}\./i.test(l)) {
     return true;
   }
   if (/^от\s+\d|^N[oº°]\s*-/i.test(l) && l.length < 50) {
@@ -2930,6 +2930,17 @@ function splitMergedGeminiTablePhysicalLines_(line) {
   const l = String(line || '').trim();
   if (!l || l.indexOf('\t') === -1) {
     return [l];
+  }
+  const declM = l.match(/(\d{7,}\/\d{5,}\/\d{6,})\t2(?:\t|$)/);
+  if (declM && declM.index !== undefined) {
+    const idxDecl = declM.index + declM[1].length;
+    const tailD = l.substring(idxDecl + 1).trim();
+    if (/^2[\t\s]/.test(tailD)) {
+      const headD = l.substring(0, idxDecl).trim();
+      if (headD.length >= 15) {
+        return [headD, tailD];
+      }
+    }
   }
   if (!/Доставка\s+товара/i.test(l)) {
     return [l];
