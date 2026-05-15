@@ -31,6 +31,9 @@ const DELETE_TEMP_DOCS = true;
 /** Имя листа для результата (создастся, если нет) */
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
+/** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
+const SCRIPT_VERSION = '2026-05-16-golden';
+
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
@@ -93,7 +96,36 @@ function onOpen() {
     .addItem('Сверить Дарт 4230 с эталоном', 'runGoldenCheckDart4230_')
     .addItem('Сверить Э прибор 11400 с эталоном', 'runGoldenCheckEpribor11400_')
     .addItem('Сверить Электромонтаж 13215 с эталоном', 'runGoldenCheckElectromontazh13215_')
+    .addSeparator()
+    .addItem('Проверить версию скрипта (есть ли сверка с эталоном)', 'verifyScriptHasGoldenChecks')
     .addToUi();
+}
+
+/** Сверка с эталоном — функции в начале файла, чтобы были видны в списке «Выполнить». */
+function runGoldenCheckDart4230_() {
+  runGoldenCheckForFile_('Дарт 4230.pdf');
+}
+
+function runGoldenCheckEpribor11400_() {
+  runGoldenCheckForFile_('Э прибор 11400.pdf');
+}
+
+function runGoldenCheckElectromontazh13215_() {
+  runGoldenCheckForFile_('Электромонтаж 13215.pdf');
+}
+
+/** Откройте этот пункт, если в списке функций нет runGoldenCheck… */
+function verifyScriptHasGoldenChecks() {
+  const hasDart = typeof runGoldenCheckDart4230_ === 'function';
+  const hasCore = typeof runGoldenCheckForFile_ === 'function';
+  const msg =
+    'Версия скрипта: ' +
+    SCRIPT_VERSION +
+    '\n\nСверка с эталоном: ' +
+    (hasDart && hasCore ? 'установлена' : 'НЕ найдена — замените Code.gs целиком из GitHub (InvoicePdfToSheet.gs, ~3100 строк)') +
+    '\n\nВ списке функций слева от «Выполнить» выберите файл, где открыт этот код (часто «Code.gs» или «InvoicePdfToSheet»).';
+  Logger.log(msg);
+  SpreadsheetApp.getUi().alert(msg);
 }
 
 /**
@@ -850,7 +882,10 @@ function showRecognitionSetupHelp() {
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
       '3) Сохраните свойства и снова запустите «Загрузить данные из папки Drive». При запросе разрешите доступ к внешней сети (UrlFetchApp).\n\n' +
       'Порядок: Gemini (PDF) → OCR.space → короткий запрос Gemini по тексту Doc. При 429 подождите 2–3 мин.\n\n' +
-      'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).'
+      'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).\n\n' +
+      'Сверка с эталоном: версия ' +
+      SCRIPT_VERSION +
+      '. В редакторе Ctrl+F → «2026-05-16-golden». Меню → «Проверить версию скрипта».'
   );
 }
 
@@ -3075,16 +3110,4 @@ function runGoldenCheckForFile_(fileName) {
     Logger.log('  ' + (i + 1) + '. ' + diffs[i]);
   }
   SpreadsheetApp.getActiveSpreadsheet().toast('Эталон: ' + diffs.length + ' расхождений — см. журнал', 'Сверка', 12);
-}
-
-function runGoldenCheckDart4230_() {
-  runGoldenCheckForFile_('Дарт 4230.pdf');
-}
-
-function runGoldenCheckEpribor11400_() {
-  runGoldenCheckForFile_('Э прибор 11400.pdf');
-}
-
-function runGoldenCheckElectromontazh13215_() {
-  runGoldenCheckForFile_('Электромонтаж 13215.pdf');
 }
