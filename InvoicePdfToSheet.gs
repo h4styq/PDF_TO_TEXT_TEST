@@ -6,12 +6,14 @@
  * 2) Включите сервис: Расширения → Apps Script → Сервисы → Google Drive API (v3).
  * 3) Первый запрос может запросить разрешения на Drive и Таблицы.
  *
- * ОГРАНИЧЕНИЯ PDF В APPS SCRIPT:
- * — Текст берётся после конвертации «PDF → Google Документ». Сканы без текстового слоя дадут пустой/бесполезный текст — нужен OCR (Document AI, Cloud Vision и т.д.), это уже вне этого скрипта.
- * — Поворот страницы на 90° иногда ломает порядок строк/таблиц при конвертации; надёжнее заранее выпрямить PDF (вручную или утилитой) либо использовать OCR по изображению страницы.
- * — Если в Doc «кракозябры» (>&F, случайные латинские куски без нормального русского текста) — это не ошибка скрипта: движок Google не смог извлечь текстовый слой из вашего PDF (часто скан, нестандартные шрифты, «картинка вместо текста»). Нужен другой исходный файл (OCR → поисковый PDF) или внешний OCR/API; Apps Script сам PDF не расшифрует.
+ * РАСПОЗНАВАНИЕ (основной путь, USE_PDF_TO_DOC_CONVERSION = false):
+ * — PDF не конвертируется в Google Doc (для сканов Doc обычно даёт «кракозябры» без пользы).
+ * — Текст и таблица извлекаются через Gemini (PDF) и/или OCR.space.
  *
- * РАСПОЗНАВАНИЕ (опционально), если конвертация PDF→Doc нечитаема:
+ * Запасной путь (USE_PDF_TO_DOC_CONVERSION = true):
+ * — Старый вариант: PDF → Google Doc → при необходимости Gemini/OCR.
+ *
+ * РАСПОЗНАВАНИЕ (ключи в свойствах скрипта):
  * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
  *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
  *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
@@ -25,14 +27,20 @@
 /** ID папки на Google Drive (из URL: .../folders/THIS_ID) */
 const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 
-/** true — удалять временные Google Docs после чтения текста */
+/**
+ * false (рекомендуется): не создавать Google Doc из PDF — только Gemini / OCR.space.
+ * true: сначала конвертация PDF→Doc, затем при необходимости внешнее API.
+ */
+const USE_PDF_TO_DOC_CONVERSION = false;
+
+/** true — удалять временные Google Docs после чтения (только если USE_PDF_TO_DOC_CONVERSION) */
 const DELETE_TEMP_DOCS = true;
 
 /** Имя листа для результата (создастся, если нет) */
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-16-golden7';
+const SCRIPT_VERSION = '2026-05-17-external-only';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -265,10 +273,83 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
 }
 
 /**
- * Конвертирует PDF в Google Doc, забирает плоский текст и пытается прочитать таблицы Document (структура УПД).
- * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string}}
+ * Извлечение текста/талицы из PDF: внешнее API (по умолчанию) или PDF→Doc (опционально).
+ * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string, usedExternalApi:boolean, textSource:string, externalStructured:string}}
  */
 function pdfToExtracted_(pdfFileId) {
+  if (!USE_PDF_TO_DOC_CONVERSION) {
+    return pdfToExtractedViaExternalOnly_(pdfFileId);
+  }
+  return pdfToExtractedViaGoogleDoc_(pdfFileId);
+}
+
+/**
+ * Распознавание без конвертации PDF→Google Doc (Gemini PDF → OCR.space).
+ */
+function pdfToExtractedViaExternalOnly_(pdfFileId) {
+  const props = PropertiesService.getScriptProperties();
+  const hasGemini = !!props.getProperty('GEMINI_API_KEY');
+  const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
+  Logger.log('API-ключи: Gemini=' + (hasGemini ? 'да' : 'нет') + ', OCR.space=' + (hasOcr ? 'да' : 'нет'));
+  Logger.log('Конвертация PDF→Doc отключена (USE_PDF_TO_DOC_CONVERSION = false).');
+
+  if (!hasGemini && !hasOcr) {
+    return {
+      text: '',
+      textLength: 0,
+      docTable: null,
+      conversionOk: false,
+      conversionNote:
+        'Задайте GEMINI_API_KEY и/или OCR_SPACE_API_KEY в свойствах скрипта. ' +
+        'Конвертация PDF→Google Doc отключена.',
+      usedExternalApi: false,
+      textSource: 'none',
+      externalStructured: '',
+    };
+  }
+
+  const improved = tryExternalTextExtraction_(pdfFileId, '');
+  let text = '';
+  let externalStructured = '';
+  let textSource = 'none';
+  let conversionOk = false;
+  let conversionNote = '';
+  let externalFailNote = '';
+
+  if (improved && improved.text) {
+    if (looksStructuredGemini_(improved.text)) {
+      externalStructured = normalizeText_(improved.text);
+    }
+    text = mergeExternalExtractIntoPlainText_(improved.text);
+    textSource = improved.source || 'external';
+    const q = analyzeDocTextQuality_(text);
+    conversionOk =
+      looksStructuredGemini_(improved.text) || q.readable || text.length >= 120 || textSource === 'ocr.space';
+    conversionNote = conversionOk ? '' : q.reason;
+    Logger.log('Текст из ' + textSource + ': ' + text.length + ' симв., readable=' + conversionOk);
+  } else {
+    externalFailNote =
+      ' Не удалось распознать PDF (часто Gemini HTTP 429 — пауза 2–3 мин; OCR.space — лимит размера файла).';
+    conversionNote = 'Внешнее распознавание не дало результата.';
+    conversionOk = false;
+  }
+
+  return {
+    text: text,
+    textLength: text ? text.length : 0,
+    docTable: null,
+    conversionOk: conversionOk,
+    conversionNote: conversionNote + externalFailNote,
+    usedExternalApi: true,
+    textSource: textSource,
+    externalStructured: externalStructured,
+  };
+}
+
+/**
+ * Старый путь: PDF → Google Doc, таблицы Document, при необходимости Gemini/OCR.
+ */
+function pdfToExtractedViaGoogleDoc_(pdfFileId) {
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -435,11 +516,15 @@ function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
     const g = tryGeminiPdfExtractAllModels_(pdfFileId, geminiKey);
     let geminiDocTextTried = false;
     if (g && g.rateLimited) {
-      Logger.log('Gemini: лимит 429 на PDF — сначала пробуем текст Google Doc, затем OCR.space.');
-      geminiDocTextTried = true;
-      const gtEarly = tryGeminiTextFromDoc_(docFallbackText, geminiKey);
-      if (gtEarly) {
-        return gtEarly;
+      if (docFallbackText && docFallbackText.length >= 80) {
+        Logger.log('Gemini: лимит 429 на PDF — сначала пробуем текст Google Doc, затем OCR.space.');
+        geminiDocTextTried = true;
+        const gtEarly = tryGeminiTextFromDoc_(docFallbackText, geminiKey);
+        if (gtEarly) {
+          return gtEarly;
+        }
+      } else {
+        Logger.log('Gemini: лимит 429 на PDF — переходим к OCR.space (текст Doc не используется).');
       }
     }
     if (g && g.text && g.text.length > 80) {
@@ -933,7 +1018,9 @@ function showRecognitionSetupHelp() {
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
       '3) Сохраните свойства и снова запустите «Загрузить данные из папки Drive». При запросе разрешите доступ к внешней сети (UrlFetchApp).\n\n' +
-      'Порядок: Gemini (PDF) → OCR.space → короткий запрос Gemini по тексту Doc. При 429 подождите 2–3 мин.\n\n' +
+      'Порядок: Gemini (PDF) → OCR.space' +
+      (USE_PDF_TO_DOC_CONVERSION ? ' → запасной запрос Gemini по тексту Doc.' : ' (конвертация PDF→Doc отключена).') +
+      ' При 429 подождите 2–3 мин.\n\n' +
       'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).\n\n' +
       'Сверка с эталоном: версия ' +
       SCRIPT_VERSION +
@@ -1236,8 +1323,9 @@ function splitHeaderAndDataFromMatrix_(matrix) {
  */
 function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNote, textSource, externalStructured) {
   if (conversionOk === false) {
-    const advice =
-      ' Рекомендации: распознать текст в Acrobat/ABBYY и сохранить поисковый PDF; или выгрузить PDF из учётной системы с текстовым слоем; повёрнутые страницы — выпрямить до OCR. В Google — Document AI / Vision API; на ПК — Python (PyMuPDF, pytesseract).';
+    const advice = USE_PDF_TO_DOC_CONVERSION
+      ? ' Рекомендации: GEMINI_API_KEY / OCR_SPACE_API_KEY; или PDF с текстовым слоем; повёрнутые страницы — выпрямить до OCR.'
+      : ' Задайте GEMINI_API_KEY и/или OCR_SPACE_API_KEY (меню «Как подключить распознавание»). При 429 подождите и повторите.';
     return {
       invoiceLine: (conversionNote || 'Конвертация PDF→Google Doc не дала читаемый текст.') + advice,
       seller: '',
