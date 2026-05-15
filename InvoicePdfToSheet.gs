@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-delivery-not-garbage';
+const SCRIPT_VERSION = '2026-05-19-electromontazh-ocr2';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2155,6 +2155,21 @@ function isOcrInvoiceMetaLine_(line) {
   return false;
 }
 
+/** OCR: строка услуги доставки без полной шапки таблицы «наименование». */
+function isLikelyOcrDeliveryProductLine_(line) {
+  const l = String(line || '').trim();
+  if (/^доставка\s+товара/i.test(l)) {
+    return true;
+  }
+  if (/^2\s+/i.test(l) && /доставк/i.test(l)) {
+    return true;
+  }
+  if (/\bдоставк\w*\s+товара\b/i.test(l)) {
+    return true;
+  }
+  return false;
+}
+
 function looksLikeProductDataLine_(line) {
   if (isOcrNoiseLine_(line) || isOcrInvoiceMetaLine_(line)) {
     return false;
@@ -2164,7 +2179,10 @@ function looksLikeProductDataLine_(line) {
     return false;
   }
   if (/^доставка\s+товара/i.test(l)) {
-    return /адрес\s+доставки|\d+[.,]\d{2}/i.test(l);
+    return /адрес\s+доставки|\d+[.,]\d{2}|москва|ленинск|слобода/i.test(l);
+  }
+  if (/^2\s+/i.test(l) && /доставк/i.test(l)) {
+    return /адрес|москва|452|543|\d+[.,]\d{2}/i.test(l);
   }
   if (looksLikeOcrProductSkuLine_(l)) {
     return /\d+[.,]\d{2}|796|,\d{3}|\d+\s*%|без\s+акциза/i.test(l);
@@ -2826,7 +2844,7 @@ function parseOcrProductRowsOnly_(text) {
     if (/всего\s+к\s+оплате/i.test(line)) {
       break;
     }
-    if (!inTableRegion && !looksLikeOcrProductSkuLine_(line)) {
+    if (!inTableRegion && !looksLikeOcrProductSkuLine_(line) && !isLikelyOcrDeliveryProductLine_(line)) {
       continue;
     }
     if (!looksLikeProductDataLine_(line)) {
@@ -3826,6 +3844,20 @@ function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
   return semanticMapGoodsRow_(cells, seqNum);
 }
 
+/** Номер декларации: OCR может слить слэши в пробелы. */
+function extractElectromontazhDeclarationFromFlat_(flat) {
+  const ft = String(flat || '').replace(/\s+/g, ' ');
+  let m = ft.match(/\b(\d{6,}\/\d{5,}\/\d{6,})\b/);
+  if (m) {
+    return m[1];
+  }
+  m = ft.match(/\b(\d{7,})\s+(\d{5,})\s+(\d{6,})\b/);
+  if (m) {
+    return m[1] + '/' + m[2] + '/' + m[3];
+  }
+  return '';
+}
+
 /** Исправления OCR для УПД ЗАО «МПО Электромонтаж»: страна, декларация, сумма с НДС. */
 function repairElectromontazhOcrMappedRow_(mapped, fullText) {
   const name = String(mapped[1] || '');
@@ -3837,9 +3869,9 @@ function repairElectromontazhOcrMappedRow_(mapped, fullText) {
     }
   }
   if (/[ГG]8510|нак\s*онечник\s+47482/i.test(name)) {
-    const decl = ft.match(/(\d{7,}\/\d{5,}\/\d{6,})/);
-    if (decl && !String(mapped[14] || '').trim()) {
-      mapped[14] = decl[1];
+    const declNum = extractElectromontazhDeclarationFromFlat_(ft);
+    if (declNum && !String(mapped[14] || '').trim()) {
+      mapped[14] = declNum;
     }
     if (String(mapped[12] || '').trim() === '156') {
       if (!String(mapped[13] || '').trim() || /^без$/i.test(String(mapped[13]).trim())) {
@@ -4140,8 +4172,8 @@ function normalizeBasisField_(basis, fullText) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (/9677\/19|мпо\s*["«]?электромонтаж|зао\s*["«]?мпо/i.test(flat)) {
-    const emBasis = pickElectromontazhBasisFromFlat_(flat);
+  if (/9677\s*\/?\s*19|532483|[ГG]\s*8510|нак\s*онечник|электромонтаж|мпо|зао/i.test(flat)) {
+    const emBasis = pickElectromontazhBasisFromFlat_(flat) || pickElectromontazhBasisFromFlatLoose_(flat);
     if (emBasis) {
       return emBasis;
     }
@@ -4183,6 +4215,28 @@ function pickElectromontazhBasisFromFlat_(flat) {
     date = '21.01.2025';
   }
   return 'Счёт-договор № ' + fixBasisContractNumberOcr_(contract + ' от ' + date);
+}
+
+/** То же основание при разорванном OCR («532483 от …» без читаемого «Счёт-договор»). */
+function pickElectromontazhBasisFromFlatLoose_(flat) {
+  if (!/532483/i.test(flat)) {
+    return '';
+  }
+  const tight = flat.match(/532483[^\d]{0,35}от\s+(\d{2}\.\d{2}\.\d{4})/i);
+  if (tight) {
+    let date = tight[1];
+    if (date === '27.01.2025' && /\b21\.01\.2025\b/.test(flat)) {
+      date = '21.01.2025';
+    }
+    return 'Счёт-договор № 3Д532483 от ' + date;
+  }
+  if (/\b21\.01\.2025\b/.test(flat)) {
+    return 'Счёт-договор № 3Д532483 от 21.01.2025';
+  }
+  if (/\b27\.01\.2025\b/.test(flat)) {
+    return 'Счёт-договор № 3Д532483 от 27.01.2025';
+  }
+  return '';
 }
 
 function writeParsedRows_(sheet, items, maxTableCols) {
