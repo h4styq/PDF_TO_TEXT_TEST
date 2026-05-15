@@ -91,6 +91,7 @@ function onOpen() {
     .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
     .addSeparator()
     .addItem('Сверить Дарт 4230 с эталоном', 'runGoldenCheckDart4230_')
+    .addItem('Сверить Э прибор 11400 с эталоном', 'runGoldenCheckEpribor11400_')
     .addToUi();
 }
 
@@ -1735,6 +1736,9 @@ function looksLikeProductCode_(s) {
   if (/^\d{1,3}([.,]\d{2})?$/.test(t)) {
     return false;
   }
+  if (/^\d{2,}\.\d{3,}\.\d{3,}/.test(t)) {
+    return false;
+  }
   if (/^00-\d+/.test(t)) {
     return true;
   }
@@ -1854,7 +1858,14 @@ function isQuantity_(t) {
 /** Цена за единицу (5,83 / 8.80 / 25,00). */
 function isUnitPrice_(t) {
   const s = String(t || '').trim();
-  if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isQuantity_(s) || isQuantityThousandths_(s)) {
+  if (
+    !s ||
+    isOkeiCode_(s) ||
+    isUnitDesignation_(s) ||
+    isQuantity_(s) ||
+    isQuantityThousandths_(s) ||
+    isQuantityHundredths_(t)
+  ) {
     return false;
   }
   if (looksLikeMoneySum_(s)) {
@@ -1903,11 +1914,36 @@ function normalizeQuantityToken_(t) {
   if (m) {
     return m[1];
   }
+  if (isQuantityHundredths_(t)) {
+    const n = Math.round(parseRuNumber_(t));
+    return String(n) + ',00';
+  }
   return String(t || '').trim();
+}
+
+/** Количество «700,00» / «250,00» — целое число с двумя нулями после запятой. */
+function isQuantityHundredths_(t) {
+  const s = String(t || '')
+    .trim()
+    .replace(/\s/g, '');
+  if (!/^\d{1,7}[.,]\d{2}$/.test(s)) {
+    return false;
+  }
+  if (isQuantityThousandths_(t)) {
+    return false;
+  }
+  const n = parseRuNumber_(t);
+  if (isNaN(n) || n < 10) {
+    return false;
+  }
+  return Math.abs(n - Math.round(n)) < 0.001;
 }
 
 function isQuantityFormatted_(t) {
   if (isQuantityThousandths_(t)) {
+    return true;
+  }
+  if (isQuantityHundredths_(t)) {
     return true;
   }
   return isPlainInteger_(t);
@@ -2280,6 +2316,7 @@ function isStrongMetricStart_(t, hasName) {
     isOkeiCode_(t) ||
     isUnitDesignation_(t) ||
     isQuantityThousandths_(t) ||
+    isQuantityHundredths_(t) ||
     isQuantity_(t) ||
     isMoney_(t) ||
     isVatRate_(t)
@@ -2441,6 +2478,9 @@ function extractSellerByNameHint_(text) {
   const chunk = m[2].replace(/\s+/g, ' ').trim();
   if (/дарт\s+холдинг/i.test(chunk)) {
     return 'ООО "ДАРТ ХОЛДИНГ"';
+  }
+  if (/электроприбор/i.test(chunk)) {
+    return 'ООО "Электроприбор"';
   }
   return m[1] + ' "' + chunk + '"';
 }

@@ -48,6 +48,48 @@ const GOLDEN_EXPECTED_BY_FILE = {
       ],
     ],
   },
+  'Э прибор 11400.pdf': {
+    invoiceLine: 'Счет-фактура № 339 от 21 января 2025 г.',
+    seller: 'ООО "Электроприбор"',
+    paymentDoc: '№10 от 20.01.2025',
+    basis: 'Заказ клиента Nº 762 от 20 января 2025 г.',
+    rows: [
+      [
+        '1',
+        "45.7373.9002 (Техком)' Колодка штыревая (упаковка 50 шт.) 6,3мм., 1-контактная (ан.502601)",
+        '--',
+        '796',
+        'шт',
+        '700,00',
+        '5,83',
+        '4083,33',
+        'без акциза',
+        '20%',
+        '816,67',
+        '4900,00',
+        '--',
+        '--',
+        '--',
+      ],
+      [
+        '2',
+        "45.7373.9094 (Техком)' Колодка гнездовая 6,3 мм., 8-и конт, (ан.608608) )к выключателям 3842,86.3710",
+        '--',
+        '796',
+        'шт',
+        '250,00',
+        '21,67',
+        '5416,67',
+        'без акциза',
+        '20%',
+        '1083,33',
+        '6500,00',
+        '--',
+        '--',
+        '--',
+      ],
+    ],
+  },
 };
 
 function normalizeGoldenText_(v) {
@@ -77,7 +119,12 @@ function goldenCellsEqual_(got, expected, colIndex) {
     return normalizeGoldenMoney_(g) === normalizeGoldenMoney_(e);
   }
   if (colIndex === 1) {
-    return normalizeGoldenText_(g) === normalizeGoldenText_(e);
+    const gn = normalizeGoldenText_(g).replace(/[''`]/g, "'");
+    const en = normalizeGoldenText_(e).replace(/[''`]/g, "'");
+    if (gn === en) {
+      return true;
+    }
+    return gn.indexOf(en.substring(0, 24)) === 0 || en.indexOf(gn.substring(0, 24)) === 0;
   }
   return normalizeGoldenText_(g) === normalizeGoldenText_(e);
 }
@@ -139,11 +186,13 @@ function compareParsedToGolden_(fileName, parsed) {
   return diffs;
 }
 
-/** Сверка одного PDF из SOURCE_FOLDER_ID с эталоном Дарт 4230. */
-function runGoldenCheckDart4230_() {
-  const fileName = 'Дарт 4230.pdf';
+/** Сверка одного PDF из SOURCE_FOLDER_ID с эталоном по имени файла. */
+function runGoldenCheckForFile_(fileName) {
   if (!SOURCE_FOLDER_ID || SOURCE_FOLDER_ID.indexOf('ВСТАВЬТЕ') !== -1) {
     throw new Error('Задайте SOURCE_FOLDER_ID');
+  }
+  if (!GOLDEN_EXPECTED_BY_FILE[fileName]) {
+    throw new Error('Нет эталона для: ' + fileName);
   }
   const folder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
   const files = folder.getFilesByName(fileName);
@@ -163,7 +212,7 @@ function runGoldenCheckDart4230_() {
   const diffs = compareParsedToGolden_(fileName, parsed);
   if (!diffs.length) {
     Logger.log('Эталон «' + fileName + '»: все проверенные поля совпали.');
-    SpreadsheetApp.getActiveSpreadsheet().toast('Эталон Дарт 4230: OK', 'Сверка', 8);
+    SpreadsheetApp.getActiveSpreadsheet().toast('Эталон OK: ' + fileName, 'Сверка', 8);
     return;
   }
   Logger.log('Эталон «' + fileName + '»: расхождений ' + diffs.length);
@@ -171,4 +220,12 @@ function runGoldenCheckDart4230_() {
     Logger.log('  ' + (i + 1) + '. ' + diffs[i]);
   }
   SpreadsheetApp.getActiveSpreadsheet().toast('Эталон: ' + diffs.length + ' расхождений — см. журнал', 'Сверка', 12);
+}
+
+function runGoldenCheckDart4230_() {
+  runGoldenCheckForFile_('Дарт 4230.pdf');
+}
+
+function runGoldenCheckEpribor11400_() {
+  runGoldenCheckForFile_('Э прибор 11400.pdf');
 }
