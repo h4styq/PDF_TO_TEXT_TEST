@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-17-ocr-metrics';
+const SCRIPT_VERSION = '2026-05-17-gx-segment';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1570,25 +1570,72 @@ function normalizeGoldenInvoiceLine_(v) {
   return normalizeGoldenText_(v).replace(/(\d{4})\s+г\b/, '$1г');
 }
 
-/** Фрагмент OCR вокруг GX / услуги доставки (метрики часто в соседних «ячейках»). */
-function repairOcrMetricsFromTextWindow_(out, fullText, nameHint) {
-  if (!fullText) {
+/** Узкий фрагмент OCR только для одной позиции (без следующей строки УПД). */
+function extractOcrSegmentForProduct_(fullText, nameHint) {
+  const t = normalizeText_(fullText);
+  const name = String(nameHint || '');
+  if (/gx\d|gx12|розетк/i.test(name)) {
+    let m = t.match(
+      /gx12[\s\S]{0,520}?(?=\s*2\s+[\s\S]{0,30}услуг|\s*2\s+услуг|услуг\s+по\s+организации|организации\s+доставки)/i
+    );
+    if (!m) {
+      m = t.match(/gx12[\s\S]{0,520}/i) || t.match(/gx\d[\s\S]{0,520}/i);
+    }
+    return m ? m[0] : '';
+  }
+  if (/услуг|доставк|упаковк/i.test(name)) {
+    let m = t.match(
+      /(?:^|\n)\s*2\s+[^\n]*(?:услуг|доставк|упаковк)[\s\S]{0,360}?(?=\n\s*(?:всего|3[\s\t])|$)/i
+    );
+    if (!m) {
+      m = t.match(/услуг\s+по\s+организации[\s\S]{0,380}/i);
+    }
+    return m ? m[0] : '';
+  }
+  return '';
+}
+
+/** Строка товара GX: суммы только из своего фрагмента (не доставка 400+80). */
+function repairGxProductRowMetrics_(out, fullText) {
+  if (!/gx\d|gx12|розетк/i.test(out[1] || '')) {
     return;
   }
-  const flat = String(fullText || '').replace(/\u00a0/g, ' ');
-  let segment = '';
-  if (/gx\d|gx12/i.test(nameHint || '') || /gx\d/i.test(out[1] || '')) {
-    const m = flat.match(/gx12[\s\S]{0,700}/i) || flat.match(/gx\d[\s\S]{0,700}/i);
-    segment = m ? m[0] : '';
-  } else if (/услуг|доставк|упаковк/i.test(nameHint || '')) {
-    const m = flat.match(/услуг[\s\S]{0,400}?(?:доставк|упаковк)[\s\S]{0,400}/i);
-    segment = m ? m[0] : '';
-  }
-  if (!segment) {
+  const seg = extractOcrSegmentForProduct_(fullText, out[1]);
+  if (!seg) {
     return;
   }
-  const oneLine = segment.replace(/\s+/g, ' ').trim();
-  repairOcrMetricsFromSourceLine_(out, oneLine);
+  const line = seg.replace(/\s+/g, ' ').trim();
+  repairOcrMetricsFromSourceLine_(out, line);
+  const scraped = scrapeMoneyNumbersFromLine_(line);
+  tryAssignCostVatTotalTriple_(out, scraped, 500);
+  inferQtyPriceFromCost_(out, line);
+  const cost = parseRuNumber_(out[7]);
+  const q = parseRuNumber_(out[5]);
+  if (cost >= 1000 && (q === 1 || q === 2)) {
+    out[5] = '';
+    out[6] = '';
+    inferQtyPriceFromCost_(out, line);
+  }
+  if (!out[3]) {
+    out[3] = '796';
+  }
+  if (!out[4]) {
+    out[4] = 'шт';
+  }
+}
+
+/** Услуга доставки: тройка с небольшой стоимостью (400+80=480). */
+function repairDeliveryProductRowMetrics_(out, fullText) {
+  if (!/услуг|доставк|упаковк/i.test(out[1] || '')) {
+    return;
+  }
+  const seg = extractOcrSegmentForProduct_(fullText, out[1]);
+  const line = (seg || fullText || '').replace(/\s+/g, ' ').trim();
+  const scraped = scrapeMoneyNumbersFromLine_(line);
+  tryAssignCostVatTotalTriple_(out, scraped, 0);
+  repairOcrMetricsFromSourceLine_(out, line);
+  fixSwappedQtyPrice_(out);
+  fixVatTotalSlotConfusion_(out);
 }
 
 function sanitizeOcrInvoiceLine_(invoiceLine, fullText) {
@@ -2077,9 +2124,11 @@ function scrapeMoneyNumbersFromLine_(line) {
 
 /**
  * Тройка сумм УПД: стоимость + НДС = всего (3125+625=3750, 400+80=480).
+ * @param {number} [minCost] минимальная «стоимость без НДС» (для строки товара GX — не брать 400+80).
  * @return {boolean}
  */
-function tryAssignCostVatTotalTriple_(out, nums) {
+function tryAssignCostVatTotalTriple_(out, nums, minCost) {
+  const minC = minCost || 0;
   const unique = [];
   for (let i = 0; i < nums.length; i++) {
     const n = nums[i];
@@ -2092,6 +2141,7 @@ function tryAssignCostVatTotalTriple_(out, nums) {
   unique.sort(function (a, b) {
     return a - b;
   });
+  let best = null;
   for (let k = unique.length - 1; k >= 2; k--) {
     const total = unique[k];
     for (let i = 0; i < k; i++) {
@@ -2107,12 +2157,23 @@ function tryAssignCostVatTotalTriple_(out, nums) {
         if (ratio < 0.05 || ratio > 0.35) {
           continue;
         }
-        out[7] = formatRuMoney_(cost);
-        out[10] = formatRuMoney_(vat);
-        out[11] = formatRuMoney_(total);
-        return true;
+        if (cost < minC) {
+          continue;
+        }
+        if (!best || cost > best.cost) {
+          best = { cost: cost, vat: vat, total: total };
+        }
       }
     }
+  }
+  if (best) {
+    out[7] = formatRuMoney_(best.cost);
+    out[10] = formatRuMoney_(best.vat);
+    out[11] = formatRuMoney_(best.total);
+    return true;
+  }
+  if (minC > 0) {
+    return tryAssignCostVatTotalTriple_(out, nums, 0);
   }
   return false;
 }
@@ -2147,8 +2208,13 @@ function inferQtyPriceFromCost_(out, line) {
       const x = ints[a];
       const y = ints[b];
       if (Math.abs(x * y - cost) < 1.5) {
-        out[5] = String(Math.min(x, y));
-        out[6] = formatRuMoney_(Math.max(x, y));
+        const qty = Math.min(x, y);
+        const price = Math.max(x, y);
+        if (/gx\d|gx12|розетк/i.test(out[1] || '') && cost >= 1000 && qty <= 5 && price > cost * 0.5) {
+          continue;
+        }
+        out[5] = String(qty);
+        out[6] = formatRuMoney_(price);
         return;
       }
     }
@@ -2238,7 +2304,8 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
   }
   const scraped = scrapeMoneyNumbersFromLine_(l);
   if (scraped.length >= 3) {
-    tryAssignCostVatTotalTriple_(out, scraped);
+    const minC = /gx\d|gx12|розетк/i.test(out[1] || '') ? 500 : 0;
+    tryAssignCostVatTotalTriple_(out, scraped, minC);
   }
   inferQtyPriceFromCost_(out, l);
   fixVatTotalSlotConfusion_(out);
@@ -2272,7 +2339,7 @@ function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
       }
     }
   }
-  if (!mapped[5]) {
+  if (!mapped[5] && isDeliveryServiceRow_(mapped[1])) {
     for (let c = 6; c <= 8; c++) {
       const v = String(mapped[c] || '').trim();
       if (/^[12]$/.test(v)) {
@@ -2284,26 +2351,25 @@ function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   }
   fixSwappedQtyPrice_(mapped);
   let lineForRepair = sourceLine;
+  const segment = fullText ? extractOcrSegmentForProduct_(fullText, mapped[1]) : '';
   if (fullText) {
     const better = findOcrProductLineForRow_(fullText, mapped[1]);
     if (better && (!lineForRepair || (lineForRepair.indexOf('796') < 0 && better.indexOf('796') >= 0))) {
       lineForRepair = better;
     }
-  }
-  if (lineForRepair) {
-    repairOcrMetricsFromSourceLine_(mapped, lineForRepair);
-  }
-  if (fullText) {
-    repairOcrMetricsFromTextWindow_(mapped, fullText, mapped[1]);
-    if (!mapped[5] || !mapped[6]) {
-      inferQtyPriceFromCost_(mapped, fullText.replace(/\n/g, ' '));
+    if (segment && segment.length > (lineForRepair || '').length) {
+      lineForRepair = segment.replace(/\s+/g, ' ').trim();
     }
   }
-  if (!mapped[3] && /gx|розетк|796/i.test(fullText || lineForRepair || '')) {
-    mapped[3] = '796';
-  }
-  if (!mapped[4] && /gx|розетк|услуг|796|шт/i.test((mapped[1] || '') + (lineForRepair || ''))) {
-    mapped[4] = 'шт';
+  if (/gx\d|gx12|розетк/i.test(mapped[1] || '')) {
+    repairGxProductRowMetrics_(mapped, fullText || lineForRepair);
+  } else if (/услуг|доставк|упаковк/i.test(mapped[1] || '')) {
+    repairDeliveryProductRowMetrics_(mapped, fullText);
+    if (lineForRepair) {
+      repairOcrMetricsFromSourceLine_(mapped, lineForRepair);
+    }
+  } else if (lineForRepair) {
+    repairOcrMetricsFromSourceLine_(mapped, lineForRepair);
   }
   fixVatTotalSlotConfusion_(mapped);
   fixQtyPriceCostSlots_(mapped);
