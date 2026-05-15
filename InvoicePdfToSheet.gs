@@ -141,8 +141,6 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const rows = [];
   let maxTableCols = 0;
   let pauseBeforeNextPdf = false;
-  /** После 429 на PDF не гоняем остальные модели и следующие файлы — сразу OCR.space */
-  const runState = { geminiSkip: false };
 
   while (files.hasNext()) {
     if (pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
@@ -158,7 +156,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     const file = files.next();
     Logger.log('PDF: ' + file.getName());
     try {
-      const pack = pdfToExtracted_(file.getId(), runState);
+      const pack = pdfToExtracted_(file.getId());
       if (pack.usedExternalApi) {
         pauseBeforeNextPdf = true;
       }
@@ -206,7 +204,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
  * Конвертирует PDF в Google Doc, забирает плоский текст и пытается прочитать таблицы Document (структура УПД).
  * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string}}
  */
-function pdfToExtracted_(pdfFileId, runState) {
+function pdfToExtracted_(pdfFileId) {
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -236,7 +234,7 @@ function pdfToExtracted_(pdfFileId, runState) {
         'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
       );
       usedExternalApi = true;
-      const improved = tryExternalTextExtraction_(pdfFileId, text, runState);
+      const improved = tryExternalTextExtraction_(pdfFileId, text);
       if (improved && improved.text) {
         const merged = mergeExternalExtractIntoPlainText_(improved.text);
         const q2 = analyzeDocTextQuality_(merged);
@@ -264,7 +262,7 @@ function pdfToExtracted_(pdfFileId, runState) {
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
     usedExternalApi = true;
-    const improved = tryExternalTextExtraction_(pdfFileId, text, runState);
+    const improved = tryExternalTextExtraction_(pdfFileId, text);
     if (improved && improved.text) {
       const merged = mergeExternalExtractIntoPlainText_(improved.text);
       text = merged;
@@ -341,17 +339,14 @@ function looksStructuredGemini_(raw) {
  * @param {string} pdfFileId
  * @param {string} [docFallbackText] текст после PDF→Doc (запасной путь без повторной загрузки PDF)
  */
-function tryExternalTextExtraction_(pdfFileId, docFallbackText, runState) {
+function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
   const props = PropertiesService.getScriptProperties();
   const geminiKey = props.getProperty('GEMINI_API_KEY');
-  if (geminiKey && !(runState && runState.geminiSkip)) {
+  if (geminiKey) {
     Logger.log('Пробуем распознавание через Gemini (PDF, модели: ' + getGeminiModelsToTry_().join(' → ') + ')…');
     const g = tryGeminiPdfExtractAllModels_(pdfFileId, geminiKey);
     if (g && g.rateLimited) {
-      Logger.log('Gemini: лимит 429 — остальные PDF в этом запуске пойдут сразу в OCR.space (без повторных вызовов Gemini).');
-      if (runState) {
-        runState.geminiSkip = true;
-      }
+      Logger.log('Gemini: лимит 429 на этом PDF — переходим к OCR.space (следующий PDF снова попробует Gemini после паузы).');
     }
     if (g && g.text && g.text.length > 80) {
       const merged = mergeExternalExtractIntoPlainText_(g.text);
@@ -1492,6 +1487,9 @@ function isGarbageMappedRow_(mapped) {
   if (/^00-\d{5,}$/i.test(name) && !mapped[7] && !mapped[11] && !mapped[6]) {
     return true;
   }
+  if (isNumericOnlyProductName_(name)) {
+    return true;
+  }
   if (isDeliveryServiceRow_(name)) {
     return !!(mapped[11] || mapped[7] || mapped[10]);
   }
@@ -1505,17 +1503,40 @@ function isGarbageMappedRow_(mapped) {
   return !(hasMetric || hasUnit || hasOkei);
 }
 
+/** Наименование — только цифры (ошибка TAB-выравнивания OCR). */
+function isNumericOnlyProductName_(name) {
+  const n = String(name || '').trim();
+  if (!n) {
+    return true;
+  }
+  if (/gx\d|розетк|колодк|наконечник|услуг|доставк|45\.\d{4}/i.test(n)) {
+    return false;
+  }
+  return /^[\d\s.,]+$/.test(n.replace(/\s+/g, ''));
+}
+
 /** Наименование и кол-во попали не в те графы после OCR. */
 function repairScrambledOcrRow_(mapped) {
   const rawName = String(mapped[1] || '').trim();
-  if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName)) {
+  if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName) || isNumericOnlyProductName_(rawName)) {
     for (let c = 2; c < mapped.length; c++) {
       const v = String(mapped[c] || '').trim();
       if (!v) {
         continue;
       }
-      if (/45\.\d{4}|колодк|наконечник|розетк|gx\d|техком|\(техком\)/i.test(v)) {
-        mapped[1] = cleanProductName_(v + ' [' + rawName + ']');
+      if (/45\.\d{4}|колодк|наконечник|розетк|gx\d|техком|\(техком\)|g\d{4}\./i.test(v)) {
+        const sku = /^00-\d{5,}$/i.test(rawName) ? ' [' + rawName + ']' : '';
+        mapped[1] = cleanProductName_(v + sku);
+        mapped[c] = '';
+        break;
+      }
+    }
+  }
+  if (isNumericOnlyProductName_(mapped[1])) {
+    for (let c = 2; c < mapped.length; c++) {
+      const v = String(mapped[c] || '').trim();
+      if (/gx\d|розетк|колодк|наконечник|услуг.*доставк|g\d{4}\./i.test(v)) {
+        mapped[1] = cleanProductName_(v);
         mapped[c] = '';
         break;
       }
@@ -1532,6 +1553,72 @@ function repairScrambledOcrRow_(mapped) {
     }
   }
   fixQtyPriceCostSlots_(mapped);
+}
+
+/**
+ * Разбор одной OCR-строки товара (часто без TAB, с «796 шт» в середине).
+ */
+function tokenizeOcrProductLine_(line) {
+  const l = String(line || '').replace(/\u00a0/g, ' ').trim();
+  if (!l) {
+    return [];
+  }
+  if (l.indexOf('\t') !== -1) {
+    const tabbed = splitTableLine_(l);
+    if (tabbed.length >= 6) {
+      return tabbed;
+    }
+  }
+  const wide = l
+    .split(/\s{2,}/)
+    .map(function (x) {
+      return x.trim();
+    })
+    .filter(function (x) {
+      return x.length > 0;
+    });
+  if (wide.length >= 6) {
+    return wide;
+  }
+  const okeiMatch = l.match(/(?:^|\s)(796)\s+(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
+  if (!okeiMatch) {
+    return wide.length >= 2 ? wide : splitTableLine_(l);
+  }
+  const okeiIdx = l.indexOf(okeiMatch[1], okeiMatch.index);
+  let before = l.substring(0, okeiIdx).trim();
+  let after = l.substring(okeiIdx + okeiMatch[0].trim().length).trim();
+  const tokens = [];
+  let sm = before.match(/^(\d{1,2})\s+/);
+  if (sm) {
+    tokens.push(sm[1]);
+    before = before.substring(sm[0].length).trim();
+  }
+  sm = before.match(/^(00-\d{5,})\s*/);
+  if (sm) {
+    tokens.push(sm[1]);
+    before = before.substring(sm[0].length).trim();
+  }
+  sm = before.match(/^([-—])\s*/);
+  if (sm) {
+    tokens.push(sm[1]);
+    before = before.substring(sm[0].length).trim();
+  }
+  if (before) {
+    tokens.push(before);
+  }
+  tokens.push('796');
+  tokens.push(/^шт/i.test(okeiMatch[2]) ? 'шт' : okeiMatch[2]);
+  const afterParts =
+    after.match(
+      /(\d{1,2}\s*%|без\s+акциза|без|\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2,3}|\d{1,7}(?:,\d{3})?|--|—|-|156|643|КИТАЙ|[A-Za-zА-Яа-яЁё]{4,}|\d{8,}\/\d+)/gi
+    ) || [];
+  for (let i = 0; i < afterParts.length; i++) {
+    const p = afterParts[i].trim();
+    if (p && p.length > 0) {
+      tokens.push(p);
+    }
+  }
+  return tokens.length >= 4 ? tokens : splitTableLine_(l);
 }
 
 /** Строки товаров из «сырого» OCR-текста (без шапки УПД и мусорных строк). */
@@ -1567,7 +1654,7 @@ function parseOcrProductRowsOnly_(text) {
         j++;
       }
     }
-    const cells = splitTableLine_(line);
+    const cells = tokenizeOcrProductLine_(line);
     if (cells.length >= 2) {
       rows.push(cells);
     }
@@ -1682,6 +1769,13 @@ function parseRuNumber_(s) {
     .replace(',', '.');
   const n = parseFloat(t);
   return isNaN(n) ? NaN : n;
+}
+
+function formatRuMoney_(n) {
+  if (isNaN(n) || n <= 0) {
+    return '';
+  }
+  return String(Math.round(n * 100) / 100).replace('.', ',');
 }
 
 function isOkeiCode_(t) {
@@ -1916,6 +2010,20 @@ function fixQtyPriceCostSlots_(out) {
     if (rounded > 0 && rounded < 1000000) {
       out[5] = String(rounded).replace('.', ',');
     }
+  }
+  const totalVat = parseRuNumber_(out[11]);
+  const vatAmt = parseRuNumber_(out[10]);
+  if (!out[7] && totalVat > 0) {
+    if (vatAmt > 0) {
+      out[7] = formatRuMoney_(totalVat - vatAmt);
+    } else if (out[9] && /20/.test(String(out[9]))) {
+      out[7] = formatRuMoney_(totalVat / 1.2);
+    }
+  }
+  const q4 = parseRuNumber_(out[5]);
+  const c4 = parseRuNumber_(out[7]);
+  if (!out[6] && q4 > 0 && c4 > 0) {
+    out[6] = formatRuMoney_(c4 / q4);
   }
 }
 
@@ -2197,6 +2305,10 @@ function tryMapPrestructuredRow_(cells, seqNum) {
   if (name.length < 4) {
     return null;
   }
+  const cyrInName = (name.match(/[а-яА-ЯёЁ]/g) || []).length;
+  if (cyrInName < 4 || isNumericOnlyProductName_(name)) {
+    return null;
+  }
   const tail = r.slice(tailStart);
   const structured =
     isKodVidaTovara_(tail[0]) ||
@@ -2230,7 +2342,10 @@ function tryMapPrestructuredRow_(cells, seqNum) {
  * Смысловое выравнивание: 796→код ОКЕИ, шт→условное обозначение, количество и суммы на свои места.
  */
 function semanticMapGoodsRow_(cells, seqNum) {
-  const prestructured = tryMapPrestructuredRow_(cells, seqNum);
+  let prestructured = tryMapPrestructuredRow_(cells, seqNum);
+  if (prestructured && isNumericOnlyProductName_(prestructured[1])) {
+    prestructured = null;
+  }
   if (prestructured) {
     return prestructured;
   }
