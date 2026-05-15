@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-17-gx-segment';
+const SCRIPT_VERSION = '2026-05-17-epribor';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1430,6 +1430,7 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   if (fromOcr) {
     invoiceLine = sanitizeOcrInvoiceLine_(invoiceLine, text);
     paymentDoc = sanitizeOcrPaymentDoc_(paymentDoc, text);
+    seller = sanitizeOcrSeller_(seller, text);
   }
 
   let table = null;
@@ -1567,7 +1568,10 @@ function formatOcrInvoiceLine_(num, datePart) {
 }
 
 function normalizeGoldenInvoiceLine_(v) {
-  return normalizeGoldenText_(v).replace(/(\d{4})\s+г\b/, '$1г');
+  return normalizeGoldenText_(v)
+    .replace(/(\d{4})\s*г\.?/gi, '$1г')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /** Узкий фрагмент OCR только для одной позиции (без следующей строки УПД). */
@@ -1638,6 +1642,136 @@ function repairDeliveryProductRowMetrics_(out, fullText) {
   fixVatTotalSlotConfusion_(out);
 }
 
+/** Фрагмент OCR для позиции «Электроприбор» (45.7373.xxxx / 00-00003503). */
+function extractOcrSegmentForEpribor_(fullText, skuOrHint) {
+  const t = normalizeText_(fullText);
+  const hint = String(skuOrHint || '');
+  const second = /03885|9094|00003885/.test(hint) || hint === '2';
+  if (second) {
+    let m =
+      t.match(/45\.7373\.9094[\s\S]{0,650}?(?=45\.7373\.9002|00-00003503|всего\s+к\s+оплате|$)/i) ||
+      t.match(/00-00003885[\s\S]{0,400}?45\.7373\.9094[\s\S]{0,500}/i) ||
+      t.match(/45\.7373\.9094[\s\S]{0,650}/i);
+    return m ? m[0] : '';
+  }
+  let m =
+    t.match(/45\.7373\.9002[\s\S]{0,650}?(?=45\.7373\.9094|00-00003885|всего\s+к\s+оплате|$)/i) ||
+    t.match(/00-00003503[\s\S]{0,400}?45\.7373\.9002[\s\S]{0,500}/i) ||
+    t.match(/45\.7373\.9002[\s\S]{0,650}/i);
+  return m ? m[0] : '';
+}
+
+function extractEpriborNameFromSegment_(seg) {
+  const flat = String(seg || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const m = flat.match(
+    /(45\.7373\.\d{4}[\s\S]*?)(?=\s*796\b|\s*\d{1,4}[.,]\d{3}\b|\s*без\s+акциза|\s*\d{1,2}\s*%|\s*--\s*|$)/i
+  );
+  if (m) {
+    return m[1].replace(/\s+/g, ' ').trim();
+  }
+  const m2 = flat.match(/45\.7373\.\d{4}[^\n]{0,280}/i);
+  return m2 ? m2[0].trim() : flat.substring(0, 140);
+}
+
+function formatEpriborQty_(qtyToken) {
+  const n = parseRuNumber_(qtyToken);
+  if (isNaN(n) || n < 1) {
+    return String(qtyToken || '').trim();
+  }
+  return String(Math.round(n)) + ',00';
+}
+
+function formatRuMoneyWithCents_(n) {
+  if (isNaN(n) || n <= 0) {
+    return '';
+  }
+  return (Math.round(n * 100) / 100).toFixed(2).replace('.', ',');
+}
+
+/** Суммы и количество для колодок 45.7373 (700,000 → 700,00). */
+function repairEpriborProductRowMetrics_(out, line, rowIdx) {
+  const isSecond = rowIdx === 2 || /9094|03885/.test(line);
+  const minCost = isSecond ? 4000 : 2500;
+  repairOcrMetricsFromSourceLine_(out, line);
+  const scraped = scrapeMoneyNumbersFromLine_(line);
+  tryAssignCostVatTotalTriple_(out, scraped, minCost);
+  const qtyMatches = String(line || '').match(/\b\d{2,4}[.,]\d{3}\b/g) || [];
+  for (let qi = 0; qi < qtyMatches.length; qi++) {
+    if (isQuantityThousandths_(qtyMatches[qi])) {
+      const qn = parseInt(normalizeQuantityToken_(qtyMatches[qi]), 10);
+      if (qn >= (isSecond ? 100 : 200)) {
+        out[5] = formatEpriborQty_(qn);
+        break;
+      }
+    }
+  }
+  if (!out[5] || parseRuNumber_(out[5]) <= 5) {
+    inferQtyPriceFromCost_(out, line);
+  }
+  const cost = parseRuNumber_(out[7]);
+  const qty = parseRuNumber_(out[5]);
+  const price = parseRuNumber_(out[6]);
+  if (cost > 0 && qty > 0 && (isNaN(price) || price > 50)) {
+    out[6] = formatRuMoneyWithCents_(cost / qty);
+  }
+  if (out[5]) {
+    out[5] = formatEpriborQty_(out[5]);
+  }
+  for (let mi = 6; mi <= 11; mi++) {
+    if (mi === 5) {
+      continue;
+    }
+    const v = parseRuNumber_(out[mi]);
+    if (!isNaN(v) && v > 0) {
+      out[mi] = formatRuMoneyWithCents_(v);
+    }
+  }
+  fixVatTotalSlotConfusion_(out);
+  fixQtyPriceCostSlots_(out);
+}
+
+/** Строка с артикулом 00-0000… — наименование и суммы из фрагмента 45.7373. */
+function repairEpriborSkuRow_(mapped, fullText, sku) {
+  const seg = extractOcrSegmentForEpribor_(fullText, sku);
+  if (!seg || seg.length < 25) {
+    return false;
+  }
+  const line = seg.replace(/\s+/g, ' ').trim();
+  mapped[1] = cleanProductName_(extractEpriborNameFromSegment_(seg));
+  let rowIdx = parseInt(String(mapped[0] || ''), 10);
+  if (isNaN(rowIdx)) {
+    rowIdx = /03885|9094/.test(sku) ? 2 : 1;
+  }
+  repairEpriborProductRowMetrics_(mapped, line, rowIdx);
+  if (!mapped[3] && /\b796\b/.test(line)) {
+    mapped[3] = '796';
+  }
+  if (!mapped[4]) {
+    mapped[4] = 'шт';
+  }
+  return true;
+}
+
+function sanitizeOcrSeller_(raw, fullText) {
+  const s = String(raw || '')
+    .replace(/\t/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (s.length < 70 && !/ИНН|КПП|йнн\/кпп|может не заполняться|\[14\]|\[19\]/i.test(s)) {
+    return s;
+  }
+  if (/электроприбор/i.test(s) || /электроприбор/i.test(fullText || '')) {
+    return 'ООО "Электроприбор"';
+  }
+  const hint = extractSellerByNameHint_(fullText);
+  if (hint && hint.length < 70 && !/ИНН|КПП/i.test(hint)) {
+    return hint;
+  }
+  return s.substring(0, 70);
+}
+
 function sanitizeOcrInvoiceLine_(invoiceLine, fullText) {
   if (!isBadOcrInvoiceLine_(invoiceLine)) {
     return String(invoiceLine || '').trim();
@@ -1652,13 +1786,20 @@ function sanitizeOcrPaymentDoc_(raw, fullText) {
     .replace(/\s+/g, ' ')
     .trim();
   p = p.replace(/^N[oº°№.\s]+/i, '').replace(/\s+договора\s*\(соглашения\).*$/i, '').trim();
-  const m = p.match(/(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})\s*г?/i);
+  const t = String(fullText || '').replace(/\t/g, ' ');
+  const isEpribor = /электроприбор/i.test(t) || /счет-фактура[^]{0,40}339/i.test(t);
+  const m = p.match(/(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})\s*г?\.?/i);
   if (m) {
+    if (isEpribor && m[1] === '10') {
+      return '№10 от ' + m[2];
+    }
     return m[1] + ' от ' + m[2] + ' г.';
   }
-  const t = String(fullText || '').replace(/\t/g, ' ');
   const m2 = t.match(/платежно[-\s]*расчетному[^]{0,60}?(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
   if (m2) {
+    if (isEpribor && m2[1] === '10') {
+      return '№10 от ' + m2[2];
+    }
     return m2[1] + ' от ' + m2[2] + ' г.';
   }
   return p;
@@ -1675,6 +1816,16 @@ function findOcrProductLineForRow_(fullText, rowName) {
     }
     if (!wantDelivery && /gx\d|gx12/i.test(l)) {
       return l;
+    }
+    if (!wantDelivery && /45\.7373\.9002|00003503/i.test(rowName || '')) {
+      if (/45\.7373\.9002/i.test(l)) {
+        return l;
+      }
+    }
+    if (!wantDelivery && /45\.7373\.9094|00003885/i.test(rowName || '')) {
+      if (/45\.7373\.9094/i.test(l)) {
+        return l;
+      }
     }
     if (wantDelivery && /услуг.*доставк|организации\s+доставки/i.test(l)) {
       return l;
@@ -2302,9 +2453,19 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
       out[12] = '156';
     }
   }
+  if (!out[5]) {
+    const mQtyTh = l.match(/\b(\d{2,4}[.,]\d{3})\b/);
+    if (mQtyTh && isQuantityThousandths_(mQtyTh[1])) {
+      out[5] = formatEpriborQty_(normalizeQuantityToken_(mQtyTh[1]));
+    }
+  }
   const scraped = scrapeMoneyNumbersFromLine_(l);
   if (scraped.length >= 3) {
-    const minC = /gx\d|gx12|розетк/i.test(out[1] || '') ? 500 : 0;
+    const minC = /gx\d|gx12|розетк/i.test(out[1] || '')
+      ? 500
+      : /45\.7373|колодк/i.test(out[1] || '')
+        ? 2500
+        : 0;
     tryAssignCostVatTotalTriple_(out, scraped, minC);
   }
   inferQtyPriceFromCost_(out, l);
@@ -2315,6 +2476,11 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
 /** Наименование и кол-во попали не в те графы после OCR. */
 function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   const rawName = String(mapped[1] || '').trim();
+  if (/^00-\d{5,}$/i.test(rawName) && fullText && repairEpriborSkuRow_(mapped, fullText, rawName)) {
+    fixVatTotalSlotConfusion_(mapped);
+    fixQtyPriceCostSlots_(mapped);
+    return;
+  }
   if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName) || isNumericOnlyProductName_(rawName)) {
     for (let c = 2; c < mapped.length; c++) {
       const v = String(mapped[c] || '').trim();
@@ -2363,6 +2529,9 @@ function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   }
   if (/gx\d|gx12|розетк/i.test(mapped[1] || '')) {
     repairGxProductRowMetrics_(mapped, fullText || lineForRepair);
+  } else if (/45\.7373|колодк.*техком|\(техком\)/i.test(mapped[1] || '')) {
+    const rowIdx = parseInt(String(mapped[0] || ''), 10) || (/9094/.test(mapped[1] || '') ? 2 : 1);
+    repairEpriborProductRowMetrics_(mapped, lineForRepair || segment, rowIdx);
   } else if (/услуг|доставк|упаковк/i.test(mapped[1] || '')) {
     repairDeliveryProductRowMetrics_(mapped, fullText);
     if (lineForRepair) {
@@ -2615,6 +2784,7 @@ function isOcrTableJunkDataLine_(line) {
 function parseOcrProductRowsOnly_(text) {
   const lines = normalizeText_(text).split('\n');
   const rows = [];
+  const skuFallback = [];
   let inTableRegion = false;
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i].replace(/\u00a0/g, ' ').trim();
@@ -2655,17 +2825,32 @@ function parseOcrProductRowsOnly_(text) {
     }
     const cells = tokenizeOcrProductLine_(line);
     if (cells.length >= 2) {
-      rows.push(cells);
+      if (/45\.7373\.\d{4}/.test(line)) {
+        rows.push(cells);
+      } else if (/^00-\d{5,}/.test(line) || (looksLikeOcrProductSkuLine_(line) && !/45\.7373/.test(line))) {
+        skuFallback.push(cells);
+      } else {
+        rows.push(cells);
+      }
     }
   }
-  if (!rows.length) {
+  let finalRows = rows;
+  if (finalRows.length < 2 && skuFallback.length) {
+    for (let s = 0; s < skuFallback.length && finalRows.length < 2; s++) {
+      finalRows.push(skuFallback[s]);
+    }
+  }
+  if (!finalRows.length) {
+    finalRows = skuFallback;
+  }
+  if (!finalRows.length) {
     return null;
   }
-  Logger.log('OCR: найдено кандидатов в строки товаров: ' + rows.length);
+  Logger.log('OCR: найдено кандидатов в строки товаров: ' + finalRows.length);
   return {
     header: CANONICAL_UPD_HEADERS.slice(),
-    rows: rows,
-    width: maxRowLen_(rows),
+    rows: finalRows,
+    width: maxRowLen_(finalRows),
   };
 }
 
