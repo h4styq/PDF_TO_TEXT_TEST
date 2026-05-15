@@ -31,18 +31,20 @@ const DELETE_TEMP_DOCS = true;
 /** Имя листа для результата (создастся, если нет) */
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
-/** Модель Gemini для чтения PDF (при ошибке 404 смените на gemini-1.5-flash или gemini-2.5-flash) */
+/** Модель Gemini для чтения PDF (v1beta; не используйте gemini-1.5-flash — часто 404) */
 const GEMINI_MODEL = 'gemini-2.0-flash';
 
 /** Макс. размер PDF для отправки в Gemini inline (байт); при превышении внешний шаг пропускается */
 const MAX_GEMINI_INLINE_PDF_BYTES = 6 * 1024 * 1024;
 
-/** Повторы при 429/5xx и «пустом» ответе Gemini (нестабильность API и модели) */
-const GEMINI_MAX_ATTEMPTS = 5;
-const GEMINI_RETRY_BASE_DELAY_MS = 8000;
-const GEMINI_MAX_BACKOFF_MS = 90000;
-/** Запасные модели, если основная даёт 429 или недоступна (порядок важен) */
-const GEMINI_FALLBACK_MODELS = ['gemini-1.5-flash', 'gemini-2.0-flash-lite'];
+/** Повторы при 429 (короткие паузы — лимит выполнения Apps Script ~6 мин) */
+const GEMINI_MAX_ATTEMPTS = 2;
+const GEMINI_RETRY_BASE_DELAY_MS = 5000;
+const GEMINI_MAX_BACKOFF_MS = 20000;
+/** Повторы для запасного пути «только текст Doc» */
+const GEMINI_TEXT_MAX_ATTEMPTS = 1;
+/** Запасные модели при 429/недоступности основной */
+const GEMINI_FALLBACK_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
 /** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
 const PAUSE_BETWEEN_PDF_MS = 25000;
@@ -346,19 +348,6 @@ function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
     } else {
       Logger.log('Gemini PDF: не удалось получить текст' + (g && g.text ? ' (короткий: ' + g.text.length + ')' : '') + '.');
     }
-    if (docFallbackText && docFallbackText.length >= 80) {
-      Logger.log(
-        'Gemini: пробуем структурировать текст из Google Doc (' + docFallbackText.length + ' симв., без PDF)…'
-      );
-      const gt = tryGeminiTextExtractAllModels_(docFallbackText, geminiKey);
-      if (gt && gt.text && gt.text.length > 80) {
-        const mergedT = mergeExternalExtractIntoPlainText_(gt.text);
-        if (analyzeDocTextQuality_(mergedT).readable || looksStructuredGemini_(gt.text)) {
-          Logger.log('Gemini (текст Doc): OK, модель ' + gt.model);
-          return { text: gt.text, source: 'gemini-doc-text' };
-        }
-      }
-    }
   } else {
     Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
   }
@@ -374,20 +363,58 @@ function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
   } else {
     Logger.log('OCR_SPACE_API_KEY не задан — пропускаем OCR.space.');
   }
+  if (geminiKey && docFallbackText && docFallbackText.length >= 80) {
+    Logger.log(
+      'Gemini: короткая попытка по тексту Doc (' + docFallbackText.length + ' симв., модель ' + GEMINI_MODEL + ')…'
+    );
+    const gt = tryGeminiTextExtract_(docFallbackText, geminiKey, GEMINI_MODEL);
+    if (gt && gt.text && gt.text.length > 80) {
+      const mergedT = mergeExternalExtractIntoPlainText_(gt.text);
+      if (analyzeDocTextQuality_(mergedT).readable || looksStructuredGemini_(gt.text)) {
+        Logger.log('Gemini (текст Doc): OK');
+        return { text: gt.text, source: 'gemini-doc-text' };
+      }
+    }
+  }
   Logger.log('Внешнее распознавание не дало результата.');
   return null;
 }
 
-/** Список моделей: свойство GEMINI_MODEL в скрипте → константа → запасные. */
+/** Модели, которые в 2025–2026 часто отдают 404 в generativelanguage v1beta */
+function isDeprecatedGeminiModel_(name) {
+  if (!name) {
+    return false;
+  }
+  return /^gemini-1\.5-(flash|pro)(-|$)/i.test(name) || name === 'gemini-1.5-flash' || name === 'gemini-1.5-pro';
+}
+
+/** Список моделей: константа GEMINI_MODEL первой, затем свойство (если не устарело), запасные. */
 function getGeminiModelsToTry_() {
   const props = PropertiesService.getScriptProperties();
   const fromProps = (props.getProperty('GEMINI_MODEL') || '').trim();
-  const primary = fromProps || GEMINI_MODEL;
-  const out = [primary];
+  const candidates = [GEMINI_MODEL];
+  if (fromProps && fromProps !== GEMINI_MODEL) {
+    candidates.unshift(fromProps);
+  }
   for (let i = 0; i < GEMINI_FALLBACK_MODELS.length; i++) {
-    if (out.indexOf(GEMINI_FALLBACK_MODELS[i]) === -1) {
-      out.push(GEMINI_FALLBACK_MODELS[i]);
+    candidates.push(GEMINI_FALLBACK_MODELS[i]);
+  }
+  const out = [];
+  for (let c = 0; c < candidates.length; c++) {
+    const m = candidates[c];
+    if (!m || out.indexOf(m) !== -1) {
+      continue;
     }
+    if (isDeprecatedGeminiModel_(m)) {
+      Logger.log(
+        'Пропуск модели «' + m + '» (часто HTTP 404). Удалите GEMINI_MODEL из свойств скрипта или укажите gemini-2.0-flash.'
+      );
+      continue;
+    }
+    out.push(m);
+  }
+  if (!out.length) {
+    out.push(GEMINI_MODEL);
   }
   return out;
 }
@@ -423,29 +450,15 @@ function tryGeminiPdfExtractAllModels_(pdfFileId, apiKey) {
     const model = models[mi];
     Logger.log('Gemini PDF, модель: ' + model);
     const r = tryGeminiPdfExtract_(pdfFileId, apiKey, model);
+    if (r && r.notFound) {
+      continue;
+    }
     if (r && r.text) {
       r.model = model;
       return r;
     }
     if (mi < models.length - 1) {
-      Logger.log('Следующая запасная модель Gemini через 5 с…');
-      Utilities.sleep(5000);
-    }
-  }
-  return null;
-}
-
-function tryGeminiTextExtractAllModels_(plainText, apiKey) {
-  const models = getGeminiModelsToTry_();
-  const snippet = plainText.length > 120000 ? plainText.substring(0, 120000) : plainText;
-  for (let mi = 0; mi < models.length; mi++) {
-    const model = models[mi];
-    const r = tryGeminiTextExtract_(snippet, apiKey, model);
-    if (r && r.text) {
-      r.model = model;
-      return r;
-    }
-    if (mi < models.length - 1) {
+      Logger.log('Следующая модель Gemini через 3 с…');
       Utilities.sleep(3000);
     }
   }
@@ -495,6 +508,12 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
       });
       const code = resp.getResponseCode();
       const respText = resp.getContentText();
+      if (code === 404) {
+        Logger.log(
+          'Gemini HTTP 404 — модель «' + model + '» недоступна. В свойствах скрипта задайте GEMINI_MODEL=gemini-2.0-flash'
+        );
+        return { notFound: true };
+      }
       if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
         const waitMs = geminiBackoffMs_(attempt, resp);
         Logger.log(
@@ -564,17 +583,15 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
     model +
     ':generateContent?key=' +
     encodeURIComponent(apiKey);
-  const prompt =
+  const snippet = plainText.length > 80000 ? plainText.substring(0, 80000) : plainText;
+  const promptShort =
     getGeminiInvoicePrompt_() +
-    '\n\nНиже сырой текст, извлечённый из PDF через Google (может быть неполным). Восстанови структуру счёта/УПД:\n\n' +
-    plainText;
+    '\n\nТекст из PDF (Google Doc):\n\n' +
+    snippet;
 
-  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) {
-      Utilities.sleep(geminiBackoffMs_(attempt - 1, null));
-    }
+  for (let attempt = 1; attempt <= GEMINI_TEXT_MAX_ATTEMPTS; attempt++) {
     const bodyObj = {
-      contents: [{ parts: [{ text: prompt }] }],
+      contents: [{ parts: [{ text: promptShort }] }],
       generationConfig: { temperature: 0, maxOutputTokens: 8192 },
     };
     const resp = UrlFetchApp.fetch(url, {
@@ -585,10 +602,14 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
     });
     const code = resp.getResponseCode();
     const respText = resp.getContentText();
+    if (code === 404) {
+      Logger.log('Gemini (текст) HTTP 404 — модель «' + model + '» недоступна.');
+      return null;
+    }
     if (code === 429 || code === 503) {
-      const waitMs = geminiBackoffMs_(attempt, resp);
+      const waitMs = Math.min(geminiBackoffMs_(attempt, resp), GEMINI_MAX_BACKOFF_MS);
       Logger.log('Gemini (текст) HTTP ' + code + ', пауза ' + Math.round(waitMs / 1000) + ' с');
-      if (attempt < GEMINI_MAX_ATTEMPTS) {
+      if (attempt < GEMINI_TEXT_MAX_ATTEMPTS) {
         Utilities.sleep(waitMs);
       }
       continue;
@@ -795,8 +816,8 @@ function showRecognitionSetupHelp() {
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
       '3) Сохраните свойства и снова запустите «Загрузить данные из папки Drive». При запросе разрешите доступ к внешней сети (UrlFetchApp).\n\n' +
-      'Сначала Gemini (несколько повторов при 429/5xx и пустом ответе), при слабом ответе — OCR.space. Без ключей — только конвертация Google.\n\n' +
-      'При нестабильности: подождите минуту и повторите запуск или задайте оба ключа (OCR как запасной).'
+      'Порядок: Gemini (PDF) → OCR.space → короткий запрос Gemini по тексту Doc. При 429 подождите 2–3 мин.\n\n' +
+      'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).'
   );
 }
 
