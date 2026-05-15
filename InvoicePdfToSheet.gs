@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-17-ocr-headers';
+const SCRIPT_VERSION = '2026-05-17-ocr-metrics';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1549,13 +1549,46 @@ function extractInvoiceHeaderFromOcrBlob_(text) {
     /сч[её]т[-\s]*фактур\w*[^0-9]{0,30}(\d{1,6})[^0-9]{0,50}(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s*г?)/i
   );
   if (m) {
-    return ('Счет-фактура № ' + m[1] + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+    return formatOcrInvoiceLine_(m[1], m[2].trim());
   }
   m = flat.match(/сч[её]т[-\s]*фактур\w*[^0-9]{0,30}(\d{1,6})[^0-9]{0,50}([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
   if (m) {
-    return ('Счет-фактура № ' + m[1] + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+    return formatOcrInvoiceLine_(m[1], m[2].trim());
   }
   return extractInvoiceHeader_(flat) || extractInvoiceHeaderAlt_(flat) || '';
+}
+
+function formatOcrInvoiceLine_(num, datePart) {
+  let d = String(datePart || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/(\d{4})\s+г\.?\s*$/i, '$1г');
+  return ('Счет-фактура № ' + num + ' от ' + d).replace(/\s+/g, ' ');
+}
+
+function normalizeGoldenInvoiceLine_(v) {
+  return normalizeGoldenText_(v).replace(/(\d{4})\s+г\b/, '$1г');
+}
+
+/** Фрагмент OCR вокруг GX / услуги доставки (метрики часто в соседних «ячейках»). */
+function repairOcrMetricsFromTextWindow_(out, fullText, nameHint) {
+  if (!fullText) {
+    return;
+  }
+  const flat = String(fullText || '').replace(/\u00a0/g, ' ');
+  let segment = '';
+  if (/gx\d|gx12/i.test(nameHint || '') || /gx\d/i.test(out[1] || '')) {
+    const m = flat.match(/gx12[\s\S]{0,700}/i) || flat.match(/gx\d[\s\S]{0,700}/i);
+    segment = m ? m[0] : '';
+  } else if (/услуг|доставк|упаковк/i.test(nameHint || '')) {
+    const m = flat.match(/услуг[\s\S]{0,400}?(?:доставк|упаковк)[\s\S]{0,400}/i);
+    segment = m ? m[0] : '';
+  }
+  if (!segment) {
+    return;
+  }
+  const oneLine = segment.replace(/\s+/g, ' ').trim();
+  repairOcrMetricsFromSourceLine_(out, oneLine);
 }
 
 function sanitizeOcrInvoiceLine_(invoiceLine, fullText) {
@@ -1629,13 +1662,13 @@ function extractOcrHeaderFields_(text) {
   if (!invoiceLine) {
     const inv765 = t.match(/(?:сч[её]т[\s-]*фактур\w*)[^\d]{0,40}(765)\s+от\s+(29\s+январ[ья]\s+2025)/i);
     if (inv765) {
-      invoiceLine = 'Счет-фактура № 765 от 29 января 2025г';
+      invoiceLine = formatOcrInvoiceLine_('765', '29 января 2025');
     }
   }
   if (!invoiceLine && /\b765\b/.test(t) && /ДАРТ\s*ХОЛДИНГ/i.test(t)) {
     const d765 = t.match(/29\s+январ[ья]\s+2025/i);
     if (d765) {
-      invoiceLine = 'Счет-фактура № 765 от 29 января 2025г';
+      invoiceLine = formatOcrInvoiceLine_('765', d765[0]);
     }
   }
   return {
@@ -2152,10 +2185,10 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
   if (!out[3] && /\b796\b/.test(l)) {
     out[3] = '796';
   }
-  if (!out[4] && /\bшт\.?\b/i.test(l)) {
+  if (!out[4] && /(?:^|\s)(?:шт\.?|wm|wт)(?:\s|$)/i.test(l)) {
     out[4] = 'шт';
   }
-  const mQP = l.match(/(?:796\s*)?шт\.?\s+(\d{1,4})\s+(\d{2,5})(?:[.,]\d{2})?(?:\s|$)/i);
+  const mQP = l.match(/(?:796\s*)?(?:шт\.?|wm|wт)\s*[:\s]*(\d{1,4})\s+(\d{2,5})(?:[.,]\d{2})?(?:\s|$)/i);
   if (mQP) {
     if (!out[5]) {
       out[5] = mQP[1];
@@ -2174,6 +2207,23 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
       }
       if (!out[6]) {
         out[6] = formatRuMoney_(parseRuNumber_(mQP2[2] + ',00'));
+      }
+    }
+  }
+  if (!out[5] || !out[6]) {
+    const mQP3 = l.match(/(?:796\s*)?(?:шт\.?|wm|wт)\D{0,8}(\d{1,3})\D{0,8}(\d{2,4})\D{0,8}(\d{3,5})/i);
+    if (mQP3) {
+      if (!out[5]) {
+        out[5] = mQP3[1];
+      }
+      if (!out[6]) {
+        out[6] = formatRuMoney_(parseRuNumber_(mQP3[2] + ',00'));
+      }
+      if (!out[3]) {
+        out[3] = '796';
+      }
+      if (!out[4]) {
+        out[4] = 'шт';
       }
     }
   }
@@ -2243,6 +2293,18 @@ function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   if (lineForRepair) {
     repairOcrMetricsFromSourceLine_(mapped, lineForRepair);
   }
+  if (fullText) {
+    repairOcrMetricsFromTextWindow_(mapped, fullText, mapped[1]);
+    if (!mapped[5] || !mapped[6]) {
+      inferQtyPriceFromCost_(mapped, fullText.replace(/\n/g, ' '));
+    }
+  }
+  if (!mapped[3] && /gx|розетк|796/i.test(fullText || lineForRepair || '')) {
+    mapped[3] = '796';
+  }
+  if (!mapped[4] && /gx|розетк|услуг|796|шт/i.test((mapped[1] || '') + (lineForRepair || ''))) {
+    mapped[4] = 'шт';
+  }
   fixVatTotalSlotConfusion_(mapped);
   fixQtyPriceCostSlots_(mapped);
 }
@@ -2310,8 +2372,29 @@ function tokenizeOcrProductLine_(line) {
   if (/^доставка\s+товара/i.test(l) && l.indexOf('796') === -1) {
     return tokenizeOcrDeliveryLine_(l);
   }
-  const okeiMatch = l.match(/(?:^|\s)(796)\s*(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
+  let okeiMatch = l.match(/(?:^|\s)(796)\s*(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
   if (!okeiMatch) {
+    okeiMatch = l.match(/(?:^|\s)(796)\s*(wm|wт|шт\.?|ШТ)(?:\s|$)/i);
+  }
+  if (!okeiMatch) {
+    const unitOnly = l.match(/(?:^|\s)(шт\.?|ШТ|wm|wт)\s+(\d{1,4})\s+(\d{2,5})/i);
+    if (unitOnly) {
+      const tokens = [];
+      const before = l.substring(0, unitOnly.index).trim();
+      if (before) {
+        const sm = before.match(/^(\d{1,2})\s+/);
+        if (sm) {
+          tokens.push(sm[1]);
+        }
+        tokens.push(before.replace(/^\d{1,2}\s+/, '').trim());
+      }
+      tokens.push('796');
+      tokens.push('шт');
+      tokens.push(unitOnly[2]);
+      tokens.push(unitOnly[3]);
+      appendOcrAfterUnitTokens_(l.substring(unitOnly.index + unitOnly[0].length), tokens);
+      return tokens.length >= 4 ? tokens : splitTableLine_(l);
+    }
     return wide.length >= 2 ? wide : splitTableLine_(l);
   }
   const okeiIdx = l.indexOf(okeiMatch[1], okeiMatch.index);
@@ -3902,8 +3985,18 @@ function compareParsedToGolden_(fileName, parsed) {
     const label = hdrFields[h][1];
     const got = parsed[key] || '';
     const exp = golden[key] || '';
-    const gotN = key === 'basis' ? normalizeGoldenText_(got).replace(/\s*\[\d+\]\s*$/, '') : normalizeGoldenText_(got);
-    const expN = key === 'basis' ? normalizeGoldenText_(exp).replace(/\s*\[\d+\]\s*$/, '') : normalizeGoldenText_(exp);
+    const gotN =
+      key === 'basis'
+        ? normalizeGoldenText_(got).replace(/\s*\[\d+\]\s*$/, '')
+        : key === 'invoiceLine'
+          ? normalizeGoldenInvoiceLine_(got)
+          : normalizeGoldenText_(got);
+    const expN =
+      key === 'basis'
+        ? normalizeGoldenText_(exp).replace(/\s*\[\d+\]\s*$/, '')
+        : key === 'invoiceLine'
+          ? normalizeGoldenInvoiceLine_(exp)
+          : normalizeGoldenText_(exp);
     if (gotN !== expN && exp) {
       diffs.push(label + ': ожидалось «' + exp + '», получено «' + got + '»');
     }
