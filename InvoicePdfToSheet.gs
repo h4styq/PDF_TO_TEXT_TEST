@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-electromontazh-ocr';
+const SCRIPT_VERSION = '2026-05-19-em-split-table';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2931,18 +2931,46 @@ function splitMergedGeminiTablePhysicalLines_(line) {
   if (!l || l.indexOf('\t') === -1) {
     return [l];
   }
-  let idx = l.search(/\t2\t/i);
+  if (!/Доставка\s+товара/i.test(l)) {
+    return [l];
+  }
+  let idx = -1;
+  const ma = l.match(/\t2(?:\t|\s*)(?=.{0,200}?Доставка\s+товара)/i);
+  if (ma && ma.index !== undefined) {
+    idx = ma.index;
+  }
+  if (idx < 0) {
+    const dPos = l.search(/Доставка\s+товара/i);
+    if (dPos > 20) {
+      const tab2 = l.substring(0, dPos).lastIndexOf('\t2');
+      if (tab2 >= 8) {
+        const tailProbe = l.substring(tab2 + 1).trim();
+        if ((/^2[\t\s]+/i.test(tailProbe) || /^2Доставка/i.test(tailProbe)) && /Доставка\s+товара/i.test(tailProbe)) {
+          idx = tab2;
+        }
+      }
+    }
+  }
+  if (idx < 0) {
+    idx = l.search(/\t2\t/i);
+    if (idx >= 0 && !/Доставка\s+товара/i.test(l.substring(idx + 1))) {
+      idx = -1;
+    }
+  }
   if (idx < 0) {
     idx = l.search(/\t2\s+/i);
+    if (idx >= 0 && !/Доставка\s+товара/i.test(l.substring(idx + 1))) {
+      idx = -1;
+    }
+  }
+  if (idx < 0) {
+    idx = l.search(/\t2(?=Доставка\s+товара)/i);
   }
   if (idx < 0) {
     return [l];
   }
   const tail = l.substring(idx + 1).trim();
-  if (!/^2[\t\s]+/i.test(tail)) {
-    return [l];
-  }
-  if (!/Доставка\s+товара/i.test(tail)) {
+  if (!/^2[\t\s]+/i.test(tail) && !/^2Доставка/i.test(tail)) {
     return [l];
   }
   const head = l.substring(0, idx).trim();
@@ -3003,7 +3031,7 @@ function parseGeminiTableSection_(text) {
     if (isOcrNoiseLine_(lines[i])) {
       continue;
     }
-    const physical = splitMergedGeminiTablePhysicalLines_(lines[i]);
+    const physical = splitMergedOcrProductPhysicalLines_(lines[i]);
     for (let p = 0; p < physical.length; p++) {
       const cells = splitTableLine_(physical[p]);
       if (!cells.length) {
