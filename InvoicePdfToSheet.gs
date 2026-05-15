@@ -32,7 +32,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-16-golden4';
+const SCRIPT_VERSION = '2026-05-16-golden5';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1681,8 +1681,76 @@ function isNumericOnlyProductName_(name) {
   return /^[\d\s.,]+$/.test(n.replace(/\s+/g, ''));
 }
 
+/** Сумма с НДС (480) попала в графу «сумма НДС» вместо 80. */
+function fixVatTotalSlotConfusion_(out) {
+  const cost = parseRuNumber_(out[7]);
+  let vat = parseRuNumber_(out[10]);
+  let total = parseRuNumber_(out[11]);
+  if (cost > 0 && vat > 0 && (isNaN(total) || total <= cost) && vat > cost * 1.05 && vat <= cost * 1.3) {
+    total = vat;
+    vat = total - cost;
+    out[11] = formatRuMoney_(total);
+    out[10] = formatRuMoney_(vat);
+    return;
+  }
+  if (cost > 0 && total > cost && !isNaN(vat) && vat >= total * 0.85) {
+    out[10] = formatRuMoney_(total - cost);
+    out[11] = formatRuMoney_(total);
+  }
+}
+
+/** Дозаполнение граф из исходной OCR-строки (шт, 25, 125, без акциза, 156). */
+function repairOcrMetricsFromSourceLine_(out, sourceLine) {
+  const l = String(sourceLine || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!l) {
+    return;
+  }
+  if (!out[3] && /\b796\b/.test(l)) {
+    out[3] = '796';
+  }
+  if (!out[4] && /\bшт\.?\b/i.test(l)) {
+    out[4] = 'шт';
+  }
+  const mQP = l.match(/(?:796\s*)?шт\.?\s+(\d{1,4})\s+(\d{2,5})(?:[.,]\d{2})?(?:\s|$)/i);
+  if (mQP) {
+    if (!out[5]) {
+      out[5] = mQP[1];
+    }
+    if (!out[6]) {
+      const pRaw = mQP[2];
+      const pNum = parseRuNumber_(pRaw.indexOf(',') >= 0 || pRaw.indexOf('.') >= 0 ? pRaw : pRaw + ',00');
+      out[6] = formatRuMoney_(pNum);
+    }
+  }
+  if (!out[5] || !out[6]) {
+    const mQP2 = l.match(/\b(\d{1,2})\s+(\d{2,3})\s+(\d{3,5})\s+(?:20\s*%|без)/i);
+    if (mQP2 && /gx|розетк/i.test(l)) {
+      if (!out[5]) {
+        out[5] = mQP2[1];
+      }
+      if (!out[6]) {
+        out[6] = formatRuMoney_(parseRuNumber_(mQP2[2] + ',00'));
+      }
+    }
+  }
+  if (!out[8] && (/без\s+акциза/i.test(l) || (out[9] && /^\d{1,2}\s*%$/.test(String(out[9]).trim())))) {
+    out[8] = 'без акциза';
+  }
+  if (!out[12]) {
+    const cm = l.match(/(?:^|\s)156(?:\s|$|[\s,])/);
+    if (cm) {
+      out[12] = '156';
+    }
+  }
+  fixVatTotalSlotConfusion_(out);
+  fixQtyPriceCostSlots_(out);
+}
+
 /** Наименование и кол-во попали не в те графы после OCR. */
-function repairScrambledOcrRow_(mapped) {
+function repairScrambledOcrRow_(mapped, sourceLine) {
   const rawName = String(mapped[1] || '').trim();
   if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName) || isNumericOnlyProductName_(rawName)) {
     for (let c = 2; c < mapped.length; c++) {
@@ -1719,6 +1787,10 @@ function repairScrambledOcrRow_(mapped) {
     }
   }
   fixSwappedQtyPrice_(mapped);
+  if (sourceLine) {
+    repairOcrMetricsFromSourceLine_(mapped, sourceLine);
+  }
+  fixVatTotalSlotConfusion_(mapped);
   fixQtyPriceCostSlots_(mapped);
 }
 
@@ -1785,7 +1857,7 @@ function tokenizeOcrProductLine_(line) {
   if (/^доставка\s+товара/i.test(l) && l.indexOf('796') === -1) {
     return tokenizeOcrDeliveryLine_(l);
   }
-  const okeiMatch = l.match(/(?:^|\s)(796)\s+(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
+  const okeiMatch = l.match(/(?:^|\s)(796)\s*(шт\.?|ШТ|кг\.?|кг)(?:\s|$)/i);
   if (!okeiMatch) {
     return wide.length >= 2 ? wide : splitTableLine_(l);
   }
@@ -1813,17 +1885,64 @@ function tokenizeOcrProductLine_(line) {
   }
   tokens.push('796');
   tokens.push(/^шт/i.test(okeiMatch[2]) ? 'шт' : okeiMatch[2]);
-  const afterParts =
-    after.match(
-      /(\d{1,2}\s*%|без\s+акциза|без|\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2,3}|\d{1,7}(?:,\d{3})?|--|—|-|156|643|КИТАЙ|[A-Za-zА-Яа-яЁё]{4,}|\d{8,}\/\d+)/gi
-    ) || [];
-  for (let i = 0; i < afterParts.length; i++) {
-    const p = afterParts[i].trim();
-    if (p && p.length > 0) {
+  appendOcrAfterUnitTokens_(after, tokens);
+  return tokens.length >= 4 ? tokens : splitTableLine_(l);
+}
+
+/** Токены после «796 шт» — по словам, чтобы не терять «25» и «125» без копеек. */
+function appendOcrAfterUnitTokens_(after, tokens) {
+  const chunks = String(after || '')
+    .split(/\s+/)
+    .map(function (x) {
+      return x.trim();
+    })
+    .filter(function (x) {
+      return x.length > 0;
+    });
+  for (let i = 0; i < chunks.length; i++) {
+    let p = chunks[i];
+    if (/^без$/i.test(p) && /^акциз/i.test(chunks[i + 1] || '')) {
+      tokens.push('без акциза');
+      i++;
+      continue;
+    }
+    if (/^акциз/i.test(p) && tokens.length && /без$/i.test(tokens[tokens.length - 1])) {
+      tokens[tokens.length - 1] = 'без акциза';
+      continue;
+    }
+    if (/^\d{1,2}$/.test(p) && /^%$/.test(chunks[i + 1] || '')) {
+      tokens.push(p + ' %');
+      i++;
+      continue;
+    }
+    if (/^\d{1,2}%$/.test(p) || /^без\s+акциза$/i.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^--$|^—$|^-$/.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^\d{8,}\/\d+/.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^[A-Za-zА-Яа-яЁё]{4,}$/.test(p) && !/^шт$/i.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^\d{1,7}$/.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^\d{1,3}(?:\s\d{3})*[.,]\d{2}$/.test(p) || /^\d+[.,]\d{2,3}$/.test(p)) {
+      tokens.push(p);
+      continue;
+    }
+    if (/^\d{1,7},\d{3}$/.test(p)) {
       tokens.push(p);
     }
   }
-  return tokens.length >= 4 ? tokens : splitTableLine_(l);
 }
 
 /** Оценка качества набора строк OCR (меньше мусора и больше «товарных» строк — выше). */
@@ -2515,15 +2634,34 @@ function assignMetricsInDocumentOrder_(pool, out) {
 
     if (phase === 5) {
       if (looksLikeMoneySum_(t) || isMoney_(t)) {
-        out[10] = t;
-        phase = 6;
-        continue;
+        const n = parseRuNumber_(t);
+        const cost = parseRuNumber_(out[7]);
+        if (!out[10]) {
+          if (cost > 0 && n > cost * 1.05) {
+            out[11] = t;
+            phase = 6;
+            continue;
+          }
+          out[10] = t;
+          phase = 6;
+          continue;
+        }
       }
     }
 
     if (phase === 6) {
       if (looksLikeMoneySum_(t) || isMoney_(t)) {
-        out[11] = t;
+        const n = parseRuNumber_(t);
+        const vat = parseRuNumber_(out[10]);
+        const cost = parseRuNumber_(out[7]);
+        if (vat > 0 && n > vat) {
+          out[11] = t;
+        } else if (cost > 0 && n > cost * 1.05 && vat > 0 && vat >= n * 0.9) {
+          out[11] = out[10];
+          out[10] = t;
+        } else if (!out[11]) {
+          out[11] = t;
+        }
         phase = 7;
         continue;
       }
@@ -2747,8 +2885,9 @@ function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
 function normalizeGoodsTableRows_(rows) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
+    const sourceLine = rows[i].join('\t');
     const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
-    repairScrambledOcrRow_(mapped);
+    repairScrambledOcrRow_(mapped, sourceLine);
     mapped[1] = cleanProductName_(mapped[1]);
     if (!isGarbageMappedRow_(mapped)) {
       out.push(mapped);
