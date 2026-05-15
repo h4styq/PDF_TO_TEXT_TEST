@@ -9,7 +9,7 @@
     "sourceType": "script"
   },
   "rules": {
-    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_)$" }],
+    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_|runGoldenCheckDart4230_)$" }],
     "no-undef": "error",
     "no-redeclare": "warn",
     "no-prototype-builtins": "off",
@@ -19,7 +19,11 @@
     {
       "files": ["*.gs"],
       "globals": {
-        "MimeType": "readonly"
+        "MimeType": "readonly",
+        "CANONICAL_UPD_HEADERS": "readonly",
+        "SOURCE_FOLDER_ID": "readonly",
+        "pdfToExtracted_": "readonly",
+        "parseInvoiceData_": "readonly"
       }
     }
   ]

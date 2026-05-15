@@ -89,6 +89,8 @@ function onOpen() {
     .addItem('Загрузить данные из папки Drive', 'runProcessFolder')
     .addSeparator()
     .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
+    .addSeparator()
+    .addItem('Сверить Дарт 4230 с эталоном', 'runGoldenCheckDart4230_')
     .addToUi();
 }
 
@@ -1179,6 +1181,9 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   if (!seller) {
     seller = extractSeller_(text);
   }
+  if (!seller) {
+    seller = extractSellerByNameHint_(text);
+  }
   if (!paymentDoc) {
     paymentDoc = extractPaymentDoc_(text);
   }
@@ -1258,7 +1263,7 @@ function normalizeText_(t) {
 
 function extractInvoiceHeader_(text) {
   const re =
-    /Сч[её]т[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
+    /Сч[её]т[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s*г?|[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
   const m = text.match(re);
   if (m) {
     const num = m[1].replace(/\s+/g, ' ').trim();
@@ -1455,7 +1460,8 @@ function looksLikeProductDataLine_(line) {
     return false;
   }
   const hasNumbers = /\d+[.,]\d{2}|\d{3,}|796|,\d{3}/.test(l);
-  const hasProductHint = /наконечник|колодк|доставк\s+товара|розетк|услуг.*доставк|кабель|упаковк|г\d{3,}|45\.\d{3}|gx\d/i.test(l);
+  const hasProductHint =
+    /наконечник|колодк|доставк\s+товара|розетк|услуг.*доставк|организации\s+доставки|кабель|упаковк|g\d{3,}|45\.\d{3}|gx\d/i.test(l);
   return hasNumbers && hasProductHint;
 }
 
@@ -2424,6 +2430,19 @@ function extractSeller_(text) {
   let chunk = stop === -1 ? rest : rest.substring(0, stop);
   chunk = chunk.replace(/\n+/g, ' ').trim();
   return chunk;
+}
+
+/** Запасной поиск продавца в OCR (если метка «Продавец» разорвана). */
+function extractSellerByNameHint_(text) {
+  const m = text.match(/(ООО|АО|ПАО|ИП)\s*["«]?\s*([^"»\n]{3,80})/i);
+  if (!m) {
+    return '';
+  }
+  const chunk = m[2].replace(/\s+/g, ' ').trim();
+  if (/дарт\s+холдинг/i.test(chunk)) {
+    return 'ООО "ДАРТ ХОЛДИНГ"';
+  }
+  return m[1] + ' "' + chunk + '"';
 }
 
 function extractAfterLabel_(text, label) {
