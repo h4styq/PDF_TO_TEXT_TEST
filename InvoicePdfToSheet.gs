@@ -1393,8 +1393,25 @@ function parseRuNumber_(s) {
 }
 
 function isOkeiCode_(t) {
+  return isOkeiCodeWithContext_(t, '');
+}
+
+/** Код ОКЕИ (796, 166…), не путать со страной (156, 643…). */
+function isOkeiCodeWithContext_(t, nextToken) {
   const s = String(t || '').trim();
-  return /^\d{3}$/.test(s);
+  if (!/^\d{3}$/.test(s)) {
+    return false;
+  }
+  if (isUnitDesignation_(nextToken)) {
+    return true;
+  }
+  if (/^(796|166|055|006|112|715|898|797)$/.test(s)) {
+    return true;
+  }
+  if (/^(156|643|840|380|051)$/.test(s)) {
+    return false;
+  }
+  return false;
 }
 
 function isUnitDesignation_(t) {
@@ -1402,25 +1419,48 @@ function isUnitDesignation_(t) {
   return /^(шт\.?|кг\.?|т\.?|м\.?|м2|м3|л\.?|упак\.?|компл\.?|ч\.?|чел\.?|мест\.?|рул\.?|пог\.?\s*м\.?)$/i.test(s);
 }
 
+/** Сумма с копейками / разрядами («3 125,00»), не количество. */
+function looksLikeMoneySum_(t) {
+  const s = String(t || '').trim();
+  if (/\d[\d\s]{2,}[.,]\d{2}$/.test(s)) {
+    return true;
+  }
+  if (/\s/.test(s) && /\d{4,}/.test(s.replace(/[^\d]/g, ''))) {
+    return true;
+  }
+  return false;
+}
+
 function isQuantity_(t) {
   const s = String(t || '').trim();
   if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isVatRate_(s)) {
     return false;
   }
-  if (isMoney_(s)) {
+  if (/^\d{1,2}\s*%$/.test(s) || looksLikeMoneySum_(s)) {
+    return false;
+  }
+  const compact = s.replace(/\s/g, '');
+  if (/^\d{1,4}[.,]\d{2}$/.test(compact)) {
     return false;
   }
   const n = parseRuNumber_(s);
-  if (isNaN(n) || n <= 0) {
+  if (isNaN(n) || n <= 0 || n >= 1000000) {
     return false;
   }
-  if (/^\d{1,2}%$/.test(s)) {
+  return /^\d{1,7}([.,]\d{1,4})?$/.test(compact);
+}
+
+/** Цена за единицу (5,83 / 8.80 / 25,00). */
+function isUnitPrice_(t) {
+  const s = String(t || '').trim();
+  if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isQuantity_(s)) {
     return false;
   }
-  if (/^\d{1,6}([.,]\d{1,4})?$/.test(s.replace(/\s/g, ''))) {
-    return n < 1000000;
+  if (looksLikeMoneySum_(s)) {
+    return false;
   }
-  return false;
+  const compact = s.replace(/\s/g, '');
+  return /^\d{1,6}[.,]\d{1,2}$/.test(compact);
 }
 
 function isMoney_(t) {
@@ -1428,14 +1468,17 @@ function isMoney_(t) {
   if (!s) {
     return false;
   }
-  if (/^\d{1,2}%$/.test(s) || /^без\s+акциза$/i.test(s)) {
+  if (/^\d{1,2}\s*%$/.test(s) || /^без\s+акциза$/i.test(s)) {
     return false;
   }
-  if (/\d[\d\s]*[.,]\d{2}$/.test(s)) {
+  if (isQuantity_(s) || isUnitPrice_(s)) {
+    return false;
+  }
+  if (looksLikeMoneySum_(s)) {
     return true;
   }
   const n = parseRuNumber_(s);
-  return !isNaN(n) && (n >= 100 || /\s/.test(s.replace(/[^\d\s]/g, '')));
+  return !isNaN(n) && n >= 500;
 }
 
 function isVatRate_(t) {
@@ -1540,9 +1583,7 @@ function semanticMapGoodsRow_(cells, seqNum) {
     out[5] = takeFromPool_(pool, isQuantity_);
   }
   if (!out[6]) {
-    out[6] = takeFromPool_(pool, function (t) {
-      return isMoney_(t) && parseRuNumber_(t) < 100000;
-    });
+    out[6] = takeFromPool_(pool, isUnitPrice_);
   }
   if (!out[7]) {
     out[7] = takeFromPool_(pool, isMoney_);
@@ -1580,6 +1621,18 @@ function semanticMapGoodsRow_(cells, seqNum) {
   if (!out[3] && out[2] && isOkeiCode_(out[2])) {
     out[3] = out[2];
     out[2] = '';
+  }
+
+  if (!out[5] && out[6] && out[7]) {
+    const price = parseRuNumber_(out[6]);
+    const cost = parseRuNumber_(out[7]);
+    if (price > 0 && cost > 0) {
+      const q = Math.round((cost / price) * 1000) / 1000;
+      if (q > 0 && q < 1000000) {
+        out[5] = String(q);
+        Logger.log('Количество вычислено из стоимости/цены: ' + out[5]);
+      }
+    }
   }
 
   return out;
