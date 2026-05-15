@@ -32,7 +32,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-16-golden';
+const SCRIPT_VERSION = '2026-05-16-golden2';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -93,9 +93,10 @@ function onOpen() {
     .addSeparator()
     .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
     .addSeparator()
-    .addItem('Сверить Дарт 4230 с эталоном', 'runGoldenCheckDart4230_')
-    .addItem('Сверить Э прибор 11400 с эталоном', 'runGoldenCheckEpribor11400_')
-    .addItem('Сверить Электромонтаж 13215 с эталоном', 'runGoldenCheckElectromontazh13215_')
+    .addItem('Сверить Дарт 4230 с эталоном', 'goldenCheckDart4230')
+    .addItem('Сверить Э прибор 11400 с эталоном', 'goldenCheckEpribor11400')
+    .addItem('Сверить Электромонтаж 13215 с эталоном', 'goldenCheckElectromontazh13215')
+    .addItem('Сверить все эталоны (3 PDF)', 'goldenCheckAll')
     .addSeparator()
     .addItem('Проверить версию скрипта (есть ли сверка с эталоном)', 'verifyScriptHasGoldenChecks')
     .addToUi();
@@ -885,7 +886,7 @@ function showRecognitionSetupHelp() {
       'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).\n\n' +
       'Сверка с эталоном: версия ' +
       SCRIPT_VERSION +
-      '. В редакторе Ctrl+F → «2026-05-16-golden». Меню → «Проверить версию скрипта».'
+      '. В редакторе Ctrl+F → «2026-05-16-golden2». Сверка: меню таблицы → goldenCheck…'
   );
 }
 
