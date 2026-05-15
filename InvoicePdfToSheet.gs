@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-17-external-only';
+const SCRIPT_VERSION = '2026-05-17-ocr-headers';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -317,7 +317,7 @@ function pdfToExtractedViaExternalOnly_(pdfFileId) {
   let externalFailNote = '';
 
   if (improved && improved.text) {
-    if (looksStructuredGemini_(improved.text)) {
+    if (isGeminiStructuredExtract_(improved.text, improved.source)) {
       externalStructured = normalizeText_(improved.text);
     }
     text = mergeExternalExtractIntoPlainText_(improved.text);
@@ -382,12 +382,12 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId) {
       usedExternalApi = true;
       const improved = tryExternalTextExtraction_(pdfFileId, text);
       if (improved && improved.text) {
-        if (looksStructuredGemini_(improved.text)) {
+        if (isGeminiStructuredExtract_(improved.text, improved.source)) {
           externalStructured = normalizeText_(improved.text);
         }
         const merged = mergeExternalExtractIntoPlainText_(improved.text);
         const q2 = analyzeDocTextQuality_(merged);
-        if (q2.readable || looksStructuredGemini_(improved.text) || merged.length > text.length * 0.5) {
+        if (q2.readable || isGeminiStructuredExtract_(improved.text, improved.source) || merged.length > text.length * 0.5) {
           text = merged;
           docTable = null;
           if (q2.readable || looksStructuredGemini_(improved.text)) {
@@ -413,13 +413,13 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId) {
     usedExternalApi = true;
     const improved = tryExternalTextExtraction_(pdfFileId, text);
     if (improved && improved.text) {
-      if (looksStructuredGemini_(improved.text)) {
+      if (isGeminiStructuredExtract_(improved.text, improved.source)) {
         externalStructured = normalizeText_(improved.text);
       }
       const merged = mergeExternalExtractIntoPlainText_(improved.text);
       text = merged;
       const q3 = analyzeDocTextQuality_(text);
-      if (q3.readable || looksStructuredGemini_(improved.text)) {
+      if (q3.readable || isGeminiStructuredExtract_(improved.text, improved.source)) {
         quality = { readable: true, reason: '' };
       } else {
         quality = q3;
@@ -482,6 +482,17 @@ function looksStructuredGemini_(raw) {
   }
   const cyr = (raw.match(/[а-яА-ЯёЁ]/g) || []).length;
   return hasTabs && cyr > 100;
+}
+
+/** Маркеры Gemini — не путать с табличным OCR.space. */
+function isGeminiStructuredExtract_(raw, source) {
+  if (source === 'ocr.space') {
+    return false;
+  }
+  if (!raw || !/===\s*HEADER\s*===/i.test(raw)) {
+    return false;
+  }
+  return looksStructuredGemini_(raw);
 }
 
 /**
@@ -1339,15 +1350,18 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
 
   const text = normalizeText_(raw);
   const structuredSrc =
-    externalStructured ||
-    (looksStructuredGemini_(raw) && /===\s*HEADER\s*===/i.test(raw) ? normalizeText_(raw) : '');
+    externalStructured && /===\s*HEADER\s*===/i.test(externalStructured)
+      ? externalStructured
+      : /===\s*HEADER\s*===/i.test(raw)
+        ? normalizeText_(raw)
+        : '';
   const textHint =
     !text || textLength < 80
       ? ' Мало текста после конвертации PDF (часто скан или «картинка»). Нужен OCR или PDF с текстовым слоем.'
       : '';
 
   if (structuredSrc) {
-    Logger.log('Парсинг структурированного ответа Gemini (' + structuredSrc.length + ' симв.).');
+    Logger.log('Парсинг ответа Gemini с маркерами HEADER/TABLE (' + structuredSrc.length + ' симв.).');
   }
 
   let structuredHdr = parseStructuredHeaderBlock_(structuredSrc || text);
@@ -1375,12 +1389,12 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   }
   if (textSource === 'ocr.space' || isLikelyOcrUnstructured_(text)) {
     const oh = extractOcrHeaderFields_(text);
-    if (!invoiceLine && oh.invoiceLine) {
+    if (oh.invoiceLine) {
       invoiceLine = oh.invoiceLine;
+    } else if (isBadOcrInvoiceLine_(invoiceLine)) {
+      invoiceLine = extractInvoiceHeaderFromOcrBlob_(text);
     }
-    if (!paymentDoc && oh.paymentDoc) {
-      paymentDoc = oh.paymentDoc;
-    }
+    paymentDoc = sanitizeOcrPaymentDoc_(oh.paymentDoc || paymentDoc, text);
     if (!seller && oh.seller) {
       seller = oh.seller;
     }
@@ -1413,6 +1427,10 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   }
 
   const fromOcr = textSource === 'ocr.space' || isLikelyOcrUnstructured_(text);
+  if (fromOcr) {
+    invoiceLine = sanitizeOcrInvoiceLine_(invoiceLine, text);
+    paymentDoc = sanitizeOcrPaymentDoc_(paymentDoc, text);
+  }
 
   let table = null;
   if (docTable && docTable.rows && docTable.rows.length) {
@@ -1444,7 +1462,7 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
 
   if (table && table.rows && table.rows.length) {
     const beforeFilter = table.rows.length;
-    table.rows = normalizeGoodsTableRows_(table.rows);
+    table.rows = normalizeGoodsTableRows_(table.rows, text);
     if (beforeFilter !== table.rows.length) {
       Logger.log('Фильтр строк таблицы: ' + beforeFilter + ' → ' + table.rows.length);
     }
@@ -1509,10 +1527,86 @@ function extractInvoiceHeader_(text) {
   return '';
 }
 
+function isBadOcrInvoiceLine_(s) {
+  const inv = String(s || '').trim();
+  if (!inv) {
+    return true;
+  }
+  if (inv.length > 95) {
+    return true;
+  }
+  return /постановлению|Приложение\s+№|Универсальный\s+передаточн|\t/i.test(inv);
+}
+
+/** Счёт-фактура из «шапки» OCR (TAB/мусор УПД). */
+function extractInvoiceHeaderFromOcrBlob_(text) {
+  const flat = String(text || '')
+    .replace(/\t/g, ' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  let m = flat.match(
+    /сч[её]т[-\s]*фактур\w*[^0-9]{0,30}(\d{1,6})[^0-9]{0,50}(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}\s*г?)/i
+  );
+  if (m) {
+    return ('Счет-фактура № ' + m[1] + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+  }
+  m = flat.match(/сч[её]т[-\s]*фактур\w*[^0-9]{0,30}(\d{1,6})[^0-9]{0,50}([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
+  if (m) {
+    return ('Счет-фактура № ' + m[1] + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+  }
+  return extractInvoiceHeader_(flat) || extractInvoiceHeaderAlt_(flat) || '';
+}
+
+function sanitizeOcrInvoiceLine_(invoiceLine, fullText) {
+  if (!isBadOcrInvoiceLine_(invoiceLine)) {
+    return String(invoiceLine || '').trim();
+  }
+  const fixed = extractInvoiceHeaderFromOcrBlob_(fullText);
+  return fixed || String(invoiceLine || '').substring(0, 90).trim();
+}
+
+function sanitizeOcrPaymentDoc_(raw, fullText) {
+  let p = String(raw || '')
+    .replace(/\t/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  p = p.replace(/^N[oº°№.\s]+/i, '').replace(/\s+договора\s*\(соглашения\).*$/i, '').trim();
+  const m = p.match(/(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})\s*г?/i);
+  if (m) {
+    return m[1] + ' от ' + m[2] + ' г.';
+  }
+  const t = String(fullText || '').replace(/\t/g, ' ');
+  const m2 = t.match(/платежно[-\s]*расчетному[^]{0,60}?(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
+  if (m2) {
+    return m2[1] + ' от ' + m2[2] + ' г.';
+  }
+  return p;
+}
+
+/** Строка товара в полном OCR-тексте (если в кандидате нет 796/шт). */
+function findOcrProductLineForRow_(fullText, rowName) {
+  const lines = normalizeText_(fullText).split('\n');
+  const wantDelivery = /услуг|доставк|упаковк/i.test(rowName || '');
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i].replace(/\u00a0/g, ' ').trim();
+    if (!l || /универсальн|постановлению|Приложение\s+№/i.test(l)) {
+      continue;
+    }
+    if (!wantDelivery && /gx\d|gx12/i.test(l)) {
+      return l;
+    }
+    if (wantDelivery && /услуг.*доставк|организации\s+доставки/i.test(l)) {
+      return l;
+    }
+  }
+  return '';
+}
+
 /** Шапка из «сырого» OCR (если метки разорваны). */
 function extractOcrHeaderFields_(text) {
   const t = normalizeText_(text);
-  let invoiceLine = extractInvoiceHeader_(t) || extractInvoiceHeaderAlt_(t);
+  let invoiceLine = extractInvoiceHeader_(t) || extractInvoiceHeaderAlt_(t) || extractInvoiceHeaderFromOcrBlob_(t);
   let paymentDoc = extractPaymentDoc_(t);
   if (!paymentDoc) {
     const pm = t.match(/платежно[-\s]*расчетному\s+документу[^\d]{0,20}(\d{1,4})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
@@ -1603,8 +1697,11 @@ function parsePlainHeaderLinesFromText_(text) {
       invoiceLine = line;
       continue;
     }
-    if (!invoiceLine && /сч[её]т[-\s]*фактур/i.test(line) && /\d/.test(line)) {
-      invoiceLine = line;
+    if (!invoiceLine && /сч[её]т[-\s]*фактур/i.test(line)) {
+      invoiceLine = extractInvoiceHeaderFromOcrBlob_(line) || extractInvoiceHeaderFromOcrBlob_(text);
+      if (!invoiceLine && line.length < 100) {
+        invoiceLine = line;
+      }
       continue;
     }
     if (!seller && /\bПродавец\s*:?/i.test(line)) {
@@ -2099,7 +2196,7 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
 }
 
 /** Наименование и кол-во попали не в те графы после OCR. */
-function repairScrambledOcrRow_(mapped, sourceLine) {
+function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   const rawName = String(mapped[1] || '').trim();
   if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName) || isNumericOnlyProductName_(rawName)) {
     for (let c = 2; c < mapped.length; c++) {
@@ -2136,8 +2233,15 @@ function repairScrambledOcrRow_(mapped, sourceLine) {
     }
   }
   fixSwappedQtyPrice_(mapped);
-  if (sourceLine) {
-    repairOcrMetricsFromSourceLine_(mapped, sourceLine);
+  let lineForRepair = sourceLine;
+  if (fullText) {
+    const better = findOcrProductLineForRow_(fullText, mapped[1]);
+    if (better && (!lineForRepair || (lineForRepair.indexOf('796') < 0 && better.indexOf('796') >= 0))) {
+      lineForRepair = better;
+    }
+  }
+  if (lineForRepair) {
+    repairOcrMetricsFromSourceLine_(mapped, lineForRepair);
   }
   fixVatTotalSlotConfusion_(mapped);
   fixQtyPriceCostSlots_(mapped);
@@ -3261,12 +3365,12 @@ function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
   return semanticMapGoodsRow_(cells, seqNum);
 }
 
-function normalizeGoodsTableRows_(rows) {
+function normalizeGoodsTableRows_(rows, fullText) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const sourceLine = rows[i].join('\t');
     const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
-    repairScrambledOcrRow_(mapped, sourceLine);
+    repairScrambledOcrRow_(mapped, sourceLine, fullText);
     mapped[1] = cleanProductName_(mapped[1]);
     if (!isGarbageMappedRow_(mapped)) {
       out.push(mapped);
