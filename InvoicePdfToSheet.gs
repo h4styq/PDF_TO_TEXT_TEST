@@ -141,6 +141,8 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const rows = [];
   let maxTableCols = 0;
   let pauseBeforeNextPdf = false;
+  /** После 429 на PDF не гоняем остальные модели и следующие файлы — сразу OCR.space */
+  const runState = { geminiSkip: false };
 
   while (files.hasNext()) {
     if (pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
@@ -156,7 +158,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     const file = files.next();
     Logger.log('PDF: ' + file.getName());
     try {
-      const pack = pdfToExtracted_(file.getId());
+      const pack = pdfToExtracted_(file.getId(), runState);
       if (pack.usedExternalApi) {
         pauseBeforeNextPdf = true;
       }
@@ -204,7 +206,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
  * Конвертирует PDF в Google Doc, забирает плоский текст и пытается прочитать таблицы Document (структура УПД).
  * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string}}
  */
-function pdfToExtracted_(pdfFileId) {
+function pdfToExtracted_(pdfFileId, runState) {
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -234,7 +236,7 @@ function pdfToExtracted_(pdfFileId) {
         'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
       );
       usedExternalApi = true;
-      const improved = tryExternalTextExtraction_(pdfFileId, text);
+      const improved = tryExternalTextExtraction_(pdfFileId, text, runState);
       if (improved && improved.text) {
         const merged = mergeExternalExtractIntoPlainText_(improved.text);
         const q2 = analyzeDocTextQuality_(merged);
@@ -262,7 +264,7 @@ function pdfToExtracted_(pdfFileId) {
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
     usedExternalApi = true;
-    const improved = tryExternalTextExtraction_(pdfFileId, text);
+    const improved = tryExternalTextExtraction_(pdfFileId, text, runState);
     if (improved && improved.text) {
       const merged = mergeExternalExtractIntoPlainText_(improved.text);
       text = merged;
@@ -339,12 +341,18 @@ function looksStructuredGemini_(raw) {
  * @param {string} pdfFileId
  * @param {string} [docFallbackText] текст после PDF→Doc (запасной путь без повторной загрузки PDF)
  */
-function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
+function tryExternalTextExtraction_(pdfFileId, docFallbackText, runState) {
   const props = PropertiesService.getScriptProperties();
   const geminiKey = props.getProperty('GEMINI_API_KEY');
-  if (geminiKey) {
+  if (geminiKey && !(runState && runState.geminiSkip)) {
     Logger.log('Пробуем распознавание через Gemini (PDF, модели: ' + getGeminiModelsToTry_().join(' → ') + ')…');
     const g = tryGeminiPdfExtractAllModels_(pdfFileId, geminiKey);
+    if (g && g.rateLimited) {
+      Logger.log('Gemini: лимит 429 — остальные PDF в этом запуске пойдут сразу в OCR.space (без повторных вызовов Gemini).');
+      if (runState) {
+        runState.geminiSkip = true;
+      }
+    }
     if (g && g.text && g.text.length > 80) {
       const merged = mergeExternalExtractIntoPlainText_(g.text);
       if (analyzeDocTextQuality_(merged).readable || looksStructuredGemini_(g.text)) {
@@ -460,6 +468,10 @@ function tryGeminiPdfExtractAllModels_(pdfFileId, apiKey) {
     if (r && r.notFound) {
       continue;
     }
+    if (r && r.rateLimited) {
+      Logger.log('Gemini: HTTP 429 — не переключаем другие модели (экономия квоты и времени).');
+      return { rateLimited: true };
+    }
     if (r && r.text) {
       r.model = model;
       return r;
@@ -490,6 +502,7 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
       ':generateContent?key=' +
       encodeURIComponent(apiKey);
 
+    let only429 = true;
     for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
       const bodyObj = {
         contents: [
@@ -516,12 +529,16 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
       const code = resp.getResponseCode();
       const respText = resp.getContentText();
       if (code === 404) {
+        only429 = false;
         Logger.log(
           'Gemini HTTP 404 — модель «' + model + '» недоступна. В свойствах скрипта задайте GEMINI_MODEL=gemini-2.0-flash'
         );
         return { notFound: true };
       }
       if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
+        if (code !== 429) {
+          only429 = false;
+        }
         const waitMs = geminiBackoffMs_(attempt, resp);
         Logger.log(
           'Gemini HTTP ' + code + ', попытка ' + attempt + '/' + GEMINI_MAX_ATTEMPTS + ', пауза ' + Math.round(waitMs / 1000) + ' с'
@@ -531,6 +548,7 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
         }
         continue;
       }
+      only429 = false;
       if (code !== 200) {
         Logger.log('Gemini HTTP ' + code + ': ' + respText.substring(0, 800));
         return null;
@@ -575,6 +593,9 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
       return { text: out, model: model };
     }
     Logger.log('Gemini: исчерпаны попытки (' + GEMINI_MAX_ATTEMPTS + ') для модели ' + model);
+    if (only429) {
+      return { rateLimited: true };
+    }
     return null;
   } catch (e) {
     Logger.log('Gemini: ' + e.message);
@@ -1244,11 +1265,17 @@ function extractInvoiceHeader_(text) {
   const re =
     /Сч[её]т[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
   const m = text.match(re);
-  if (!m) {
-    return '';
+  if (m) {
+    const num = m[1].replace(/\s+/g, ' ').trim();
+    return ('Счет-фактура № ' + num + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
   }
-  const num = m[1].replace(/\s+/g, ' ').trim();
-  return ('Счет-фактура № ' + num + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
+  const reOcr =
+    /Сч[её]т[-\s]*фактура\s*N[oº°№]?\s*(\d{1,6})\s+от\s+([0-9]{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{4}|[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
+  const m2 = text.match(reOcr);
+  if (m2) {
+    return ('Счет-фактура № ' + m2[1] + ' от ' + m2[2].trim()).replace(/\s+/g, ' ');
+  }
+  return '';
 }
 
 /** Поля из блока ===HEADER=== ответа Gemini. */
@@ -1368,24 +1395,72 @@ function isOcrNoiseLine_(line) {
   if (/^\(\d{1,2}\)\s*$/.test(l)) {
     return true;
   }
+  if (isOcrInvoiceMetaLine_(l)) {
+    return true;
+  }
+  return false;
+}
+
+/** Артикул / номенклатура в строке OCR (не шапка документа). */
+function looksLikeOcrProductSkuLine_(line) {
+  const l = String(line || '').trim();
+  return (
+    /00-\d{5,}/.test(l) ||
+    /45\.\d{4}\.\d{4}/.test(l) ||
+    /\bGX\d/i.test(l) ||
+    /\bG\d{4}\.\s*/i.test(l) ||
+    /наконечник\s+\d{4,}/i.test(l)
+  );
+}
+
+/** Строки шапки/подвала УПД в OCR — не строки товаров. */
+function isOcrInvoiceMetaLine_(line) {
+  const l = String(line || '').trim();
+  if (!l || l.length < 6) {
+    return true;
+  }
+  if (looksLikeOcrProductSkuLine_(l)) {
+    return false;
+  }
+  if (
+    /^(сч[её]т|универсальн|передаточн|исправлен|документ\s*\(|всего\s+к\s+оплате|индивидуальн|подпись|приказу|дата\s+отгрузки|листе\s*\(|грузополучатель|грузоотправитель|и\s+передаточн|к\s+платежно|заказ\s+клиента|передаточный\s+документ|покупатель|продавец)/i.test(
+      l
+    )
+  ) {
+    return true;
+  }
+  if (/^[0-9]{1,2}\s*-\s*сч[её]т/i.test(l)) {
+    return true;
+  }
+  if (/основание\s+передачи|адрес\s+доставки|молодежная|жуковск/i.test(l) && !/наконечник|колодк|00-\d/i.test(l)) {
+    return true;
+  }
+  if (/^от\s+\d|^N[oº°]\s*-/i.test(l) && l.length < 50) {
+    return true;
+  }
+  if (/^(лист|страниц|м\.п\.|печать)/i.test(l)) {
+    return true;
+  }
   return false;
 }
 
 function looksLikeProductDataLine_(line) {
-  if (isOcrNoiseLine_(line)) {
+  if (isOcrNoiseLine_(line) || isOcrInvoiceMetaLine_(line)) {
     return false;
   }
   const l = String(line || '').trim();
   if (l.length < 10) {
     return false;
   }
+  if (looksLikeOcrProductSkuLine_(l)) {
+    return /\d+[.,]\d{2}|796|,\d{3}|\d+\s*%|без\s+акциза/i.test(l);
+  }
   const cyr = (l.match(/[а-яА-ЯёЁ]/g) || []).length;
   if (cyr < 6) {
     return false;
   }
   const hasNumbers = /\d+[.,]\d{2}|\d{3,}|796|,\d{3}/.test(l);
-  const hasProductHint =
-    /наконечник|колодк|доставк|розетк|услуг|кабель|упаковк|г\d{3,}|45\.\d{3}|gx\d/i.test(l) || cyr >= 12;
+  const hasProductHint = /наконечник|колодк|доставк\s+товара|розетк|услуг.*доставк|кабель|упаковк|г\d{3,}|45\.\d{3}|gx\d/i.test(l);
   return hasNumbers && hasProductHint;
 }
 
@@ -1399,13 +1474,22 @@ function cleanProductName_(name) {
 
 function isGarbageMappedRow_(mapped) {
   const name = cleanProductName_(mapped[1]);
-  if (!name || name.length < 8) {
+  if (!name || name.length < 4) {
     return true;
   }
-  if (isOcrNoiseLine_(name)) {
+  if (isOcrNoiseLine_(name) || isOcrInvoiceMetaLine_(name)) {
     return true;
   }
   if (/^основание\s+передачи/i.test(name)) {
+    return true;
+  }
+  if (/^(сч[её]т|передаточн|документ\s*\(|всего\s+к|грузополучатель|и\s+передаточн|заказ\s+клиента)/i.test(name)) {
+    return true;
+  }
+  if (/января|февраля|апреля|декабря\s+\d{4}/i.test(name) && !looksLikeOcrProductSkuLine_(name)) {
+    return true;
+  }
+  if (/^00-\d{5,}$/i.test(name) && !mapped[7] && !mapped[11] && !mapped[6]) {
     return true;
   }
   if (isDeliveryServiceRow_(name)) {
@@ -1414,15 +1498,62 @@ function isGarbageMappedRow_(mapped) {
   const hasMetric = !!(mapped[5] || mapped[6] || mapped[7] || mapped[11]);
   const hasUnit = mapped[4] && /шт|кг/i.test(mapped[4]);
   const hasOkei = mapped[3] === '796';
+  const hasSkuName = looksLikeOcrProductSkuLine_(name) || /колодк|наконечник|розетк|gx\d/i.test(name);
+  if (hasSkuName && (hasMetric || hasUnit || hasOkei)) {
+    return false;
+  }
   return !(hasMetric || hasUnit || hasOkei);
+}
+
+/** Наименование и кол-во попали не в те графы после OCR. */
+function repairScrambledOcrRow_(mapped) {
+  const rawName = String(mapped[1] || '').trim();
+  if (/^00-\d{5,}$/i.test(rawName) || /^00-\d{5,}\s*$/i.test(rawName)) {
+    for (let c = 2; c < mapped.length; c++) {
+      const v = String(mapped[c] || '').trim();
+      if (!v) {
+        continue;
+      }
+      if (/45\.\d{4}|колодк|наконечник|розетк|gx\d|техком|\(техком\)/i.test(v)) {
+        mapped[1] = cleanProductName_(v + ' [' + rawName + ']');
+        mapped[c] = '';
+        break;
+      }
+    }
+  }
+  if (!mapped[5]) {
+    for (let c = 6; c <= 8; c++) {
+      const v = String(mapped[c] || '').trim();
+      if (/^[12]$/.test(v)) {
+        mapped[5] = v;
+        mapped[c] = '';
+        break;
+      }
+    }
+  }
+  fixQtyPriceCostSlots_(mapped);
 }
 
 /** Строки товаров из «сырого» OCR-текста (без шапки УПД и мусорных строк). */
 function parseOcrProductRowsOnly_(text) {
   const lines = normalizeText_(text).split('\n');
   const rows = [];
+  let inTableRegion = false;
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i].replace(/\u00a0/g, ' ').trim();
+    if (!line) {
+      continue;
+    }
+    if (/наименован/i.test(line) && /(п\/п|код|количество|единиц)/i.test(line)) {
+      inTableRegion = true;
+      continue;
+    }
+    if (/всего\s+к\s+оплате/i.test(line)) {
+      break;
+    }
+    if (!inTableRegion && !looksLikeOcrProductSkuLine_(line)) {
+      continue;
+    }
     if (!looksLikeProductDataLine_(line)) {
       continue;
     }
@@ -2150,6 +2281,7 @@ function normalizeGoodsTableRows_(rows) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
+    repairScrambledOcrRow_(mapped);
     mapped[1] = cleanProductName_(mapped[1]);
     if (!isGarbageMappedRow_(mapped)) {
       out.push(mapped);
