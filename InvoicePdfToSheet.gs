@@ -31,8 +31,8 @@ const DELETE_TEMP_DOCS = true;
 /** Имя листа для результата (создастся, если нет) */
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
-/** Модель Gemini для чтения PDF (v1beta; не используйте gemini-1.5-flash — часто 404) */
-const GEMINI_MODEL = 'gemini-2.0-flash';
+/** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 /** Макс. размер PDF для отправки в Gemini inline (байт); при превышении внешний шаг пропускается */
 const MAX_GEMINI_INLINE_PDF_BYTES = 6 * 1024 * 1024;
@@ -65,6 +65,7 @@ const CANONICAL_UPD_HEADERS = [
   'Код вида товара',
   'Единица измерения: код',
   'Единица измерения: условное обозначение (национальное)',
+  'Количество (объем)',
   'Цена (тариф) за единицу измерения',
   'Стоимость товаров (работ, услуг), имущественных прав без налога — всего',
   'В том числе сумма акциза',
@@ -650,7 +651,7 @@ function getGeminiInvoicePrompt_() {
     '===TABLE===\n' +
     'Колонки таблицы (ровно в этом порядке, разделитель TAB), без колонки «код товара»:\n' +
     '№ п/п | Наименование товара | Код вида товара | Единица измерения: код | Единица измерения: условное обозначение | ' +
-    'Цена за единицу | Стоимость без налога | Акциз | Налоговая ставка | Сумма налога | Стоимость с налогом | ' +
+    'Количество (объем) | Цена за единицу | Стоимость без налога | Акциз | Налоговая ставка | Сумма налога | Стоимость с налогом | ' +
     'Страна: цифровой код | Страна: краткое наименование | Рег. номер декларации/партии\n' +
     'В колонке № п/п только порядковый номер строки: 1, 2, 3… Первая строка — заголовки, далее строки данных (TAB). ' +
     'Не включай «Всего к оплате» и итоги.\n' +
@@ -1382,15 +1383,211 @@ function stripLeadingProductCodeColumn_(row) {
   return r;
 }
 
+function parseRuNumber_(s) {
+  const t = String(s || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s/g, '')
+    .replace(',', '.');
+  const n = parseFloat(t);
+  return isNaN(n) ? NaN : n;
+}
+
+function isOkeiCode_(t) {
+  const s = String(t || '').trim();
+  return /^\d{3}$/.test(s);
+}
+
+function isUnitDesignation_(t) {
+  const s = String(t || '').trim();
+  return /^(шт\.?|кг\.?|т\.?|м\.?|м2|м3|л\.?|упак\.?|компл\.?|ч\.?|чел\.?|мест\.?|рул\.?|пог\.?\s*м\.?)$/i.test(s);
+}
+
+function isQuantity_(t) {
+  const s = String(t || '').trim();
+  if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isVatRate_(s)) {
+    return false;
+  }
+  if (isMoney_(s)) {
+    return false;
+  }
+  const n = parseRuNumber_(s);
+  if (isNaN(n) || n <= 0) {
+    return false;
+  }
+  if (/^\d{1,2}%$/.test(s)) {
+    return false;
+  }
+  if (/^\d{1,6}([.,]\d{1,4})?$/.test(s.replace(/\s/g, ''))) {
+    return n < 1000000;
+  }
+  return false;
+}
+
+function isMoney_(t) {
+  const s = String(t || '').trim();
+  if (!s) {
+    return false;
+  }
+  if (/^\d{1,2}%$/.test(s) || /^без\s+акциза$/i.test(s)) {
+    return false;
+  }
+  if (/\d[\d\s]*[.,]\d{2}$/.test(s)) {
+    return true;
+  }
+  const n = parseRuNumber_(s);
+  return !isNaN(n) && (n >= 100 || /\s/.test(s.replace(/[^\d\s]/g, '')));
+}
+
+function isVatRate_(t) {
+  const s = String(t || '').trim();
+  return /^\d{1,2}\s*%$/.test(s) || /^без\s+акциза$/i.test(s) || s === '0';
+}
+
+function isExcise_(t) {
+  const s = String(t || '').trim();
+  return /^без\s+акциза$/i.test(s) || s === '0' || s === '—' || s === '-';
+}
+
+function isCountryCode_(t) {
+  const s = String(t || '').trim();
+  if (!/^\d{3}$/.test(s)) {
+    return false;
+  }
+  if (/^(156|643|840|380|051|112|276|392)$/.test(s)) {
+    return true;
+  }
+  return /^\d{3}$/.test(s) && !/^(796|166|055|006|715|898)$/.test(s);
+}
+
+function isCountryName_(t) {
+  const s = String(t || '').trim();
+  return /^[A-Za-zА-Яа-яЁё\-]{3,}$/.test(s) && !isUnitDesignation_(s) && !isOkeiCode_(s) && !isMoney_(s);
+}
+
+function isDeclReg_(t) {
+  const s = String(t || '').trim();
+  return /\d{5,}\/\d{6,}\/\d{4,}/.test(s) || (s.length > 12 && /\//.test(s));
+}
+
+function isKodVidaTovara_(t) {
+  const s = String(t || '').trim();
+  if (!s || isOkeiCode_(s) || isUnitDesignation_(s)) {
+    return false;
+  }
+  return /^--$|^\-{1,2}$|^\d{1,2}$/.test(s);
+}
+
+function isStrongMetricStart_(t, hasName) {
+  if (!hasName) {
+    return false;
+  }
+  return isOkeiCode_(t) || isUnitDesignation_(t) || isQuantity_(t) || isMoney_(t) || isVatRate_(t);
+}
+
+function takeFromPool_(pool, pred) {
+  for (let i = 0; i < pool.length; i++) {
+    if (pred(pool[i])) {
+      return pool.splice(i, 1)[0];
+    }
+  }
+  return '';
+}
+
+function takeOkeiFromPool_(pool) {
+  for (let i = 0; i < pool.length; i++) {
+    const next = pool[i + 1] || '';
+    if (isOkeiCodeWithContext_(pool[i], next)) {
+      return pool.splice(i, 1)[0];
+    }
+  }
+  return '';
+}
+
+/**
+ * Смысловое выравнивание: 796→код ОКЕИ, шт→условное обозначение, количество и суммы на свои места.
+ */
+function semanticMapGoodsRow_(cells, seqNum) {
+  const out = [];
+  for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
+    out.push('');
+  }
+  out[0] = String(seqNum);
+
+  let tokens = stripLeadingProductCodeColumn_(cells).map(function (x) {
+    return String(x || '').trim();
+  });
+  let pos = 0;
+  if (tokens.length && looksLikeSeqNumber_(tokens[0])) {
+    pos = 1;
+  }
+
+  const nameParts = [];
+  while (pos < tokens.length && !isStrongMetricStart_(tokens[pos], nameParts.length > 0)) {
+    nameParts.push(tokens[pos++]);
+  }
+  out[1] = nameParts.join(' ').trim();
+
+  const pool = tokens.slice(pos);
+
+  out[2] = takeFromPool_(pool, isKodVidaTovara_);
+  if (!out[3]) {
+    out[3] = takeOkeiFromPool_(pool);
+  }
+  if (!out[4]) {
+    out[4] = takeFromPool_(pool, isUnitDesignation_);
+  }
+  if (!out[5]) {
+    out[5] = takeFromPool_(pool, isQuantity_);
+  }
+  if (!out[6]) {
+    out[6] = takeFromPool_(pool, function (t) {
+      return isMoney_(t) && parseRuNumber_(t) < 100000;
+    });
+  }
+  if (!out[7]) {
+    out[7] = takeFromPool_(pool, isMoney_);
+  }
+  if (!out[8]) {
+    out[8] = takeFromPool_(pool, isExcise_);
+  }
+  if (!out[9]) {
+    out[9] = takeFromPool_(pool, isVatRate_);
+  }
+  if (!out[10]) {
+    out[10] = takeFromPool_(pool, isMoney_);
+  }
+  if (!out[11]) {
+    out[11] = takeFromPool_(pool, isMoney_);
+  }
+  if (!out[12]) {
+    out[12] = takeFromPool_(pool, isCountryCode_);
+  }
+  if (!out[13]) {
+    out[13] = takeFromPool_(pool, isCountryName_);
+  }
+  if (!out[14]) {
+    out[14] = takeFromPool_(pool, isDeclReg_);
+  }
+  if (pool.length) {
+    const tail = pool.join(' ').trim();
+    if (tail && !out[14]) {
+      out[14] = tail;
+    } else if (tail && !out[1]) {
+      out[1] = tail;
+    }
+  }
+
+  if (!out[3] && out[2] && isOkeiCode_(out[2])) {
+    out[3] = out[2];
+    out[2] = '';
+  }
+
+  return out;
+}
+
 /** Выравнивание под CANONICAL_UPD_HEADERS; № п/п = порядковый номер по документу. */
 function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
-  let row = stripLeadingProductCodeColumn_(cells);
-  row = padRow_(row, CANONICAL_UPD_HEADERS.length);
-  if (row.length > CANONICAL_UPD_HEADERS.length) {
-    row = row.slice(0, CANONICAL_UPD_HEADERS.length);
-  }
-  row[0] = String(seqNum);
-  return row;
+  return semanticMapGoodsRow_(cells, seqNum);
 }
 
 function normalizeGoodsTableRows_(rows) {
