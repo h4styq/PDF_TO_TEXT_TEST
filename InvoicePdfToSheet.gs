@@ -32,7 +32,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-16-golden5';
+const SCRIPT_VERSION = '2026-05-16-golden6';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1681,6 +1681,129 @@ function isNumericOnlyProductName_(name) {
   return /^[\d\s.,]+$/.test(n.replace(/\s+/g, ''));
 }
 
+/** Числа-суммы из токенов строки (без мелкого кол-ва/цены). */
+function collectMoneyNumbersFromPool_(pool) {
+  const nums = [];
+  for (let i = 0; i < pool.length; i++) {
+    const t = pool[i];
+    if (!t || isVatRate_(t) || isExcise_(t) || isCountryCode_(t) || isOkeiCode_(t) || isUnitDesignation_(t)) {
+      continue;
+    }
+    const n = parseRuNumber_(t);
+    if (isNaN(n) || n < 50) {
+      continue;
+    }
+    if (looksLikeMoneySum_(t) || isMoney_(t) || isCostWithoutVat_(t) || n >= 50) {
+      nums.push(n);
+    }
+  }
+  return nums;
+}
+
+/** Собрать крупные суммы из OCR-строки (3125, 625, 3750 …). */
+function scrapeMoneyNumbersFromLine_(line) {
+  const nums = [];
+  const parts = String(line || '').split(/\s+/);
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i].replace(/\u00a0/g, '').trim();
+    if (!p || isVatRate_(p)) {
+      continue;
+    }
+    const n = parseRuNumber_(p);
+    if (isNaN(n) || n < 50) {
+      continue;
+    }
+    if (/^\d{1,2}$/.test(p) && n < 50) {
+      continue;
+    }
+    if (n < 200 && !/[.,]/.test(p) && !/\d{3,}/.test(p.replace(/\s/g, ''))) {
+      continue;
+    }
+    nums.push(n);
+  }
+  return nums;
+}
+
+/**
+ * Тройка сумм УПД: стоимость + НДС = всего (3125+625=3750, 400+80=480).
+ * @return {boolean}
+ */
+function tryAssignCostVatTotalTriple_(out, nums) {
+  const unique = [];
+  for (let i = 0; i < nums.length; i++) {
+    const n = nums[i];
+    if (!unique.some(function (u) {
+      return Math.abs(u - n) < 0.02;
+    })) {
+      unique.push(n);
+    }
+  }
+  unique.sort(function (a, b) {
+    return a - b;
+  });
+  for (let k = unique.length - 1; k >= 2; k--) {
+    const total = unique[k];
+    for (let i = 0; i < k; i++) {
+      for (let j = i + 1; j < k; j++) {
+        const x = unique[i];
+        const y = unique[j];
+        if (Math.abs(x + y - total) > Math.max(1, total * 0.002)) {
+          continue;
+        }
+        const cost = Math.max(x, y);
+        const vat = Math.min(x, y);
+        const ratio = vat / cost;
+        if (ratio < 0.05 || ratio > 0.35) {
+          continue;
+        }
+        out[7] = formatRuMoney_(cost);
+        out[10] = formatRuMoney_(vat);
+        out[11] = formatRuMoney_(total);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function assignCostVatTotalFromPool_(pool, out) {
+  const nums = collectMoneyNumbersFromPool_(pool);
+  if (nums.length >= 3) {
+    return tryAssignCostVatTotalTriple_(out, nums);
+  }
+  return false;
+}
+
+/** Кол-во и цена из пары множителей (25×125=3125). */
+function inferQtyPriceFromCost_(out, line) {
+  if (out[5] && out[6]) {
+    return;
+  }
+  const cost = parseRuNumber_(out[7]);
+  if (!cost || cost <= 0) {
+    return;
+  }
+  const ints = [];
+  const m = String(line || '').match(/\b\d{1,4}\b/g) || [];
+  for (let i = 0; i < m.length; i++) {
+    const n = parseInt(m[i], 10);
+    if (!isNaN(n) && n > 0 && n < 10000) {
+      ints.push(n);
+    }
+  }
+  for (let a = 0; a < ints.length; a++) {
+    for (let b = a + 1; b < ints.length; b++) {
+      const x = ints[a];
+      const y = ints[b];
+      if (Math.abs(x * y - cost) < 1.5) {
+        out[5] = String(Math.min(x, y));
+        out[6] = formatRuMoney_(Math.max(x, y));
+        return;
+      }
+    }
+  }
+}
+
 /** Сумма с НДС (480) попала в графу «сумма НДС» вместо 80. */
 function fixVatTotalSlotConfusion_(out) {
   const cost = parseRuNumber_(out[7]);
@@ -1745,6 +1868,11 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
       out[12] = '156';
     }
   }
+  const scraped = scrapeMoneyNumbersFromLine_(l);
+  if (scraped.length >= 3) {
+    tryAssignCostVatTotalTriple_(out, scraped);
+  }
+  inferQtyPriceFromCost_(out, l);
   fixVatTotalSlotConfusion_(out);
   fixQtyPriceCostSlots_(out);
 }
@@ -2448,7 +2576,8 @@ function fixQtyPriceCostSlots_(out) {
   if (!out[7] && totalVat > 0) {
     if (vatAmt > 0) {
       out[7] = formatRuMoney_(totalVat - vatAmt);
-    } else if (out[9] && /20/.test(String(out[9]))) {
+    } else if (out[9] && /20/.test(String(out[9])) && totalVat >= 900) {
+      // Не делить на 1.2, если в «всего» попала строка НДС (625 и т.п.)
       out[7] = formatRuMoney_(totalVat / 1.2);
     }
   }
@@ -2634,14 +2763,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
 
     if (phase === 5) {
       if (looksLikeMoneySum_(t) || isMoney_(t)) {
-        const n = parseRuNumber_(t);
-        const cost = parseRuNumber_(out[7]);
         if (!out[10]) {
-          if (cost > 0 && n > cost * 1.05) {
-            out[11] = t;
-            phase = 6;
-            continue;
-          }
           out[10] = t;
           phase = 6;
           continue;
@@ -2651,19 +2773,11 @@ function assignMetricsInDocumentOrder_(pool, out) {
 
     if (phase === 6) {
       if (looksLikeMoneySum_(t) || isMoney_(t)) {
-        const n = parseRuNumber_(t);
-        const vat = parseRuNumber_(out[10]);
-        const cost = parseRuNumber_(out[7]);
-        if (vat > 0 && n > vat) {
+        if (!out[11]) {
           out[11] = t;
-        } else if (cost > 0 && n > cost * 1.05 && vat > 0 && vat >= n * 0.9) {
-          out[11] = out[10];
-          out[10] = t;
-        } else if (!out[11]) {
-          out[11] = t;
+          phase = 7;
+          continue;
         }
-        phase = 7;
-        continue;
       }
     }
 
@@ -2684,6 +2798,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
   }
 
   assignTailColumnsFromPool_(pool, out);
+  assignCostVatTotalFromPool_(pool, out);
 }
 
 /**
