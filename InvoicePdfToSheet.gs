@@ -38,9 +38,19 @@ const GEMINI_MODEL = 'gemini-2.0-flash';
 const MAX_GEMINI_INLINE_PDF_BYTES = 6 * 1024 * 1024;
 
 /** Повторы при 429/5xx и «пустом» ответе Gemini (нестабильность API и модели) */
-const GEMINI_MAX_ATTEMPTS = 4;
-const GEMINI_RETRY_BASE_DELAY_MS = 2000;
+const GEMINI_MAX_ATTEMPTS = 5;
+const GEMINI_RETRY_BASE_DELAY_MS = 8000;
+const GEMINI_MAX_BACKOFF_MS = 90000;
+/** Запасные модели, если основная даёт 429 или недоступна (порядок важен) */
+const GEMINI_FALLBACK_MODELS = ['gemini-1.5-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
+/** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
+const PAUSE_BETWEEN_PDF_MS = 25000;
+/**
+ * Для PDF >1 МБ на бесплатном OCR.space: временно «доступ по ссылке» и запрос по URL Drive.
+ * false — только загрузка файла (лимит ~1 МБ).
+ */
+const OCR_TRY_DRIVE_URL_FOR_LARGE = true;
 
 /**
  * Заголовки граф таблицы товаров (УПД / счёт-фактура), как в типовой форме.
@@ -126,12 +136,26 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const files = folder.getFilesByType(MimeType.PDF);
   const rows = [];
   let maxTableCols = 0;
+  let pauseBeforeNextPdf = false;
 
   while (files.hasNext()) {
+    if (pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
+      Logger.log(
+        'Пауза ' +
+          Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+          ' с перед следующим PDF (снижение лимита Gemini 429)…'
+      );
+      Utilities.sleep(PAUSE_BETWEEN_PDF_MS);
+    }
+    pauseBeforeNextPdf = false;
+
     const file = files.next();
     Logger.log('PDF: ' + file.getName());
     try {
       const pack = pdfToExtracted_(file.getId());
+      if (pack.usedExternalApi) {
+        pauseBeforeNextPdf = true;
+      }
       const parsed = parseInvoiceData_(
         pack.text,
         pack.docTable,
@@ -188,6 +212,8 @@ function pdfToExtracted_(pdfFileId) {
   let text = body.getText();
   let quality = analyzeDocTextQuality_(text);
   let docTable = null;
+  let usedExternalApi = false;
+  let externalFailNote = '';
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
   const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
@@ -201,7 +227,8 @@ function pdfToExtracted_(pdfFileId) {
       Logger.log(
         'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
       );
-      const improved = tryExternalTextExtraction_(pdfFileId);
+      usedExternalApi = true;
+      const improved = tryExternalTextExtraction_(pdfFileId, text);
       if (improved && improved.text) {
         const merged = mergeExternalExtractIntoPlainText_(improved.text);
         const q2 = analyzeDocTextQuality_(merged);
@@ -215,6 +242,9 @@ function pdfToExtracted_(pdfFileId) {
           }
           Logger.log('Подставлен текст из ' + improved.source + ' (таблица из Doc была пуста).');
         }
+      } else if (!improved) {
+        externalFailNote =
+          ' Внешнее распознавание не удалось (часто Gemini HTTP 429 — подождите 1–2 мин и запустите снова; OCR.space — файл >1 МБ на бесплатном тарифе).';
       }
     } else if (tableEmpty && !hasAnyExternal) {
       Logger.log(
@@ -224,7 +254,8 @@ function pdfToExtracted_(pdfFileId) {
     }
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
-    const improved = tryExternalTextExtraction_(pdfFileId);
+    usedExternalApi = true;
+    const improved = tryExternalTextExtraction_(pdfFileId, text);
     if (improved && improved.text) {
       const merged = mergeExternalExtractIntoPlainText_(improved.text);
       text = merged;
@@ -236,17 +267,22 @@ function pdfToExtracted_(pdfFileId) {
       }
       Logger.log('После внешнего распознавания (' + improved.source + '): readable=' + quality.readable);
       docTable = null;
+    } else {
+      externalFailNote =
+        ' Внешнее распознавание не удалось (Gemini 429 / OCR.space лимит размера). Повторите позже или уменьшите PDF.';
     }
   }
   if (DELETE_TEMP_DOCS) {
     DriveApp.getFileById(docId).setTrashed(true);
   }
+  const note = (quality.reason || '') + (externalFailNote || '');
   return {
     text: text,
     textLength: text ? text.length : 0,
     docTable: docTable,
     conversionOk: quality.readable,
-    conversionNote: quality.reason,
+    conversionNote: note,
+    usedExternalApi: usedExternalApi,
   };
 }
 
@@ -290,21 +326,38 @@ function looksStructuredGemini_(raw) {
  * Если в свойствах скрипта задан ключ — пробуем извлечь читаемый текст из исходного PDF.
  * @return {{text:string, source:string}|null}
  */
-function tryExternalTextExtraction_(pdfFileId) {
+/**
+ * @param {string} pdfFileId
+ * @param {string} [docFallbackText] текст после PDF→Doc (запасной путь без повторной загрузки PDF)
+ */
+function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
   const props = PropertiesService.getScriptProperties();
   const geminiKey = props.getProperty('GEMINI_API_KEY');
   if (geminiKey) {
-    Logger.log('Пробуем распознавание через Gemini (' + GEMINI_MODEL + ')…');
-    const g = tryGeminiPdfExtract_(pdfFileId, geminiKey);
+    Logger.log('Пробуем распознавание через Gemini (PDF, модели: ' + getGeminiModelsToTry_().join(' → ') + ')…');
+    const g = tryGeminiPdfExtractAllModels_(pdfFileId, geminiKey);
     if (g && g.text && g.text.length > 80) {
       const merged = mergeExternalExtractIntoPlainText_(g.text);
       if (analyzeDocTextQuality_(merged).readable || looksStructuredGemini_(g.text)) {
-        Logger.log('Gemini: получен читаемый текст (' + g.text.length + ' симв.).');
+        Logger.log('Gemini: получен читаемый текст (' + g.text.length + ' симв., модель ' + g.model + ').');
         return { text: g.text, source: 'gemini' };
       }
       Logger.log('Gemini: ответ есть (' + g.text.length + ' симв.), но слабый по качеству — пробуем OCR.space');
     } else {
-      Logger.log('Gemini: не удалось получить текст' + (g && g.text ? ' (слишком короткий: ' + g.text.length + ' симв.)' : '') + '.');
+      Logger.log('Gemini PDF: не удалось получить текст' + (g && g.text ? ' (короткий: ' + g.text.length + ')' : '') + '.');
+    }
+    if (docFallbackText && docFallbackText.length >= 80) {
+      Logger.log(
+        'Gemini: пробуем структурировать текст из Google Doc (' + docFallbackText.length + ' симв., без PDF)…'
+      );
+      const gt = tryGeminiTextExtractAllModels_(docFallbackText, geminiKey);
+      if (gt && gt.text && gt.text.length > 80) {
+        const mergedT = mergeExternalExtractIntoPlainText_(gt.text);
+        if (analyzeDocTextQuality_(mergedT).readable || looksStructuredGemini_(gt.text)) {
+          Logger.log('Gemini (текст Doc): OK, модель ' + gt.model);
+          return { text: gt.text, source: 'gemini-doc-text' };
+        }
+      }
     }
   } else {
     Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
@@ -325,11 +378,87 @@ function tryExternalTextExtraction_(pdfFileId) {
   return null;
 }
 
-function tryGeminiPdfExtract_(pdfFileId, apiKey) {
+/** Список моделей: свойство GEMINI_MODEL в скрипте → константа → запасные. */
+function getGeminiModelsToTry_() {
+  const props = PropertiesService.getScriptProperties();
+  const fromProps = (props.getProperty('GEMINI_MODEL') || '').trim();
+  const primary = fromProps || GEMINI_MODEL;
+  const out = [primary];
+  for (let i = 0; i < GEMINI_FALLBACK_MODELS.length; i++) {
+    if (out.indexOf(GEMINI_FALLBACK_MODELS[i]) === -1) {
+      out.push(GEMINI_FALLBACK_MODELS[i]);
+    }
+  }
+  return out;
+}
+
+function parseRetryAfterMs_(resp) {
+  try {
+    const headers = resp.getHeaders();
+    const raw = headers['Retry-After'] || headers['retry-after'];
+    if (!raw) {
+      return 0;
+    }
+    const sec = parseInt(String(raw).replace(/[^0-9]/g, ''), 10);
+    if (!isNaN(sec) && sec > 0) {
+      return Math.min(sec * 1000, GEMINI_MAX_BACKOFF_MS);
+    }
+  } catch (ignore) {}
+  return 0;
+}
+
+function geminiBackoffMs_(attempt, resp) {
+  const fromHeader = resp ? parseRetryAfterMs_(resp) : 0;
+  if (fromHeader > 0) {
+    Logger.log('Gemini: пауза по Retry-After ' + Math.round(fromHeader / 1000) + ' с');
+    return fromHeader;
+  }
+  const exp = GEMINI_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+  return Math.min(exp, GEMINI_MAX_BACKOFF_MS);
+}
+
+function tryGeminiPdfExtractAllModels_(pdfFileId, apiKey) {
+  const models = getGeminiModelsToTry_();
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    Logger.log('Gemini PDF, модель: ' + model);
+    const r = tryGeminiPdfExtract_(pdfFileId, apiKey, model);
+    if (r && r.text) {
+      r.model = model;
+      return r;
+    }
+    if (mi < models.length - 1) {
+      Logger.log('Следующая запасная модель Gemini через 5 с…');
+      Utilities.sleep(5000);
+    }
+  }
+  return null;
+}
+
+function tryGeminiTextExtractAllModels_(plainText, apiKey) {
+  const models = getGeminiModelsToTry_();
+  const snippet = plainText.length > 120000 ? plainText.substring(0, 120000) : plainText;
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    const r = tryGeminiTextExtract_(snippet, apiKey, model);
+    if (r && r.text) {
+      r.model = model;
+      return r;
+    }
+    if (mi < models.length - 1) {
+      Utilities.sleep(3000);
+    }
+  }
+  return null;
+}
+
+function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
+  const model = modelName || GEMINI_MODEL;
   try {
     const file = DriveApp.getFileById(pdfFileId);
     const blob = file.getBlob();
     const size = blob.getBytes().length;
+    Logger.log('Gemini: размер PDF ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
     if (size > MAX_GEMINI_INLINE_PDF_BYTES) {
       Logger.log('Gemini: PDF слишком большой для inline: ' + size + ' байт');
       return null;
@@ -337,14 +466,11 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey) {
     const b64 = Utilities.base64Encode(blob.getBytes());
     const url =
       'https://generativelanguage.googleapis.com/v1beta/models/' +
-      GEMINI_MODEL +
+      model +
       ':generateContent?key=' +
       encodeURIComponent(apiKey);
 
     for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        Utilities.sleep(GEMINI_RETRY_BASE_DELAY_MS * (attempt - 1));
-      }
       const bodyObj = {
         contents: [
           {
@@ -370,7 +496,13 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey) {
       const code = resp.getResponseCode();
       const respText = resp.getContentText();
       if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
-        Logger.log('Gemini HTTP ' + code + ', попытка ' + attempt + '/' + GEMINI_MAX_ATTEMPTS);
+        const waitMs = geminiBackoffMs_(attempt, resp);
+        Logger.log(
+          'Gemini HTTP ' + code + ', попытка ' + attempt + '/' + GEMINI_MAX_ATTEMPTS + ', пауза ' + Math.round(waitMs / 1000) + ' с'
+        );
+        if (attempt < GEMINI_MAX_ATTEMPTS) {
+          Utilities.sleep(waitMs);
+        }
         continue;
       }
       if (code !== 200) {
@@ -414,14 +546,76 @@ function tryGeminiPdfExtract_(pdfFileId, apiKey) {
         Logger.log('Gemini: слишком короткий текст (' + out.length + ' симв.), попытка ' + attempt);
         continue;
       }
-      return { text: out };
+      return { text: out, model: model };
     }
-    Logger.log('Gemini: исчерпаны попытки (' + GEMINI_MAX_ATTEMPTS + ')');
+    Logger.log('Gemini: исчерпаны попытки (' + GEMINI_MAX_ATTEMPTS + ') для модели ' + model);
     return null;
   } catch (e) {
     Logger.log('Gemini: ' + e.message);
     return null;
   }
+}
+
+/** Тот же формат ответа, но без PDF — меньше нагрузка на квоту при 429 на inline PDF. */
+function tryGeminiTextExtract_(plainText, apiKey, modelName) {
+  const model = modelName || GEMINI_MODEL;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    model +
+    ':generateContent?key=' +
+    encodeURIComponent(apiKey);
+  const prompt =
+    getGeminiInvoicePrompt_() +
+    '\n\nНиже сырой текст, извлечённый из PDF через Google (может быть неполным). Восстанови структуру счёта/УПД:\n\n' +
+    plainText;
+
+  for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      Utilities.sleep(geminiBackoffMs_(attempt - 1, null));
+    }
+    const bodyObj = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 8192 },
+    };
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      payload: JSON.stringify(bodyObj),
+    });
+    const code = resp.getResponseCode();
+    const respText = resp.getContentText();
+    if (code === 429 || code === 503) {
+      const waitMs = geminiBackoffMs_(attempt, resp);
+      Logger.log('Gemini (текст) HTTP ' + code + ', пауза ' + Math.round(waitMs / 1000) + ' с');
+      if (attempt < GEMINI_MAX_ATTEMPTS) {
+        Utilities.sleep(waitMs);
+      }
+      continue;
+    }
+    if (code !== 200) {
+      Logger.log('Gemini (текст) HTTP ' + code);
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(respText);
+    } catch (e2) {
+      continue;
+    }
+    const parts = json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts;
+    if (!parts || !parts.length) {
+      continue;
+    }
+    let out = '';
+    for (let i = 0; i < parts.length; i++) {
+      out += parts[i].text || '';
+    }
+    if (out.length >= 40) {
+      return { text: out, model: model };
+    }
+  }
+  return null;
 }
 
 function getGeminiInvoicePrompt_() {
@@ -446,8 +640,15 @@ function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
   try {
     const file = DriveApp.getFileById(pdfFileId);
     const blob = file.getBlob().setContentType('application/pdf');
-    if (blob.getBytes().length > MAX_OCR_SPACE_BYTES) {
-      Logger.log('OCR.space: файл больше ~1 МБ (лимит бесплатного тарифа).');
+    const size = blob.getBytes().length;
+    Logger.log('OCR.space: размер файла ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
+    if (size > MAX_OCR_SPACE_BYTES) {
+      if (OCR_TRY_DRIVE_URL_FOR_LARGE) {
+        return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
+      }
+      Logger.log(
+        'OCR.space: файл больше ~1 МБ (бесплатный тариф). Сожмите PDF или задайте OCR_TRY_DRIVE_URL_FOR_LARGE = true.'
+      );
       return null;
     }
     for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
@@ -506,6 +707,78 @@ function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
   } catch (e) {
     Logger.log('OCR.space: ' + e.message);
     return null;
+  }
+}
+
+/**
+ * Для PDF >1 МБ: OCR.space по прямой ссылке Drive (нужен доступ «по ссылке», см. OCR_TRY_DRIVE_URL_FOR_LARGE).
+ */
+function tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file) {
+  const origAccess = file.getSharingAccess();
+  const origPerm = file.getSharingPermission();
+  let changedSharing = false;
+  try {
+    if (origAccess !== DriveApp.Access.ANYONE_WITH_LINK && origAccess !== DriveApp.Access.ANYONE) {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      changedSharing = true;
+      Logger.log('OCR.space: временно «доступ по ссылке» для загрузки PDF по URL.');
+    }
+    Utilities.sleep(2000);
+    const driveUrl = 'https://drive.google.com/uc?export=download&id=' + pdfFileId;
+    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        Utilities.sleep(1500 * attempt);
+      }
+      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+        method: 'post',
+        muteHttpExceptions: true,
+        payload: {
+          apikey: apiKey,
+          url: driveUrl,
+          filetype: 'PDF',
+          language: 'rus',
+          isTable: 'true',
+          OCREngine: '2',
+          detectOrientation: 'true',
+          scale: 'true',
+        },
+      });
+      const code = resp.getResponseCode();
+      const raw = resp.getContentText();
+      if (code !== 200) {
+        Logger.log('OCR.space (URL) HTTP ' + code + ': ' + raw.substring(0, 300));
+        continue;
+      }
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch (ignore) {
+        continue;
+      }
+      if (json.IsErroredOnProcessing) {
+        Logger.log('OCR.space (URL): ' + (json.ErrorMessage || JSON.stringify(json)).substring(0, 400));
+        continue;
+      }
+      const pr = json.ParsedResults && json.ParsedResults[0];
+      if (pr && pr.ParsedText && pr.ParsedText.length > 15) {
+        Logger.log('OCR.space (URL): получен текст (' + pr.ParsedText.length + ' симв.).');
+        return { text: pr.ParsedText };
+      }
+    }
+    Logger.log('OCR.space (URL): не удалось распознать (лимит тарифа или Drive не отдал файл по ссылке).');
+    return null;
+  } catch (e) {
+    Logger.log('OCR.space (URL): ' + e.message);
+    return null;
+  } finally {
+    if (changedSharing) {
+      try {
+        file.setSharing(origAccess, origPerm);
+        Logger.log('OCR.space: доступ к файлу на Drive восстановлен.');
+      } catch (restoreErr) {
+        Logger.log('OCR.space: не удалось восстановить доступ: ' + restoreErr.message);
+      }
+    }
   }
 }
 
