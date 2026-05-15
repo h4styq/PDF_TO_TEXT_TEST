@@ -653,7 +653,9 @@ function getGeminiInvoicePrompt_() {
     '№ п/п | Наименование товара | Код вида товара | Единица измерения: код | Единица измерения: условное обозначение | ' +
     'Количество (объем) | Цена за единицу | Стоимость без налога | Акциз | Налоговая ставка | Сумма налога | Стоимость с налогом | ' +
     'Страна: цифровой код | Страна: краткое наименование | Рег. номер декларации/партии\n' +
+    'Количество может быть с тремя знаками после запятой: 700,000 (=700 шт). ' +
     'В колонке № п/п только порядковый номер строки: 1, 2, 3… Первая строка — заголовки, далее строки данных (TAB). ' +
+    'Заполни также акциз, ставку и сумму НДС, стоимость с налогом, страну и рег. номер декларации, если есть в PDF.\n' +
     'Не включай «Всего к оплате» и итоги.\n' +
     '===END===\n' +
     'Если фрагмента нет — оставь маркер и пустую секцию. Не выдумывай суммы и реквизиты.'
@@ -1456,7 +1458,7 @@ function isQuantity_(t) {
 /** Цена за единицу (5,83 / 8.80 / 25,00). */
 function isUnitPrice_(t) {
   const s = String(t || '').trim();
-  if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isQuantity_(s)) {
+  if (!s || isOkeiCode_(s) || isUnitDesignation_(s) || isQuantity_(s) || isQuantityThousandths_(s)) {
     return false;
   }
   if (looksLikeMoneySum_(s)) {
@@ -1471,6 +1473,9 @@ function isMoney_(t) {
   if (!s) {
     return false;
   }
+  if (isQuantityThousandths_(s)) {
+    return false;
+  }
   if (/^\d{1,2}\s*%$/.test(s) || /^без\s+акциза$/i.test(s)) {
     return false;
   }
@@ -1482,6 +1487,28 @@ function isMoney_(t) {
   }
   const n = parseRuNumber_(s);
   return !isNaN(n) && n >= 500;
+}
+
+/** Количество в формате УПД: «700,000» = 700 (три знака после запятой). */
+function isQuantityThousandths_(t) {
+  const s = String(t || '').trim();
+  return /^\d{1,7},\d{3}$/.test(s);
+}
+
+function normalizeQuantityToken_(t) {
+  const s = String(t || '').trim();
+  const m = s.match(/^(\d{1,7}),\d{3}$/);
+  if (m) {
+    return m[1];
+  }
+  return s;
+}
+
+function isQuantityFormatted_(t) {
+  if (isQuantityThousandths_(t)) {
+    return true;
+  }
+  return isPlainInteger_(t);
 }
 
 function isVatRate_(t) {
@@ -1542,6 +1569,9 @@ function isPlainInteger_(t) {
 
 /** Стоимость без НДС: сумма с копейками или крупное целое (3125, 4083). */
 function isCostWithoutVat_(t) {
+  if (isQuantityThousandths_(t)) {
+    return false;
+  }
   if (looksLikeMoneySum_(t)) {
     return true;
   }
@@ -1643,7 +1673,7 @@ function assignMetricsInDocumentOrder_(pool, out) {
       continue;
     }
 
-    if (shouldSkipInQtyPricePhases_(t)) {
+    if (phase <= 2 && shouldSkipInQtyPricePhases_(t)) {
       continue;
     }
 
@@ -1653,8 +1683,8 @@ function assignMetricsInDocumentOrder_(pool, out) {
         i--;
         continue;
       }
-      if (isPlainInteger_(t)) {
-        out[5] = t;
+      if (isQuantityFormatted_(t)) {
+        out[5] = normalizeQuantityToken_(t);
         phase = 1;
         continue;
       }
@@ -1743,13 +1773,76 @@ function assignMetricsInDocumentOrder_(pool, out) {
       }
     }
   }
+
+  assignTailColumnsFromPool_(pool, out);
+}
+
+/**
+ * Дозаполнение акциза, НДС, страны и т.д. (если токены остались в pool или пропущены фазами).
+ */
+function assignTailColumnsFromPool_(pool, out) {
+  for (let i = 0; i < pool.length; i++) {
+    const t = pool[i];
+    if (!t) {
+      continue;
+    }
+    if (isKodVidaTovara_(t) || isOkeiCodeWithContext_(t, pool[i + 1] || '') || isUnitDesignation_(t)) {
+      continue;
+    }
+    if (t === out[5] || t === out[6] || t === out[7] || normalizeQuantityToken_(t) === out[5]) {
+      continue;
+    }
+
+    if (!out[8] && (isExcise_(t) || t === '0')) {
+      out[8] = t;
+      continue;
+    }
+    if (!out[9] && isVatRate_(t)) {
+      out[9] = t;
+      continue;
+    }
+    if (!out[10] && !isVatRate_(t) && (looksLikeMoneySum_(t) || isMoney_(t)) && !isCountryCode_(t)) {
+      const n = parseRuNumber_(t);
+      const cost = parseRuNumber_(out[7]);
+      if (!isNaN(n) && n > 0 && (isNaN(cost) || n < cost * 0.95)) {
+        out[10] = t;
+        continue;
+      }
+    }
+    if (!out[11] && (looksLikeMoneySum_(t) || isMoney_(t)) && !isCountryCode_(t)) {
+      const n = parseRuNumber_(t);
+      const cost = parseRuNumber_(out[7]);
+      if (!isNaN(n) && n > 0 && (isNaN(cost) || n >= cost * 0.9)) {
+        out[11] = t;
+        continue;
+      }
+    }
+    if (!out[12] && isCountryCode_(t)) {
+      out[12] = t;
+      continue;
+    }
+    if (!out[13] && isCountryName_(t)) {
+      out[13] = t;
+      continue;
+    }
+    if (!out[14] && isDeclReg_(t)) {
+      out[14] = t;
+    }
+  }
 }
 
 function isStrongMetricStart_(t, hasName) {
   if (!hasName) {
     return false;
   }
-  return isOkeiCode_(t) || isUnitDesignation_(t) || isQuantity_(t) || isMoney_(t) || isVatRate_(t);
+  return (
+    isOkeiCode_(t) ||
+    isUnitDesignation_(t) ||
+    isQuantityThousandths_(t) ||
+    isQuantity_(t) ||
+    isMoney_(t) ||
+    isVatRate_(t)
+  );
 }
 
 function takeFromPool_(pool, pred) {
