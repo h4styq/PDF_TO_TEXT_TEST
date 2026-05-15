@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-18-electromontazh';
+const SCRIPT_VERSION = '2026-05-19-electromontazh-ocr';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1526,6 +1526,11 @@ function extractInvoiceHeader_(text) {
   if (m3) {
     return ('Счет-фактура № ' + m3[1] + ' от ' + m3[2].trim()).replace(/\s+/g, ' ');
   }
+  const reSlash = /Сч[её]т[-\s]*фактура\s*N[oº°№.]?\s*(\d{2,6}\/\d{1,5})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
+  const ms = text.match(reSlash);
+  if (ms) {
+    return ('Счет-фактура № ' + ms[1] + ' от ' + ms[2]).replace(/\s+/g, ' ');
+  }
   return '';
 }
 
@@ -1554,6 +1559,10 @@ function extractInvoiceHeaderFromOcrBlob_(text) {
     return formatOcrInvoiceLine_(m[1], m[2].trim());
   }
   m = flat.match(/сч[её]т[-\s]*фактур\w*[^0-9]{0,30}(\d{1,6})[^0-9]{0,50}([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
+  if (m) {
+    return formatOcrInvoiceLine_(m[1], m[2].trim());
+  }
+  m = flat.match(/сч[её]т[-\s]*фактур\w*[^0-9/]{0,50}(\d{2,6}\/\d{1,5})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
   if (m) {
     return formatOcrInvoiceLine_(m[1], m[2].trim());
   }
@@ -1871,6 +1880,14 @@ function extractOcrHeaderFields_(text) {
       invoiceLine = formatOcrInvoiceLine_('765', d765[0]);
     }
   }
+  if (!invoiceLine && /электромонтаж|мпо\s+электромонтаж/i.test(t)) {
+    const emInv = t.match(
+      /(?:сч[её]т[\s-]*фактур\w*|универсальн\w*\s+передаточн\w*)[^\d]{0,55}(\d{3,6}\/\d{1,5})\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i
+    );
+    if (emInv) {
+      invoiceLine = 'Счет-фактура № ' + emInv[1] + ' от ' + emInv[2];
+    }
+  }
   return {
     invoiceLine: invoiceLine,
     paymentDoc: paymentDoc,
@@ -2102,6 +2119,7 @@ function looksLikeOcrProductSkuLine_(line) {
     /45\.\d{4}\.\d{4}/.test(l) ||
     /\bGX\d/i.test(l) ||
     /\bG\d{4}\.\s*/i.test(l) ||
+    /\b[ГG]\d{4}\.\s*/i.test(l) ||
     /наконечник\s+\d{4,}/i.test(l)
   );
 }
@@ -2125,7 +2143,7 @@ function isOcrInvoiceMetaLine_(line) {
   if (/^[0-9]{1,2}\s*-\s*сч[её]т/i.test(l)) {
     return true;
   }
-  if (/основание\s+передачи|адрес\s+доставки|молодежная|жуковск/i.test(l) && !/наконечник|колодк|00-\d/i.test(l)) {
+  if (/основание\s+передачи|адрес\s+доставки|молодежная|жуковск/i.test(l) && !/^доставка\s+товара/i.test(l) && !/наконечник|колодк|00-\d|[ГG]\d{4}\./i.test(l)) {
     return true;
   }
   if (/^от\s+\d|^N[oº°]\s*-/i.test(l) && l.length < 50) {
@@ -2832,14 +2850,17 @@ function parseOcrProductRowsOnly_(text) {
         j++;
       }
     }
-    const cells = tokenizeOcrProductLine_(line);
-    if (cells.length >= 2) {
-      if (/45\.7373\.\d{4}/.test(line)) {
-        rows.push(cells);
-      } else if (/^00-\d{5,}/.test(line) || (looksLikeOcrProductSkuLine_(line) && !/45\.7373/.test(line))) {
-        skuFallback.push(cells);
-      } else {
-        rows.push(cells);
+    const chunks = splitMergedOcrProductPhysicalLines_(line);
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const cells = tokenizeOcrProductLine_(chunks[ci]);
+      if (cells.length >= 2) {
+        if (/45\.7373\.\d{4}/.test(chunks[ci])) {
+          rows.push(cells);
+        } else if (/^00-\d{5,}/.test(chunks[ci]) || (looksLikeOcrProductSkuLine_(chunks[ci]) && !/45\.7373/.test(chunks[ci]))) {
+          skuFallback.push(cells);
+        } else {
+          rows.push(cells);
+        }
       }
     }
   }
@@ -2927,6 +2948,27 @@ function splitMergedGeminiTablePhysicalLines_(line) {
   const head = l.substring(0, idx).trim();
   if (head.length < 15) {
     return [l];
+  }
+  return [head, tail];
+}
+
+function splitMergedOcrProductPhysicalLines_(line) {
+  const ts = splitMergedGeminiTablePhysicalLines_(line);
+  if (ts.length > 1) {
+    return ts;
+  }
+  const l = String(line || '').trim();
+  let idx = l.search(/\s2\s+Доставка\s+товара/i);
+  if (idx < 0) {
+    idx = l.search(/\t2\t[^\t\n]*Доставка\s+товара/i);
+  }
+  if (idx < 0) {
+    return ts;
+  }
+  const head = l.substring(0, idx).trim();
+  const tail = l.substring(idx + 1).trim();
+  if (!/^2[\t\s]+Доставка\s+товара/i.test(tail) || head.length < 15) {
+    return ts;
   }
   return [head, tail];
 }
@@ -3224,6 +3266,9 @@ function isCountryCode_(t) {
 
 function isCountryName_(t) {
   const s = String(t || '').trim();
+  if (/^(без|или|для|нет)$/i.test(s)) {
+    return false;
+  }
   return /^[A-Za-zА-Яа-яЁё-]{3,}$/.test(s) && !isUnitDesignation_(s) && !isOkeiCode_(s) && !isMoney_(s);
 }
 
@@ -3702,7 +3747,7 @@ function semanticMapGoodsRow_(cells, seqNum) {
   }
   while (pos < tokens.length && /^\d{1,4}$/.test(tokens[pos])) {
     const rest = tokens.slice(pos + 1).join(' ');
-    if (/^(GX|Услуг|45\.|Г\d)/i.test(rest) || (pos + 2 < tokens.length && /услуг|GX/i.test(tokens.slice(pos + 2).join(' ')))) {
+    if (/^(GX|Услуг|45\.|[ГG]\d)/i.test(rest) || (pos + 2 < tokens.length && /услуг|GX/i.test(tokens.slice(pos + 2).join(' ')))) {
       pos++;
       continue;
     }
@@ -3741,6 +3786,35 @@ function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
   return semanticMapGoodsRow_(cells, seqNum);
 }
 
+/** Исправления OCR для УПД ЗАО «МПО Электромонтаж»: страна, декларация, сумма с НДС. */
+function repairElectromontazhOcrMappedRow_(mapped, fullText) {
+  const name = String(mapped[1] || '');
+  const ft = String(fullText || '').replace(/\s+/g, ' ');
+  if (/^без$/i.test(String(mapped[13] || '').trim())) {
+    mapped[13] = '';
+    if (!mapped[8]) {
+      mapped[8] = 'без акциза';
+    }
+  }
+  if (/[ГG]8510|нак\s*онечник\s+47482/i.test(name)) {
+    const decl = ft.match(/(\d{7,}\/\d{5,}\/\d{6,})/);
+    if (decl && !String(mapped[14] || '').trim()) {
+      mapped[14] = decl[1];
+    }
+    if (String(mapped[12] || '').trim() === '156') {
+      if (!String(mapped[13] || '').trim() || /^без$/i.test(String(mapped[13]).trim())) {
+        mapped[13] = 'Китай';
+      }
+    }
+    const cost = parseRuNumber_(mapped[7]);
+    const vat = parseRuNumber_(mapped[10]);
+    const tot = parseRuNumber_(mapped[11]);
+    if (cost > 0 && vat > 0 && (!tot || tot < cost)) {
+      mapped[11] = formatRuMoneyWithCents_(cost + vat);
+    }
+  }
+}
+
 function normalizeGoodsTableRows_(rows, fullText) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
@@ -3754,6 +3828,7 @@ function normalizeGoodsTableRows_(rows, fullText) {
   }
   const merged = mergeOcrContinuationRows_(out);
   for (let j = 0; j < merged.length; j++) {
+    repairElectromontazhOcrMappedRow_(merged[j], fullText);
     merged[j][0] = String(j + 1);
   }
   if (merged.length > MAX_GOODS_ROWS_PER_PDF) {
@@ -4025,6 +4100,16 @@ function normalizeBasisField_(basis, fullText) {
   const dm = s.match(/Сч[её]т[-–—]?\s*договор\s*№\s*(.+)/i);
   if (dm) {
     return 'Счёт-договор № ' + fixBasisContractNumberOcr_(dm[1].trim());
+  }
+  const flat = String(fullText || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\t/g, ' ')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const dmFlat = flat.match(/Сч[её]т[- ]договор\s*№\s*(.+?\s+от\s+[0-9]{2}\.[0-9]{2}\.[0-9]{4})/i);
+  if (dmFlat) {
+    return 'Счёт-договор № ' + fixBasisContractNumberOcr_(dmFlat[1].trim());
   }
   return s;
 }
