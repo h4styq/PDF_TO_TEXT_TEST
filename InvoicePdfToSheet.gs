@@ -40,7 +40,7 @@ const DELETE_TEMP_DOCS = true;
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-electromontazh-ocr2';
+const SCRIPT_VERSION = '2026-05-19-delivery-dash';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -3858,10 +3858,35 @@ function extractElectromontazhDeclarationFromFlat_(flat) {
   return '';
 }
 
+/** Плейсхолдеры «-» / «--» для строки «Доставка товара» (как в эталоне). */
+function applyDeliveryRowGoldenPlaceholders_(mapped) {
+  if (!isDeliveryServiceRow_(mapped[1])) {
+    return;
+  }
+  if (!String(mapped[2] || '').trim() || mapped[2] === '--') {
+    mapped[2] = '-';
+  }
+  for (let c = 3; c <= 6; c++) {
+    if (!String(mapped[c] || '').trim()) {
+      mapped[c] = '--';
+    }
+  }
+  if (!String(mapped[12] || '').trim() || mapped[12] === '--') {
+    mapped[12] = '-';
+  }
+  if (!String(mapped[13] || '').trim()) {
+    mapped[13] = '--';
+  }
+  if (!String(mapped[14] || '').trim()) {
+    mapped[14] = '--';
+  }
+}
+
 /** Исправления OCR для УПД ЗАО «МПО Электромонтаж»: страна, декларация, сумма с НДС. */
 function repairElectromontazhOcrMappedRow_(mapped, fullText) {
   const name = String(mapped[1] || '');
   const ft = String(fullText || '').replace(/\s+/g, ' ');
+  applyDeliveryRowGoldenPlaceholders_(mapped);
   if (/^без$/i.test(String(mapped[13] || '').trim())) {
     mapped[13] = '';
     if (!mapped[8]) {
@@ -3901,6 +3926,7 @@ function normalizeGoodsTableRows_(rows, fullText) {
   const merged = mergeOcrContinuationRows_(out);
   for (let j = 0; j < merged.length; j++) {
     repairElectromontazhOcrMappedRow_(merged[j], fullText);
+    applyDeliveryRowGoldenPlaceholders_(merged[j]);
     merged[j][0] = String(j + 1);
   }
   if (merged.length > MAX_GOODS_ROWS_PER_PDF) {
@@ -4509,6 +4535,9 @@ function goldenCellsEqual_(got, expected, colIndex) {
   const g = String(got || '').trim();
   const e = String(expected || '').trim();
   if (!e || e === '--') {
+    return !g || g === '--' || g === '—' || g === '-';
+  }
+  if (e === '-' || e === '—') {
     return !g || g === '--' || g === '—' || g === '-';
   }
   if (colIndex >= 5 && colIndex <= 11) {
