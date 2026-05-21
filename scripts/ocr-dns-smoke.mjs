@@ -52,3 +52,25 @@ if (good !== 'Lech G703 Black (910-005644) - CN -' && good !== 'Lech G703 Black 
   process.exit(1);
 }
 console.log('OK: product name strip');
+
+const flat =
+  '1 Товар разный 796 шт 1 100,00 3 Товар три 796 шт 2 200,00 4 Мышь беспроводная Logitech G703 Black (910-005644) - CN - 796 шт. 1 4 999,17 4 999,17 5 Мышь беспроводная Logitech G703 Black (910-005644) - CN - 796 шт. 1 4 999,17 всего к оплате';
+const esc = '910-005644'.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const re = new RegExp(
+  '(?:^|\\s)4\\s+([А-Яа-яЁё][\\s\\S]{8,220}?(?:Logitech|Lech|G703)[\\s\\S]{0,120}?\\(' +
+    esc +
+    '\\)[\\s\\S]{0,40}?-?\\s*CN)',
+  'i'
+);
+const m4 = flat.match(re);
+if (!m4 || !/Мышь беспроводная Logitech G703 Black/.test(m4[1])) {
+  console.error('FAIL: row 4 full name in flat', m4 && m4[1]);
+  process.exit(1);
+}
+const re5 = /(?:^|\s)5\s+([\s\S]{20,400}?)(?=\sвсего\s+к\s+оплате|$)/i;
+const m5 = flat.match(re5);
+if (!m5 || !/910-005644/.test(m5[1])) {
+  console.error('FAIL: row 5 supplement', m5 && m5[1]);
+  process.exit(1);
+}
+console.log('OK: row 4 name and row 5 scan');

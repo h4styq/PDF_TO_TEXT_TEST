@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-retail-name-strip';
+const SCRIPT_VERSION = '2026-05-20-retail-seq-name';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1929,8 +1929,14 @@ function findOcrProductLineForRow_(fullText, rowName) {
         return l;
       }
     }
-    if (!wantDelivery && /\(910-|910-005644|\blech\b/i.test(rowName || '')) {
-      if (/\(910-|910-005644|\blech\b|796\s*шт/i.test(l)) {
+    if (!wantDelivery && /\(910-|910-005644|\blech\b|logitech|g703|мышь/i.test(rowName || '')) {
+      if (/\(910-|910-005644|\blech\b|logitech|g703|мышь|796\s*шт/i.test(l)) {
+        return l;
+      }
+    }
+    if (!wantDelivery) {
+      const art = String(rowName || '').match(/\((\d{3}-\d{6})\)/);
+      if (art && l.indexOf(art[1]) >= 0 && /\b796\b/.test(l)) {
         return l;
       }
     }
@@ -3120,7 +3126,10 @@ function parseOcrProductRowsOnly_(text) {
       continue;
     }
     if (/всего\s+к\s+оплате/i.test(line)) {
-      break;
+      if (!ocrTableContinuesAfterTotals_(lines, i)) {
+        break;
+      }
+      continue;
     }
     if (
       !inTableRegion &&
@@ -3193,33 +3202,14 @@ function parseOcrProductRowsOnly_(text) {
       finalRows.push(['2', 'Доставка СДЭК НП', '666,67', '33,33', '700,00']);
     }
   }
-  sortOcrRawRowsDocumentOrder_(finalRows);
+  finalRows = supplementOcrProductRowsFromFlat_(text, finalRows);
+  sortRawRowsByDocumentSeq_(finalRows);
   Logger.log('OCR: найдено кандидатов в строки товаров: ' + finalRows.length);
   return {
     header: CANONICAL_UPD_HEADERS.slice(),
     rows: finalRows,
     width: maxRowLen_(finalRows),
   };
-}
-
-/** Товар (Г8510…) перед «Доставка товара» в сыром OCR. */
-function sortOcrRawRowsDocumentOrder_(rows) {
-  if (!rows || rows.length < 2) {
-    return;
-  }
-  rows.sort(function (a, b) {
-    const la = a.join(' ');
-    const lb = b.join(' ');
-    return ocrRawRowRank_(la) - ocrRawRowRank_(lb);
-  });
-}
-
-function ocrRawRowRank_(lineText) {
-  const cells = tokenizeOcrProductLine_(String(lineText || ''));
-  if (!cells.length) {
-    return 1;
-  }
-  return goodsRowDocumentRank_(alignRowToCanonicalGoodsColumns_(cells, 1));
 }
 
 /** Строки товаров с TAB без маркеров (склеенный ответ Gemini). */
@@ -3434,6 +3424,144 @@ function parseGeminiTableSection_(text) {
 
 function looksLikeSeqNumber_(s) {
   return /^\d{1,4}$/.test(String(s || '').trim());
+}
+
+/** № п/п из OCR-строки (первая ячейка или префикс «4 Мышь…»). */
+function extractDocumentSeqFromCells_(cells) {
+  if (!cells || !cells.length) {
+    return 0;
+  }
+  const c0 = String(cells[0] || '').trim();
+  if (looksLikeSeqNumber_(c0)) {
+    const n = parseInt(c0, 10);
+    return n > 0 && n <= 99 ? n : 0;
+  }
+  const joined = cells
+    .map(function (x) {
+      return String(x || '').trim();
+    })
+    .join(' ');
+  const m = joined.match(/^(\d{1,2})\s+/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    return n > 0 && n <= 99 ? n : 0;
+  }
+  return 0;
+}
+
+function sortRawRowsByDocumentSeq_(rows) {
+  if (!rows || rows.length < 2) {
+    return;
+  }
+  rows.sort(function (a, b) {
+    return (extractDocumentSeqFromCells_(a) || 999) - (extractDocumentSeqFromCells_(b) || 999);
+  });
+}
+
+function sortMappedRowsByDocumentSeq_(rows) {
+  if (!rows || rows.length < 2) {
+    return rows;
+  }
+  rows.sort(function (a, b) {
+    return (parseInt(String(a[0] || ''), 10) || 999) - (parseInt(String(b[0] || ''), 10) || 999);
+  });
+  return rows;
+}
+
+/** Сохранить № из УПД (1…5), а не перенумеровать 1…N по порядку вывода. */
+function finalizeDocumentRowNumbers_(rows) {
+  if (!rows || !rows.length) {
+    return rows;
+  }
+  const seqs = [];
+  for (let i = 0; i < rows.length; i++) {
+    const s = parseInt(String(rows[i][0] || ''), 10);
+    if (s > 0 && s <= 99) {
+      seqs.push(s);
+    }
+  }
+  let uniqueSeq = seqs.length === rows.length;
+  if (uniqueSeq) {
+    const seen = {};
+    for (let ui = 0; ui < seqs.length; ui++) {
+      if (seen[seqs[ui]]) {
+        uniqueSeq = false;
+        break;
+      }
+      seen[seqs[ui]] = true;
+    }
+  }
+  if (uniqueSeq) {
+    return sortMappedRowsByDocumentSeq_(rows);
+  }
+  for (let j = 0; j < rows.length; j++) {
+    rows[j][0] = String(j + 1);
+  }
+  return rows;
+}
+
+/** После «Всего к оплате» на 1-й странице таблица может продолжиться (стр. 2). */
+function ocrTableContinuesAfterTotals_(lines, fromIndex) {
+  for (let k = fromIndex + 1; k < Math.min(fromIndex + 100, lines.length); k++) {
+    const l = String(lines[k] || '')
+      .replace(/\u00a0/g, ' ')
+      .trim();
+    if (!l) {
+      continue;
+    }
+    if (/наименован/i.test(l) && /(п\/п|код|количество|единиц)/i.test(l)) {
+      return true;
+    }
+    if (looksLikeOcrUpdProductRowLine_(l)) {
+      return true;
+    }
+    if (/^\d{1,2}\s+(?:[A-Za-zА-ЯёЁ(М]|Мышь)/.test(l) && /\b796\b/.test(l)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Добавить пропущенные позиции (например №5 со 2-й страницы) из всего OCR-текста. */
+function supplementOcrProductRowsFromFlat_(text, rows) {
+  const out = rows ? rows.slice() : [];
+  const flat = normalizeText_(text).replace(/\s+/g, ' ');
+  const have = {};
+  for (let i = 0; i < out.length; i++) {
+    const seq = extractDocumentSeqFromCells_(out[i]);
+    if (seq > 0) {
+      have[seq] = true;
+    }
+  }
+  for (let n = 1; n <= 20; n++) {
+    if (have[n]) {
+      continue;
+    }
+    const re = new RegExp(
+      '(?:^|\\s)' +
+        n +
+        '\\s+([\\s\\S]{20,520}?)(?=(?:\\s' +
+        (n + 1) +
+        '\\s+(?:[A-Za-zА-ЯёЁ(М]|\\d)|\\sвсего\\s+к\\s+оплате|$)',
+      'i'
+    );
+    const m = flat.match(re);
+    if (!m || !/\b796\b/.test(m[1])) {
+      continue;
+    }
+    const chunk = (n + ' ' + m[1].trim()).replace(/\s+/g, ' ');
+    if (!looksLikeOcrUpdProductRowLine_(chunk) && !looksLikeProductDataLine_(chunk)) {
+      continue;
+    }
+    const cells = tokenizeOcrProductLine_(chunk);
+    if (cells.length >= 2) {
+      out.push(cells);
+      have[n] = true;
+      Logger.log('OCR: доп. позиция №' + n + ' из полного текста PDF');
+    }
+  }
+  sortRawRowsByDocumentSeq_(out);
+  return out;
 }
 
 /** Артикул / код номенклатуры (не порядковый № п/п и не сумма). */
@@ -4474,6 +4602,65 @@ function finalizeRowVatTotalsGeneric_(out) {
   }
 }
 
+/** Полное наименование по артикулу (910-005644) и № строки в плоском OCR. */
+function expandProductNameByArticleInFlat_(flat, nameHint, docSeq) {
+  const hint = stripProductNameAtOkeiMarker_(String(nameHint || '')).trim();
+  let artM = hint.match(/\((\d{3}-\d{6})\)/);
+  if (!artM) {
+    artM = String(flat || '').match(/\((\d{3}-\d{6})\)/);
+  }
+  if (!artM) {
+    return '';
+  }
+  const esc = artM[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const seq = docSeq > 0 ? docSeq : extractDocumentSeqFromCells_([hint]) || 0;
+  const seqPrefix = seq > 0 ? '(?:^|\\s)' + seq + '\\s+' : '(?:^|\\s)\\d{1,2}\\s+';
+  const tries = [
+    new RegExp(
+      '((?:Мышь|мышь)\\s+беспроводная[\\s\\S]{0,160}?(?:Logitech|Lech|Логитех|G703)[\\s\\S]{0,100}?\\(' +
+        esc +
+        '\\)[\\s\\S]{0,40}?-?\\s*CN)',
+      'i'
+    ),
+    new RegExp(
+      seqPrefix +
+        '([А-Яа-яЁё][\\s\\S]{8,220}?(?:Logitech|Lech|Логитех|G703)[\\s\\S]{0,120}?\\(' +
+        esc +
+        '\\)[\\s\\S]{0,40}?-?\\s*CN)',
+      'i'
+    ),
+    new RegExp(seqPrefix + '([\\s\\S]{10,240}?\\(' + esc + '\\)[\\s\\S]{0,40}?-?\\s*CN)', 'i'),
+  ];
+  for (let ti = 0; ti < tries.length; ti++) {
+    const m = String(flat || '').match(tries[ti]);
+    if (!m) {
+      continue;
+    }
+    let name = (m[1] || m[0]).trim().replace(/^\d{1,2}\s+/, '');
+    name = stripProductNameAtOkeiMarker_(name);
+    if (name.length >= hint.length + 4) {
+      return name.replace(/\s+/g, ' ').trim();
+    }
+  }
+  return '';
+}
+
+function enrichProductNameFromFlat_(mapped, fullText) {
+  const flat = String(fullText || '').replace(/\s+/g, ' ');
+  const seq = parseInt(String(mapped[0] || ''), 10) || 0;
+  let name = String(mapped[1] || '').trim();
+  const byArt = expandProductNameByArticleInFlat_(flat, name, seq);
+  if (byArt) {
+    name = byArt;
+  } else if (!nameContainsEmbeddedOcrMetrics_(name)) {
+    const exp = expandProductNameFromFlatOcr_(flat, name);
+    if (exp && exp.length > name.length + 5) {
+      name = exp;
+    }
+  }
+  mapped[1] = cleanProductName_(stripProductNameAtOkeiMarker_(name).substring(0, 220));
+}
+
 /** Длинное наименование из плоского OCR по первым словам строки. */
 function expandProductNameFromFlatOcr_(flat, nameHint) {
   const hint = cleanProductName_(nameHint);
@@ -4505,17 +4692,11 @@ function expandProductNameFromFlatOcr_(flat, nameHint) {
 }
 
 function repairGenericMappedRow_(mapped, fullText, sourceLine) {
-  const flat = String(fullText || '').replace(/\s+/g, ' ');
   const kind = classifyGoodsRowKind_(mapped);
   if (nameContainsEmbeddedOcrMetrics_(mapped[1])) {
     repairRowFromEmbeddedOcrTokens_(mapped);
   }
-  if (!nameContainsEmbeddedOcrMetrics_(mapped[1])) {
-    const expanded = expandProductNameFromFlatOcr_(flat, mapped[1]);
-    if (expanded && expanded.length > String(mapped[1] || '').length + 6) {
-      mapped[1] = cleanProductName_(expanded.substring(0, 220));
-    }
-  }
+  enrichProductNameFromFlat_(mapped, fullText);
   if (kind === 'delivery') {
     repairDeliveryProductRowMetrics_(mapped, fullText);
     applyDeliveryRowGoldenPlaceholders_(mapped);
@@ -4589,9 +4770,21 @@ function normalizeGoodsTableRowOrderGeneric_(rows, fullText) {
     }
   }
 
-  copy.sort(function (a, b) {
-    return goodsRowDocumentRank_(a) - goodsRowDocumentRank_(b);
-  });
+  let allDocSeq = true;
+  for (let si = 0; si < copy.length; si++) {
+    const ds = parseInt(String(copy[si][0] || ''), 10);
+    if (!(ds > 0 && ds <= 99)) {
+      allDocSeq = false;
+      break;
+    }
+  }
+  if (allDocSeq) {
+    sortMappedRowsByDocumentSeq_(copy);
+  } else {
+    copy.sort(function (a, b) {
+      return goodsRowDocumentRank_(a) - goodsRowDocumentRank_(b);
+    });
+  }
   return copy;
 }
 
@@ -4623,12 +4816,14 @@ function normalizeGoodsTableRows_(rows, fullText) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const sourceLine = rows[i].join('\t');
-    const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
+    const docSeq = extractDocumentSeqFromCells_(rows[i]) || out.length + 1;
+    const mapped = alignRowToCanonicalGoodsColumns_(rows[i], docSeq);
+    mapped[0] = String(docSeq);
     repairScrambledOcrRow_(mapped, sourceLine, fullText);
     if (nameContainsEmbeddedOcrMetrics_(mapped[1])) {
       repairRowFromEmbeddedOcrTokens_(mapped);
     }
-    mapped[1] = stripProductNameAtOkeiMarker_(mapped[1]);
+    enrichProductNameFromFlat_(mapped, fullText);
     fixExciseAndCountrySlots_(mapped);
     if (!isGarbageMappedRow_(mapped)) {
       out.push(mapped);
@@ -4645,10 +4840,10 @@ function normalizeGoodsTableRows_(rows, fullText) {
       repairElectromontazhOcrMappedRow_(ordered[j], fullText);
     }
     applyDeliveryRowGoldenPlaceholders_(ordered[j]);
-    ordered[j][1] = stripProductNameAtOkeiMarker_(ordered[j][1]);
+    enrichProductNameFromFlat_(ordered[j], fullText);
     fixExciseAndCountrySlots_(ordered[j]);
-    ordered[j][0] = String(j + 1);
   }
+  ordered = finalizeDocumentRowNumbers_(ordered);
   if (ordered.length > MAX_GOODS_ROWS_PER_PDF) {
     Logger.log('Ограничение строк таблицы: ' + ordered.length + ' → ' + MAX_GOODS_ROWS_PER_PDF);
     return ordered.slice(0, MAX_GOODS_ROWS_PER_PDF);
