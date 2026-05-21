@@ -43,7 +43,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-file-separator';
+const SCRIPT_VERSION = '2026-05-19-golden-dart-decl';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -4392,7 +4392,7 @@ const GOLDEN_EXPECTED_BY_FILE = {
         '3750,00',
         '156',
         'КИТАЙ',
-        '10005030/170323/3066',
+        '10005030/170323/3066479',
       ],
       [
         '2',
