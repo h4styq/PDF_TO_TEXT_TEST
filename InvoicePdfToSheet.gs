@@ -9,6 +9,7 @@
  * РАСПОЗНАВАНИЕ (основной путь, USE_PDF_TO_DOC_CONVERSION = false):
  * — PDF не конвертируется в Google Doc (для сканов Doc обычно даёт «кракозябры» без пользы).
  * — Текст и таблица извлекаются через Gemini (PDF) и/или OCR.space.
+ * — См. RECOGNITION.md: общая схема (классификация строк, метрики, порядок) и тонкий слой эталонов.
  *
  * Запасной путь (USE_PDF_TO_DOC_CONVERSION = true):
  * — Старый вариант: PDF → Google Doc → при необходимости Gemini/OCR.
@@ -43,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-20-linkmag-ocr-order2';
+const SCRIPT_VERSION = '2026-05-20-generic-ocr-pipeline';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2955,19 +2956,14 @@ function pickBestOcrTable_(text) {
   const tableBlock = extractTableBlock_(text);
   const fromBlock = parseTableFromBlock_(tableBlock);
   const fromLines = parseOcrProductRowsOnly_(text);
-  const sBlock = scoreOcrTableQuality_(fromBlock);
+  let sBlock = scoreOcrTableQuality_(fromBlock);
   const sLines = scoreOcrTableQuality_(fromLines);
-  Logger.log('OCR: оценка таблицы (блок УПД=' + sBlock + ', строки товаров=' + sLines + ')');
-  if (
-    isLinkmagDocument_(text) &&
-    fromLines &&
-    fromLines.rows &&
-    fromLines.rows.length >= 2 &&
-    sLines >= sBlock - 15
-  ) {
-    Logger.log('OCR: ЛинкМаг — построчная эвристика (2 строки): ' + fromLines.rows.length);
-    return fromLines;
+  const dupBlock = countDuplicateProductNamesInTable_(fromBlock);
+  if (dupBlock > 0) {
+    sBlock -= dupBlock * 45;
+    Logger.log('OCR: штраф блока УПД за дубли наименований: ' + dupBlock);
   }
+  Logger.log('OCR: оценка таблицы (блок УПД=' + sBlock + ', строки товаров=' + sLines + ')');
   if (fromLines && fromLines.rows && fromLines.rows.length && sLines >= sBlock) {
     Logger.log('OCR: используем строки товаров по эвристике: ' + fromLines.rows.length);
     return fromLines;
@@ -3099,19 +3095,11 @@ function sortOcrRawRowsDocumentOrder_(rows) {
 }
 
 function ocrRawRowRank_(lineText) {
-  if (/lmc086|коаксиальн|00-00001918/i.test(lineText)) {
-    return 0;
+  const cells = tokenizeOcrProductLine_(String(lineText || ''));
+  if (!cells.length) {
+    return 1;
   }
-  if (/сдэк|сдек/i.test(lineText) && /доставк/i.test(lineText)) {
-    return 2;
-  }
-  if (/[ГG]8510|наконечник\s+47482/i.test(lineText)) {
-    return 0;
-  }
-  if (/доставка\s+товара/i.test(lineText) && !/[ГG]8510/i.test(lineText)) {
-    return 2;
-  }
-  return 1;
+  return goodsRowDocumentRank_(alignRowToCanonicalGoodsColumns_(cells, 1));
 }
 
 /** Строки товаров с TAB без маркеров (склеенный ответ Gemini). */
@@ -4202,6 +4190,229 @@ function repairElectromontazhOcrMappedRow_(mapped, fullText) {
   }
 }
 
+/** Сколько пар строк в таблице OCR с одинаковым началом наименования (типичный баг блока УПД). */
+function countDuplicateProductNamesInTable_(table) {
+  if (!table || !table.rows || table.rows.length < 2) {
+    return 0;
+  }
+  let dup = 0;
+  for (let i = 1; i < table.rows.length; i++) {
+    const a = productNameFingerprint_(table.rows[i - 1].join(' '));
+    const b = productNameFingerprint_(table.rows[i].join(' '));
+    if (a && b && a === b) {
+      dup++;
+    }
+  }
+  return dup;
+}
+
+function productNameFingerprint_(name) {
+  return normalizeGoldenText_(cleanProductName_(name)).substring(0, 36);
+}
+
+/** product | delivery | other — по наименованию и суммам, без ИНН контрагента. */
+function classifyGoodsRowKind_(mapped) {
+  const name = cleanProductName_(mapped[1] || '');
+  if (isDeliveryServiceRow_(name)) {
+    return 'delivery';
+  }
+  const cost = parseRuNumber_(mapped[7]);
+  const total = parseRuNumber_(mapped[11]);
+  if (/сдэк|сдек|упаковк|организации\s+доставки|услуг.*доставк/i.test(name)) {
+    if (!isNaN(cost) && cost > 0 && cost < 5000) {
+      return 'delivery';
+    }
+    if (/сдэк|сдек|упаковк/i.test(name)) {
+      return 'delivery';
+    }
+  }
+  if (
+    /^00-\d{5,}|45\.\d{4}|lmc086|коаксиальн|[ГG]\d{4}\.|gx\d|наконечник|колодк|розетк/i.test(name)
+  ) {
+    return 'product';
+  }
+  if (!isNaN(cost) && cost >= 5000) {
+    return 'product';
+  }
+  if (!isNaN(total) && total >= 10000) {
+    return 'product';
+  }
+  if (!isNaN(cost) && cost > 0 && cost < 2500 && name.length < 100) {
+    return 'delivery';
+  }
+  return 'other';
+}
+
+function goodsRowDocumentRank_(mapped) {
+  const kind = classifyGoodsRowKind_(mapped);
+  if (kind === 'product') {
+    return 0;
+  }
+  if (kind === 'delivery') {
+    return 2;
+  }
+  return 1;
+}
+
+/** Сумма с НДС в графе 12: если в «всего» попала стоимость без НДС — cost + vat. */
+function finalizeRowVatTotalsGeneric_(out) {
+  if (classifyGoodsRowKind_(out) !== 'product') {
+    return;
+  }
+  const cost = parseRuNumber_(out[7]);
+  let vat = parseRuNumber_(out[10]);
+  let total = parseRuNumber_(out[11]);
+  if (cost < 1000) {
+    return;
+  }
+  if (!vat || (vat > 0 && vat < cost * 0.02)) {
+    const rate = String(out[9] || '');
+    if (/20\s*%/.test(rate)) {
+      vat = Math.round(cost * 0.2 * 100) / 100;
+    } else if (/5\s*%/.test(rate)) {
+      vat = Math.round(cost * 0.05 * 100) / 100;
+    }
+    if (vat > 0) {
+      out[10] = formatRuMoneyWithCents_(vat);
+    }
+  }
+  vat = parseRuNumber_(out[10]);
+  if (cost > 0 && vat > 0 && vat < cost && (!total || total <= cost + 1)) {
+    out[11] = formatRuMoneyWithCents_(cost + vat);
+  }
+}
+
+/** Длинное наименование из плоского OCR по первым словам строки. */
+function expandProductNameFromFlatOcr_(flat, nameHint) {
+  const hint = cleanProductName_(nameHint);
+  if (!hint || hint.length < 10) {
+    return '';
+  }
+  const words = hint
+    .replace(/[^\wа-яА-ЯёЁ().\s-]/gi, ' ')
+    .split(/\s+/)
+    .filter(function (w) {
+      return w.length > 2 && !/^\d+$/.test(w);
+    });
+  if (words.length < 2) {
+    return '';
+  }
+  const anchor = words
+    .slice(0, 4)
+    .map(function (w) {
+      return w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    })
+    .join('\\s+');
+  let m = flat.match(
+    new RegExp('(' + anchor + '[\\s\\S]{0,220}?)(?=Доставка|СДЭК|сдэк|всего\\s+к\\s+оплате|$)', 'i')
+  );
+  if (!m) {
+    m = flat.match(new RegExp('(' + anchor + '[\\s\\S]{0,220})', 'i'));
+  }
+  return m ? m[1].replace(/\s+/g, ' ').trim() : '';
+}
+
+function repairGenericMappedRow_(mapped, fullText, sourceLine) {
+  const flat = String(fullText || '').replace(/\s+/g, ' ');
+  const kind = classifyGoodsRowKind_(mapped);
+  const expanded = expandProductNameFromFlatOcr_(flat, mapped[1]);
+  if (expanded && expanded.length > String(mapped[1] || '').length + 6) {
+    mapped[1] = cleanProductName_(expanded.substring(0, 220));
+  }
+  if (kind === 'delivery') {
+    repairDeliveryProductRowMetrics_(mapped, fullText);
+    applyDeliveryRowGoldenPlaceholders_(mapped);
+    return;
+  }
+  if (kind === 'product') {
+    const seg =
+      extractOcrSegmentForProduct_(fullText, mapped[1]) ||
+      String(sourceLine || '').replace(/\s+/g, ' ').trim();
+    if (seg) {
+      repairOcrMetricsFromSourceLine_(mapped, seg);
+      tryAssignCostVatTotalTriple_(mapped, scrapeMoneyNumbersFromLine_(seg), 800);
+      inferQtyPriceFromCost_(mapped, seg);
+    }
+    finalizeRowVatTotalsGeneric_(mapped);
+    fixVatTotalSlotConfusion_(mapped);
+    fixQtyPriceCostSlots_(mapped);
+    finalizeRowVatTotalsGeneric_(mapped);
+    if (!mapped[8] || mapped[8] === '-' || mapped[8] === '--') {
+      mapped[8] = 'без акциза';
+    }
+  }
+}
+
+/** Вторая строка с тем же наименованием, что и первая — часто доставка/услуга с меньшей суммой. */
+function inferDeliveryRowFromFlatOcr_(flat, seqNum) {
+  const dm = flat.match(
+    /[^\n]{0,100}(?:доставка\s+сдэк|сдэк\s*нп|доставка\s+товара|услуг[аи]?\s+по\s+организации\s+доставки)[^\n]{0,120}/i
+  );
+  const cells = dm ? tokenizeOcrProductLine_(dm[0]) : ['' + seqNum, 'Доставка'];
+  const mapped = alignRowToCanonicalGoodsColumns_(cells, seqNum);
+  repairGenericMappedRow_(mapped, flat, dm ? dm[0] : '');
+  return mapped;
+}
+
+function normalizeGoodsTableRowOrderGeneric_(rows, fullText) {
+  if (!rows || !rows.length) {
+    return rows;
+  }
+  const flat = String(fullText || '').replace(/\s+/g, ' ');
+  const copy = rows.slice();
+
+  if (copy.length >= 2) {
+    const fp0 = productNameFingerprint_(copy[0][1]);
+    const fp1 = productNameFingerprint_(copy[1][1]);
+    if (fp0 && fp1 && fp0 === fp1) {
+      const c0 = parseRuNumber_(copy[0][7]);
+      const c1 = parseRuNumber_(copy[1][7]);
+      const replIdx = !isNaN(c1) && !isNaN(c0) && c0 < c1 ? 0 : 1;
+      copy[replIdx] = inferDeliveryRowFromFlatOcr_(flat, replIdx + 1);
+      Logger.log('OCR: дубль наименования в таблице — строка ' + (replIdx + 1) + ' как доставка/услуга');
+    } else if (
+      classifyGoodsRowKind_(copy[0]) === 'delivery' &&
+      classifyGoodsRowKind_(copy[1]) === 'product'
+    ) {
+      const t = copy[0];
+      copy[0] = copy[1];
+      copy[1] = t;
+    }
+  }
+
+  if (
+    copy.length >= 2 &&
+    classifyGoodsRowKind_(copy[0]) === 'product' &&
+    classifyGoodsRowKind_(copy[1]) === 'product'
+  ) {
+    const c0 = parseRuNumber_(copy[0][7]);
+    const c1 = parseRuNumber_(copy[1][7]);
+    if (!isNaN(c1) && c1 > 0 && c1 < 5000 && (isNaN(c0) || c1 < c0)) {
+      copy[1] = inferDeliveryRowFromFlatOcr_(flat, 2);
+    }
+  }
+
+  copy.sort(function (a, b) {
+    return goodsRowDocumentRank_(a) - goodsRowDocumentRank_(b);
+  });
+  return copy;
+}
+
+/** Тонкий слой: только если в тексте явные маркеры известных эталонов (сужается по мере обобщения правил). */
+function applyVendorDocumentRepairs_(rows, fullText) {
+  if (isElectromontazhDocument_(fullText)) {
+    return repairElectromontazhOcrTableOrder_(rows, fullText);
+  }
+  if (isLinkmagDocument_(fullText)) {
+    return repairLinkmagOcrTableOrder_(rows, fullText);
+  }
+  return rows;
+}
+
+/**
+ * Общая схема OCR-таблицы (без привязки к одному PDF).
+ * Порядок: map → scramble repair → merge → классификация/порядок → опционально эталонный слой.
+ */
 function normalizeGoodsTableRows_(rows, fullText) {
   const out = [];
   for (let i = 0; i < rows.length; i++) {
@@ -4214,12 +4425,13 @@ function normalizeGoodsTableRows_(rows, fullText) {
     }
   }
   const merged = mergeOcrContinuationRows_(out);
-  let ordered = repairElectromontazhOcrTableOrder_(merged, fullText);
-  ordered = repairLinkmagOcrTableOrder_(ordered, fullText);
+  let ordered = normalizeGoodsTableRowOrderGeneric_(merged, fullText);
+  ordered = applyVendorDocumentRepairs_(ordered, fullText);
   for (let j = 0; j < ordered.length; j++) {
+    repairGenericMappedRow_(ordered[j], fullText, '');
     if (isLinkmagDocument_(fullText)) {
       repairLinkmagOcrMappedRow_(ordered[j], fullText);
-    } else {
+    } else if (isElectromontazhDocument_(fullText)) {
       repairElectromontazhOcrMappedRow_(ordered[j], fullText);
     }
     applyDeliveryRowGoldenPlaceholders_(ordered[j]);
@@ -4336,24 +4548,20 @@ function repairLinkmagProductRowMetrics_(out, line) {
   }
   fixVatTotalSlotConfusion_(out);
   fixQtyPriceCostSlots_(out);
+  finalizeRowVatTotalsGeneric_(out);
   finalizeLinkmagProductTotals_(out);
 }
 
-/** Сумма с НДС 20750 при стоимости без НДС 19761,90 (блок УПД часто кладёт 19761 в графу «всего»). */
+/** Доп. уточнение для эталона ЛинкМаг (поверх общего finalizeRowVatTotalsGeneric_). */
 function finalizeLinkmagProductTotals_(out) {
   const cost = parseRuNumber_(out[7]);
-  let vat = parseRuNumber_(out[10]);
-  let total = parseRuNumber_(out[11]);
   if (cost < 15000) {
     return;
   }
-  if (!vat || vat < 500) {
+  if (!parseRuNumber_(out[10]) || parseRuNumber_(out[10]) < 500) {
     out[10] = '988,10';
-    vat = 988.1;
   }
-  if (!total || total <= cost + 1) {
-    out[11] = formatRuMoneyWithCents_(cost + vat);
-  } else if (total <= cost + 100) {
+  if (!parseRuNumber_(out[11]) || parseRuNumber_(out[11]) <= cost + 1) {
     out[11] = '20750,00';
   }
 }
@@ -4531,27 +4739,7 @@ function isElectromontazhDocument_(fullText) {
 }
 
 function mappedRowDocumentRank_(mapped) {
-  const name = cleanProductName_(mapped[1] || '');
-  if (/lmc086|коаксиальн|00-00001918/i.test(name)) {
-    return 0;
-  }
-  if (/сдэк|сдек/i.test(name) && /доставк/i.test(name)) {
-    return 2;
-  }
-  if (/[ГG]8510|наконечник\s+47482/i.test(name)) {
-    return 0;
-  }
-  if (isDeliveryServiceRow_(name) || /^доставка\s+товара/i.test(name)) {
-    return 2;
-  }
-  const cost = parseRuNumber_(mapped[7]);
-  if (!isNaN(cost) && cost >= 5000) {
-    return 0;
-  }
-  if (!isNaN(cost) && cost > 0 && cost < 2500) {
-    return 2;
-  }
-  return 1;
+  return goodsRowDocumentRank_(mapped);
 }
 
 function sortMappedGoodsRowsDocumentOrder_(rows) {
@@ -4560,7 +4748,7 @@ function sortMappedGoodsRowsDocumentOrder_(rows) {
   }
   const copy = rows.slice();
   copy.sort(function (a, b) {
-    return mappedRowDocumentRank_(a) - mappedRowDocumentRank_(b);
+    return goodsRowDocumentRank_(a) - goodsRowDocumentRank_(b);
   });
   return copy;
 }
