@@ -9,7 +9,7 @@
     "sourceType": "script"
   },
   "rules": {
-    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_|goldenCheckDart4230|goldenCheckEpribor11400|goldenCheckElectromontazh13215|goldenCheckAll|runGoldenCheckDart4230_|runGoldenCheckEpribor11400_|runGoldenCheckElectromontazh13215_|verifyScriptHasGoldenChecks)$" }],
+    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_|goldenCheckDart4230|goldenCheckEpribor11400|goldenCheckElectromontazh13215|goldenCheckLinkmag21450|goldenCheckAll|runGoldenCheckDart4230_|runGoldenCheckEpribor11400_|runGoldenCheckElectromontazh13215_|runGoldenCheckLinkmag21450_|verifyScriptHasGoldenChecks)$" }],
     "no-undef": "error",
     "no-redeclare": "warn",
     "no-prototype-builtins": "off",

@@ -43,7 +43,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-19-golden-dart-decl';
+const SCRIPT_VERSION = '2026-05-19-golden-linkmag';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -107,7 +107,8 @@ function onOpen() {
     .addItem('Сверить Дарт 4230 с эталоном', 'goldenCheckDart4230')
     .addItem('Сверить Э прибор 11400 с эталоном', 'goldenCheckEpribor11400')
     .addItem('Сверить Электромонтаж 13215 с эталоном', 'goldenCheckElectromontazh13215')
-    .addItem('Сверить все эталоны (3 PDF)', 'goldenCheckAll')
+    .addItem('Сверить ЛинкМаг 21 450 с эталоном', 'goldenCheckLinkmag21450')
+    .addItem('Сверить все эталоны (4 PDF)', 'goldenCheckAll')
     .addSeparator()
     .addItem('Проверить версию скрипта (есть ли сверка с эталоном)', 'verifyScriptHasGoldenChecks')
     .addToUi();
@@ -129,10 +130,15 @@ function goldenCheckElectromontazh13215() {
   runGoldenCheckForFile_('Электромонтаж 13215.pdf');
 }
 
+function goldenCheckLinkmag21450() {
+  runGoldenCheckForFile_('ЛинкМаг 21 450.pdf');
+}
+
 function goldenCheckAll() {
   goldenCheckDart4230();
   goldenCheckEpribor11400();
   goldenCheckElectromontazh13215();
+  goldenCheckLinkmag21450();
 }
 
 function runGoldenCheckDart4230_() {
@@ -145,6 +151,10 @@ function runGoldenCheckEpribor11400_() {
 
 function runGoldenCheckElectromontazh13215_() {
   goldenCheckElectromontazh13215();
+}
+
+function runGoldenCheckLinkmag21450_() {
+  goldenCheckLinkmag21450();
 }
 
 /** Проверка, что эталонная сверка установлена (запускать из меню таблицы, не обязательно из списка функций). */
@@ -3446,6 +3456,9 @@ function isDeliveryServiceRow_(name) {
   if (/доставк.*адрес\s+доставки/i.test(n)) {
     return true;
   }
+  if (/^доставка\s+/i.test(n) && /сдэк|сдек/i.test(n)) {
+    return true;
+  }
   return false;
 }
 
@@ -4449,6 +4462,48 @@ const GOLDEN_EXPECTED_BY_FILE = {
         '20%',
         '1083,33',
         '6500,00',
+        '--',
+        '--',
+        '--',
+      ],
+    ],
+  },
+  'ЛинкМаг 21 450.pdf': {
+    invoiceLine: 'Счет-фактура № 10 от 21 января 2026г',
+    seller: 'Общество с ограниченной ответственностью "Линкмаг"',
+    paymentDoc: 'от',
+    basis: 'Основной договор',
+    rows: [
+      [
+        '1',
+        'Коаксиальный соединитель N female фланец 4 отв. для кабеля LMC086 (280052)',
+        '--',
+        '796',
+        'шт',
+        '25',
+        '790,48',
+        '19761,90',
+        'без акциза',
+        '5%',
+        '988,10',
+        '20750,00',
+        '156',
+        'Китай',
+        '--',
+      ],
+      [
+        '2',
+        'Доставка СДЭК НП',
+        '--',
+        '796',
+        'шт',
+        '1',
+        '666,67',
+        '666,67',
+        'без акциза',
+        '5%',
+        '33,33',
+        '700,00',
         '--',
         '--',
         '--',
