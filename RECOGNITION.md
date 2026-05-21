@@ -46,7 +46,10 @@ PDF
 
 Ключи: `GEMINI_API_KEY`, `ANYPARSER_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
 
-**AnyParser:** `POST /parse` (sync) или `async/upload` + `async/fetch`; заголовок `x-api-key`; см. [документацию](https://docs.cambioml.com/api-reference).
+**AnyParser:** `POST /parse` (sync) или `async/upload` + `async/fetch`; заголовок `x-api-key`.
+
+- Ключ и Sandbox: **[https://app.cambioml.com](https://app.cambioml.com)** (не `cambioml.com/account` — там 404).
+- Документация: [docs.cambioml.com](https://docs.cambioml.com/introduction).
 
 ---
 

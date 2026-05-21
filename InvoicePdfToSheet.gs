@@ -1333,7 +1333,8 @@ function showRecognitionSetupHelp() {
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
       '   ИЛИ свойство:\n' +
-      '   • ANYPARSER_API_KEY — https://www.cambioml.com/account (API: public-api.cambio-ai.com)\n' +
+      '   • ANYPARSER_API_KEY — кабинет: https://app.cambioml.com (страница /account на сайте — 404)\n' +
+      '     Документация: https://docs.cambioml.com/introduction , API: public-api.cambio-ai.com\n' +
       '     Markdown из PDF; sync до ~30 с, для крупных файлов — async.\n\n' +
       '3) Сохраните свойства и снова запустите загрузку из меню таблицы.\n\n' +
       'Меню:\n' +
