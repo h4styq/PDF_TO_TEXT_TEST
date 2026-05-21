@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-retail-seq-name';
+const SCRIPT_VERSION = '2026-05-20-upd-generic-bounds';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -63,8 +63,15 @@ const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
 /** Пауза между PDF после вызова внешнего API (снижает 429 при пакетной обработке) */
 const PAUSE_BETWEEN_PDF_MS = 20000;
-/** Макс. строк товаров на один PDF после фильтрации (защита от «мусора» OCR). */
-const MAX_GOODS_ROWS_PER_PDF = 10;
+/**
+ * Границы универсального распознавания таблицы УПД (см. RECOGNITION.md).
+ * Типовая форма: 15 граф CANONICAL_UPD_HEADERS; строки — № п/п + наименование + метрики.
+ */
+const UPD_ROW_SEQ_MAX = 100;
+/** Макс. строк товаров на один PDF (типовые УПД — до ~100 позиций). */
+const MAX_GOODS_ROWS_PER_PDF = UPD_ROW_SEQ_MAX;
+/** Макс. длина наименования в ячейке листа. */
+const PRODUCT_NAME_MAX_LEN = 280;
 /**
  * Для PDF >1 МБ на бесплатном OCR.space: временно «доступ по ссылке» и запрос по URL Drive.
  * false — только загрузка файла (лимит ~1 МБ).
@@ -3043,16 +3050,16 @@ function scoreOcrTableQuality_(table) {
   const n = table.rows.length;
   if (n === 1) {
     score += 8;
-  } else if (n >= 2 && n <= 8) {
-    score += 12 + (n - 1) * 7;
+  } else if (n >= 2 && n <= UPD_ROW_SEQ_MAX) {
+    score += 15 + Math.min(n - 1, 60) * 3;
   }
-  if (n > 8) {
-    score -= (n - 8) * 12;
+  if (n > UPD_ROW_SEQ_MAX + 15) {
+    score -= (n - UPD_ROW_SEQ_MAX - 15) * 4;
   }
   for (let i = 0; i < table.rows.length; i++) {
     const line = table.rows[i].join(' ');
-    if (/GX\d|GX12|услуг.*доставк|организации\s+доставки|45\.7373|Г8510|LMC086|коаксиальн|СДЭК/i.test(line)) {
-      score += 18;
+    if (looksLikeOcrUpdProductRowLine_(line)) {
+      score += 14;
     }
     if (looksLikeProductDataLine_(line)) {
       score += 10;
@@ -3522,6 +3529,25 @@ function ocrTableContinuesAfterTotals_(lines, fromIndex) {
   return false;
 }
 
+/** Верхняя граница № п/п по всему OCR (склеенные строки и несколько страниц). */
+function detectHighestProductRowSeqInFlat_(flat) {
+  const f = String(flat || '').replace(/\s+/g, ' ');
+  let max = 0;
+  const re = /(?:^|\s)(\d{1,3})\s+(?=[A-Za-zА-ЯЁа-яё(])/g;
+  let m;
+  while ((m = re.exec(f)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n <= 0 || n > UPD_ROW_SEQ_MAX) {
+      continue;
+    }
+    const tail = f.substring(m.index, m.index + 450);
+    if (/\b796\b/.test(tail) && (/\d+[.,]\d{2}/.test(tail) || /\d{1,3}\s+\d{3},\d{2}/.test(tail))) {
+      max = Math.max(max, n);
+    }
+  }
+  return max;
+}
+
 /** Добавить пропущенные позиции (например №5 со 2-й страницы) из всего OCR-текста. */
 function supplementOcrProductRowsFromFlat_(text, rows) {
   const out = rows ? rows.slice() : [];
@@ -3533,7 +3559,11 @@ function supplementOcrProductRowsFromFlat_(text, rows) {
       have[seq] = true;
     }
   }
-  for (let n = 1; n <= 20; n++) {
+  const maxSeq = Math.min(
+    UPD_ROW_SEQ_MAX,
+    Math.max(20, detectHighestProductRowSeqInFlat_(flat))
+  );
+  for (let n = 1; n <= maxSeq; n++) {
     if (have[n]) {
       continue;
     }
@@ -4602,63 +4632,63 @@ function finalizeRowVatTotalsGeneric_(out) {
   }
 }
 
-/** Полное наименование по артикулу (910-005644) и № строки в плоском OCR. */
-function expandProductNameByArticleInFlat_(flat, nameHint, docSeq) {
+/**
+ * Полное наименование из плоского OCR: граница — текст позиции до «796» / «шт».
+ * Не привязано к бренду: любое наименование, артикул в скобках — опциональный якорь.
+ */
+function expandProductNameFromDocumentFlat_(flat, nameHint, docSeq) {
   const hint = stripProductNameAtOkeiMarker_(String(nameHint || '')).trim();
-  let artM = hint.match(/\((\d{3}-\d{6})\)/);
-  if (!artM) {
-    artM = String(flat || '').match(/\((\d{3}-\d{6})\)/);
-  }
-  if (!artM) {
+  const f = String(flat || '').replace(/\s+/g, ' ');
+  if (!f || hint.length < 2) {
     return '';
   }
-  const esc = artM[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const seq = docSeq > 0 ? docSeq : extractDocumentSeqFromCells_([hint]) || 0;
-  const seqPrefix = seq > 0 ? '(?:^|\\s)' + seq + '\\s+' : '(?:^|\\s)\\d{1,2}\\s+';
-  const tries = [
-    new RegExp(
-      '((?:Мышь|мышь)\\s+беспроводная[\\s\\S]{0,160}?(?:Logitech|Lech|Логитех|G703)[\\s\\S]{0,100}?\\(' +
-        esc +
-        '\\)[\\s\\S]{0,40}?-?\\s*CN)',
-      'i'
-    ),
-    new RegExp(
-      seqPrefix +
-        '([А-Яа-яЁё][\\s\\S]{8,220}?(?:Logitech|Lech|Логитех|G703)[\\s\\S]{0,120}?\\(' +
-        esc +
-        '\\)[\\s\\S]{0,40}?-?\\s*CN)',
-      'i'
-    ),
-    new RegExp(seqPrefix + '([\\s\\S]{10,240}?\\(' + esc + '\\)[\\s\\S]{0,40}?-?\\s*CN)', 'i'),
-  ];
-  for (let ti = 0; ti < tries.length; ti++) {
-    const m = String(flat || '').match(tries[ti]);
-    if (!m) {
-      continue;
-    }
-    let name = (m[1] || m[0]).trim().replace(/^\d{1,2}\s+/, '');
-    name = stripProductNameAtOkeiMarker_(name);
-    if (name.length >= hint.length + 4) {
-      return name.replace(/\s+/g, ' ').trim();
+  const seq = docSeq > 0 ? docSeq : 0;
+  const candidates = [];
+  const until796 = '(?=\\s796\\s*(?:шт\\.?|wm|wт)(?:\\s|$)|\\s796\\b)';
+  if (seq > 0) {
+    const reSeq = new RegExp('(?:^|\\s)' + seq + '\\s+([\\s\\S]{8,340}?)' + until796, 'i');
+    const ms = f.match(reSeq);
+    if (ms) {
+      candidates.push(stripProductNameAtOkeiMarker_(ms[1]));
     }
   }
-  return '';
+  const artM = hint.match(/\(([^()]{4,48})\)/) || hint.match(/\b([A-Za-z0-9]{3,}[-–][A-Za-z0-9]{3,})\b/);
+  if (artM) {
+    const esc = artM[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const seqP = seq > 0 ? '(?:^|\\s)' + seq + '\\s+' : '(?:^|\\s)\\d{1,2}\\s+';
+    const reArt = new RegExp(seqP + '([\\s\\S]{8,340}?' + esc + '[\\s\\S]{0,80}?)' + until796, 'i');
+    const ma = f.match(reArt);
+    if (ma) {
+      candidates.push(stripProductNameAtOkeiMarker_(ma[1]));
+    }
+  }
+  let best = hint;
+  for (let ci = 0; ci < candidates.length; ci++) {
+    const c = String(candidates[ci] || '')
+      .replace(/^\d{1,2}\s+/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (c.length > best.length + 3 && !nameContainsEmbeddedOcrMetrics_(c)) {
+      best = c;
+    }
+  }
+  return best.length > hint.length + 3 ? best : '';
 }
 
 function enrichProductNameFromFlat_(mapped, fullText) {
   const flat = String(fullText || '').replace(/\s+/g, ' ');
   const seq = parseInt(String(mapped[0] || ''), 10) || 0;
   let name = String(mapped[1] || '').trim();
-  const byArt = expandProductNameByArticleInFlat_(flat, name, seq);
-  if (byArt) {
-    name = byArt;
+  const byDoc = expandProductNameFromDocumentFlat_(flat, name, seq);
+  if (byDoc) {
+    name = byDoc;
   } else if (!nameContainsEmbeddedOcrMetrics_(name)) {
     const exp = expandProductNameFromFlatOcr_(flat, name);
     if (exp && exp.length > name.length + 5) {
       name = exp;
     }
   }
-  mapped[1] = cleanProductName_(stripProductNameAtOkeiMarker_(name).substring(0, 220));
+  mapped[1] = cleanProductName_(stripProductNameAtOkeiMarker_(name).substring(0, PRODUCT_NAME_MAX_LEN));
 }
 
 /** Длинное наименование из плоского OCR по первым словам строки. */
@@ -4805,11 +4835,21 @@ function applyVendorDocumentRepairs_(rows, fullText) {
  */
 function normalizeGoodsTableRows_(rows, fullText) {
   if (fullText) {
+    const flat = normalizeText_(fullText).replace(/\s+/g, ' ');
+    const expectedSeq = detectHighestProductRowSeqInFlat_(flat);
     const rebuilt = parseOcrProductRowsOnly_(fullText);
     const nIn = rows ? rows.length : 0;
     const nRe = rebuilt && rebuilt.rows ? rebuilt.rows.length : 0;
-    if (nRe > nIn) {
-      Logger.log('OCR: пересборка таблицы из плоского текста: ' + nIn + ' → ' + nRe + ' строк');
+    if (nRe > nIn || (expectedSeq > nIn && nRe >= Math.min(expectedSeq, nIn + 1))) {
+      Logger.log(
+        'OCR: пересборка таблицы из плоского текста: ' +
+          nIn +
+          ' → ' +
+          nRe +
+          ' строк (ожид. № до ' +
+          expectedSeq +
+          ')'
+      );
       rows = rebuilt.rows;
     }
   }
