@@ -18,7 +18,7 @@
  * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
  *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
  *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
- *   ANYPARSER_API_KEY — ключ AnyParser (CambioML): https://www.cambioml.com/account , API https://public-api.cambio-ai.com
+ *   ANYPARSER_API_KEY — ключ AnyParser: https://app.cambioml.com (кабинет/Sandbox), API https://public-api.cambio-ai.com
  * — Приоритет: сначала Gemini, затем OCR.space. Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
  * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
  * Запуск:
