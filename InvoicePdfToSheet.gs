@@ -43,8 +43,8 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 /** Пустых строк между блоками данных разных PDF на листе. */
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
-/** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-20-gemini-ocr-menu';
+/** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
+const SCRIPT_VERSION = '2026-05-20-retail-ocr-rows';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1929,6 +1929,11 @@ function findOcrProductLineForRow_(fullText, rowName) {
         return l;
       }
     }
+    if (!wantDelivery && /\(910-|910-005644|\blech\b/i.test(rowName || '')) {
+      if (/\(910-|910-005644|\blech\b|796\s*шт/i.test(l)) {
+        return l;
+      }
+    }
     if (wantDelivery && /сдэк|сдек/i.test(rowName || '')) {
       if (/сдэк|сдек/i.test(l) && /доставк/i.test(l)) {
         return l;
@@ -2230,8 +2235,26 @@ function looksLikeOcrProductSkuLine_(line) {
     /\bG\d{4}\.\s*/i.test(l) ||
     /\b[ГG]\d{4}\.\s*/i.test(l) ||
     /наконечник\s+\d{4,}/i.test(l) ||
-    /lmc086|280052|коаксиальн/i.test(l)
+    /lmc086|280052|коаксиальн/i.test(l) ||
+    /\(\d{3}-\d{6}\)/.test(l) ||
+    /\b910-\d{6}\b/i.test(l) ||
+    /\blech\b|g703/i.test(l)
   );
+}
+
+/** Строка товара УПД в «плоском» OCR: «1 Lech … 796 шт … 4 999,17 …». */
+function looksLikeOcrUpdProductRowLine_(line) {
+  const l = String(line || '').trim();
+  if (!/^\d{1,2}\s+/.test(l) || isOcrNoiseLine_(l) || isOcrInvoiceMetaLine_(l)) {
+    return false;
+  }
+  if (isLikelyOcrDeliveryProductLine_(l)) {
+    return false;
+  }
+  const hasOkei = /\b796\b|(?:^|\s)796\s*шт|шт\.?/i.test(l);
+  const hasMoney = /\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2}/.test(l);
+  const hasVat = /\b\d{1,2}\s*%/.test(l);
+  return hasOkei && (hasMoney || hasVat);
 }
 
 /** Строки шапки/подвала УПД в OCR — не строки товаров. */
@@ -2291,6 +2314,15 @@ function looksLikeProductDataLine_(line) {
     return false;
   }
   const l = String(line || '').trim();
+  if (looksLikeOcrUpdProductRowLine_(l)) {
+    return true;
+  }
+  if (looksLikeOcrProductSkuLine_(l) && /\b796\b|\bшт/i.test(l)) {
+    return /\d+[.,]\d{2}|\d{1,3}\s+\d{3},\d{2}|\d+\s*%|без\s+акциза/i.test(l);
+  }
+  if (/^\d{1,2}\s+[A-Za-z]/.test(l) && /\b796\b/.test(l) && /\d+[.,]\d{2}|\d{1,3}\s+\d{3},\d{2}/.test(l)) {
+    return true;
+  }
   if (l.length < 10) {
     return false;
   }
@@ -2370,7 +2402,8 @@ function isGarbageMappedRow_(mapped) {
   const hasMetric = !!(mapped[5] || mapped[6] || mapped[7] || mapped[11]);
   const hasUnit = mapped[4] && /шт|кг/i.test(mapped[4]);
   const hasOkei = mapped[3] === '796';
-  const hasSkuName = looksLikeOcrProductSkuLine_(name) || /колодк|наконечник|розетк|gx\d/i.test(name);
+  const hasSkuName =
+    looksLikeOcrProductSkuLine_(name) || /колодк|наконечник|розетк|gx\d|\(\d{3}-\d{6}\)|\blech\b/i.test(name);
   if (hasSkuName && (hasMetric || hasUnit || hasOkei)) {
     return false;
   }
@@ -2417,7 +2450,9 @@ function collectMoneyNumbersFromPool_(pool) {
 /** Собрать крупные суммы из OCR-строки (3125, 625, 3750 …). */
 function scrapeMoneyNumbersFromLine_(line) {
   const nums = [];
-  const parts = String(line || '').split(/\s+/);
+  const parts = String(line || '')
+    .replace(/(\d{1,3})\s+(\d{3},\d{2})/g, '$1$2')
+    .split(/\s+/);
   for (let i = 0; i < parts.length; i++) {
     const p = parts[i].replace(/\u00a0/g, '').trim();
     if (!p || isVatRate_(p)) {
@@ -2612,6 +2647,12 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
   if (!out[8] && (/без\s+акциза/i.test(l) || (out[9] && /^\d{1,2}\s*%$/.test(String(out[9]).trim())))) {
     out[8] = 'без акциза';
   }
+  if (!out[8] && /\bакциза\b/i.test(l) && !/акциза\s+\d/i.test(l)) {
+    out[8] = 'без акциза';
+  }
+  if (/^акциза$/i.test(String(out[13] || '').trim()) && /китай/i.test(l)) {
+    out[13] = 'Китай';
+  }
   if (!out[12]) {
     const cm = l.match(/(?:^|\s)156(?:\s|$|[\s,])/);
     if (cm) {
@@ -2638,9 +2679,53 @@ function repairOcrMetricsFromSourceLine_(out, sourceLine) {
   fixQtyPriceCostSlots_(out);
 }
 
+/** В наименование попали «796 шт», суммы и НДС (склеенная OCR-строка). */
+function nameContainsEmbeddedOcrMetrics_(name) {
+  const n = String(name || '');
+  return (
+    /\b796\b/.test(n) &&
+    (/\bшт\b/i.test(n) || /шт\./i.test(n)) &&
+    (/\d+[.,]\d{2}/.test(n) || /\d{1,3}\s+\d{3},\d{2}/.test(n) || /\d+\s*%/.test(n))
+  );
+}
+
+/** Переразбор строки, если метрики УПД оказались в графе «наименование». */
+function repairRowFromEmbeddedOcrTokens_(mapped) {
+  const name = String(mapped[1] || '').trim();
+  if (!nameContainsEmbeddedOcrMetrics_(name)) {
+    return false;
+  }
+  const cells = tokenizeOcrProductLine_(name);
+  if (cells.length < 4) {
+    return false;
+  }
+  const seq = parseInt(String(mapped[0] || cells[0] || ''), 10) || 1;
+  const repaired = alignRowToCanonicalGoodsColumns_(cells, seq);
+  for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
+    if (repaired[c]) {
+      mapped[c] = repaired[c];
+    }
+  }
+  repairOcrMetricsFromSourceLine_(mapped, name);
+  finalizeRowVatTotalsGeneric_(mapped);
+  if (!mapped[8] || mapped[8] === '-' || mapped[8] === '--') {
+    mapped[8] = 'без акциза';
+  }
+  if (/^акциза$/i.test(String(mapped[13] || '').trim()) && /китай/i.test(name)) {
+    mapped[13] = 'Китай';
+  }
+  return true;
+}
+
 /** Наименование и кол-во попали не в те графы после OCR. */
 function repairScrambledOcrRow_(mapped, sourceLine, fullText) {
   const rawName = String(mapped[1] || '').trim();
+  if (nameContainsEmbeddedOcrMetrics_(rawName)) {
+    repairRowFromEmbeddedOcrTokens_(mapped);
+    fixVatTotalSlotConfusion_(mapped);
+    fixQtyPriceCostSlots_(mapped);
+    return;
+  }
   if (fullText && isLinkmagDocument_(fullText)) {
     if (/00-00001918|lmc086|коаксиальн/i.test(rawName + ' ' + sourceLine)) {
       repairLinkmagProductRow_(mapped, fullText, sourceLine);
@@ -2869,8 +2954,17 @@ function appendOcrAfterUnitTokens_(after, tokens) {
       i++;
       continue;
     }
+    if (/^акциза$/i.test(p)) {
+      tokens.push('без акциза');
+      continue;
+    }
     if (/^акциз/i.test(p) && tokens.length && /без$/i.test(tokens[tokens.length - 1])) {
       tokens[tokens.length - 1] = 'без акциза';
+      continue;
+    }
+    if (/^\d{1,3}$/.test(p) && /^\d{3},\d{2}$/.test(chunks[i + 1] || '')) {
+      tokens.push(p + ' ' + chunks[i + 1]);
+      i++;
       continue;
     }
     if (/^\d{1,2}$/.test(p) && /^%$/.test(chunks[i + 1] || '')) {
@@ -2915,11 +3009,13 @@ function scoreOcrTableQuality_(table) {
   }
   let score = 0;
   const n = table.rows.length;
-  if (n >= 1 && n <= 4) {
-    score += 25;
+  if (n === 1) {
+    score += 8;
+  } else if (n >= 2 && n <= 8) {
+    score += 12 + (n - 1) * 7;
   }
-  if (n > 5) {
-    score -= (n - 5) * 12;
+  if (n > 8) {
+    score -= (n - 8) * 12;
   }
   for (let i = 0; i < table.rows.length; i++) {
     const line = table.rows[i].join(' ');
@@ -2945,11 +3041,16 @@ function pickBestOcrTable_(text) {
   const fromBlock = parseTableFromBlock_(tableBlock);
   const fromLines = parseOcrProductRowsOnly_(text);
   let sBlock = scoreOcrTableQuality_(fromBlock);
-  const sLines = scoreOcrTableQuality_(fromLines);
+  let sLines = scoreOcrTableQuality_(fromLines);
   const dupBlock = countDuplicateProductNamesInTable_(fromBlock);
   if (dupBlock > 0) {
     sBlock -= dupBlock * 45;
     Logger.log('OCR: штраф блока УПД за дубли наименований: ' + dupBlock);
+  }
+  const nBlock = fromBlock && fromBlock.rows ? fromBlock.rows.length : 0;
+  const nLines = fromLines && fromLines.rows ? fromLines.rows.length : 0;
+  if (nLines > nBlock + 1) {
+    sLines += (nLines - nBlock) * 14;
   }
   Logger.log('OCR: оценка таблицы (блок УПД=' + sBlock + ', строки товаров=' + sLines + ')');
   if (fromLines && fromLines.rows && fromLines.rows.length && sLines >= sBlock) {
@@ -2995,7 +3096,12 @@ function parseOcrProductRowsOnly_(text) {
     if (/всего\s+к\s+оплате/i.test(line)) {
       break;
     }
-    if (!inTableRegion && !looksLikeOcrProductSkuLine_(line) && !isLikelyOcrDeliveryProductLine_(line)) {
+    if (
+      !inTableRegion &&
+      !looksLikeOcrProductSkuLine_(line) &&
+      !isLikelyOcrDeliveryProductLine_(line) &&
+      !looksLikeOcrUpdProductRowLine_(line)
+    ) {
       continue;
     }
     if (!looksLikeProductDataLine_(line)) {
@@ -3197,7 +3303,39 @@ function splitMergedGeminiTablePhysicalLines_(line) {
   return [head, tail];
 }
 
+/** Несколько позиций в одной OCR-строке: «1 Lech … 2 Lech …». */
+function splitLineByOcrRowNumbers_(line) {
+  const l = String(line || '').trim();
+  if (!l || l.length < 50) {
+    return [l];
+  }
+  const starts = [];
+  const re = /(?:^|\s)(\d{1,2})\s+(?=[A-Za-zА-ЯёЁ(])/g;
+  let m;
+  while ((m = re.exec(l)) !== null) {
+    const idx = m.index + (m[0].charAt(0) === ' ' ? 1 : 0);
+    if (!starts.length || idx > starts[starts.length - 1] + 12) {
+      starts.push(idx);
+    }
+  }
+  if (starts.length < 2) {
+    return [l];
+  }
+  const out = [];
+  for (let i = 0; i < starts.length; i++) {
+    const chunk = l.substring(starts[i], i + 1 < starts.length ? starts[i + 1] : l.length).trim();
+    if (chunk.length >= 15 && (looksLikeOcrUpdProductRowLine_(chunk) || looksLikeProductDataLine_(chunk))) {
+      out.push(chunk);
+    }
+  }
+  return out.length >= 2 ? out : [l];
+}
+
 function splitMergedOcrProductPhysicalLines_(line) {
+  const byNums = splitLineByOcrRowNumbers_(line);
+  if (byNums.length > 1) {
+    return byNums;
+  }
   const ts = splitMergedGeminiTablePhysicalLines_(line);
   if (ts.length > 1) {
     return ts;
@@ -3501,7 +3639,7 @@ function isVatRate_(t) {
 
 function isExcise_(t) {
   const s = String(t || '').trim();
-  return /^без\s+акциза$/i.test(s) || s === '0' || s === '—' || s === '-';
+  return /^без\s+акциза$/i.test(s) || /^акциза$/i.test(s) || s === '0' || s === '—' || s === '-';
 }
 
 function isCountryCode_(t) {
@@ -4220,7 +4358,9 @@ function classifyGoodsRowKind_(mapped) {
     }
   }
   if (
-    /^00-\d{5,}|45\.\d{4}|lmc086|коаксиальн|[ГG]\d{4}\.|gx\d|наконечник|колодк|розетк/i.test(name)
+    /^00-\d{5,}|45\.\d{4}|lmc086|коаксиальн|[ГG]\d{4}\.|gx\d|наконечник|колодк|розетк|\(\d{3}-\d{6}\)|\blech\b|910-005644/i.test(
+      name
+    )
   ) {
     return 'product';
   }
@@ -4308,9 +4448,14 @@ function expandProductNameFromFlatOcr_(flat, nameHint) {
 function repairGenericMappedRow_(mapped, fullText, sourceLine) {
   const flat = String(fullText || '').replace(/\s+/g, ' ');
   const kind = classifyGoodsRowKind_(mapped);
-  const expanded = expandProductNameFromFlatOcr_(flat, mapped[1]);
-  if (expanded && expanded.length > String(mapped[1] || '').length + 6) {
-    mapped[1] = cleanProductName_(expanded.substring(0, 220));
+  if (nameContainsEmbeddedOcrMetrics_(mapped[1])) {
+    repairRowFromEmbeddedOcrTokens_(mapped);
+  }
+  if (!nameContainsEmbeddedOcrMetrics_(mapped[1])) {
+    const expanded = expandProductNameFromFlatOcr_(flat, mapped[1]);
+    if (expanded && expanded.length > String(mapped[1] || '').length + 6) {
+      mapped[1] = cleanProductName_(expanded.substring(0, 220));
+    }
   }
   if (kind === 'delivery') {
     repairDeliveryProductRowMetrics_(mapped, fullText);
@@ -4841,6 +4986,9 @@ function extractSellerByNameHint_(text) {
   }
   if (/линкмаг|linkmag|lmc086|00-00001918/i.test(text)) {
     return pickLinkmagSeller_();
+  }
+  if (/днс\s*ритейл|dns\s*retail/i.test(text)) {
+    return 'ООО "ДНС Ритейл"';
   }
   const zao = text.match(/ЗАО\s*["«]?\s*([^"»\n]{3,80})/i);
   if (zao && /электромонтаж/i.test(zao[1])) {
