@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-upd-generic-bounds';
+const SCRIPT_VERSION = '2026-05-20-regex-supplement-fix';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -3567,12 +3567,9 @@ function supplementOcrProductRowsFromFlat_(text, rows) {
     if (have[n]) {
       continue;
     }
+    const nextSeq = n + 1;
     const re = new RegExp(
-      '(?:^|\\s)' +
-        n +
-        '\\s+([\\s\\S]{20,520}?)(?=(?:\\s' +
-        (n + 1) +
-        '\\s+(?:[A-Za-zА-ЯёЁ(М]|\\d)|\\sвсего\\s+к\\s+оплате|$)',
+      '(?:^|\\s)' + n + '\\s+([\\s\\S]{20,520}?)(?=(?:\\s' + nextSeq + '\\s|\\sвсего\\s+к\\s+оплате|$))',
       'i'
     );
     const m = flat.match(re);
