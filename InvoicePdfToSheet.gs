@@ -18,6 +18,7 @@
  * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
  *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
  *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
+ *   ANYPARSER_API_KEY — ключ AnyParser (CambioML): https://www.cambioml.com/account , API https://public-api.cambio-ai.com
  * — Приоритет: сначала Gemini, затем OCR.space. Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
  * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
  * Запуск:
@@ -44,7 +45,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-upd-column-junk-fix';
+const SCRIPT_VERSION = '2026-05-20-anyparser-api';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -78,6 +79,13 @@ const PRODUCT_NAME_MAX_LEN = 280;
  */
 const OCR_TRY_DRIVE_URL_FOR_LARGE = true;
 
+/** AnyParser (CambioML): https://docs.cambioml.com/api-reference */
+const ANYPARSER_API_BASE = 'https://public-api.cambio-ai.com';
+const ANYPARSER_SYNC_MAX_BYTES = 8 * 1024 * 1024;
+const ANYPARSER_RATE_LIMIT_MS = 1100;
+const ANYPARSER_ASYNC_POLL_MS = 3000;
+const ANYPARSER_ASYNC_MAX_WAIT_MS = 180000;
+
 /**
  * Заголовки граф таблицы товаров (УПД / счёт-фактура), как в типовой форме.
  * Если в документе больше колонок — справа добавятся «Доп. столбец N».
@@ -109,19 +117,29 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Счета-фактуры (PDF)')
     .addItem('Загрузить из папки (Gemini)', 'runProcessFolderGemini')
+    .addItem('Загрузить из папки (AnyParser)', 'runProcessFolderAnyParser')
     .addItem('Загрузить из папки (OCR.space, без паузы 20 с)', 'runProcessFolderOcr')
     .addSeparator()
-    .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
+    .addItem('Как подключить распознавание (Gemini / AnyParser / OCR)', 'showRecognitionSetupHelp')
     .addToUi();
 }
 
-/** Режим внешнего распознавания: gemini | ocr */
+/** Режим внешнего распознавания: gemini | ocr | anyparser */
 function runProcessFolderGemini() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
     throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "gemini").');
   }
   processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'gemini');
+}
+
+/** Только AnyParser (markdown из PDF, sync или async API). */
+function runProcessFolderAnyParser() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "anyparser").');
+  }
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'anyparser');
 }
 
 /** Только OCR.space — без вызова Gemini и без паузы между PDF. */
@@ -158,7 +176,8 @@ function runProcessFolderForSpreadsheet(spreadsheetId, recognitionMode) {
 }
 
 function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode =
+    recognitionMode === 'ocr' ? 'ocr' : recognitionMode === 'anyparser' ? 'anyparser' : 'gemini';
   Logger.log('Старт: папка Drive id=' + folderId + ', таблица id=' + spreadsheetId + ', режим=' + mode);
   if (!folderId || folderId.indexOf('ВСТАВЬТЕ') !== -1) {
     const msg = 'Задайте SOURCE_FOLDER_ID в коде (ID папки из URL Google Drive).';
@@ -232,7 +251,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode)
 
   const pdfCount = rows.length;
   const outRows = countOutputRows_(rows);
-  const modeLabel = mode === 'ocr' ? 'OCR.space' : 'Gemini';
+  const modeLabel = mode === 'ocr' ? 'OCR.space' : mode === 'anyparser' ? 'AnyParser' : 'Gemini';
   const summary =
     pdfCount === 0
       ? 'В папке не найдено PDF. Проверьте папку и права доступа.'
@@ -264,13 +283,17 @@ function pdfToExtracted_(pdfFileId, recognitionMode) {
  * Распознавание без конвертации PDF→Google Doc (Gemini PDF → OCR.space).
  */
 function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode =
+    recognitionMode === 'ocr' ? 'ocr' : recognitionMode === 'anyparser' ? 'anyparser' : 'gemini';
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
   const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
+  const hasAnyParser = !!props.getProperty('ANYPARSER_API_KEY');
   Logger.log(
     'API-ключи: Gemini=' +
       (hasGemini ? 'да' : 'нет') +
+      ', AnyParser=' +
+      (hasAnyParser ? 'да' : 'нет') +
       ', OCR.space=' +
       (hasOcr ? 'да' : 'нет') +
       ', режим=' +
@@ -290,14 +313,26 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
       externalStructured: '',
     };
   }
-  if (mode === 'gemini' && !hasGemini && !hasOcr) {
+  if (mode === 'anyparser' && !hasAnyParser) {
+    return {
+      text: '',
+      textLength: 0,
+      docTable: null,
+      conversionOk: false,
+      conversionNote: 'Режим AnyParser: задайте ANYPARSER_API_KEY в свойствах скрипта.',
+      usedExternalApi: false,
+      textSource: 'none',
+      externalStructured: '',
+    };
+  }
+  if (mode === 'gemini' && !hasGemini && !hasOcr && !hasAnyParser) {
     return {
       text: '',
       textLength: 0,
       docTable: null,
       conversionOk: false,
       conversionNote:
-        'Задайте GEMINI_API_KEY и/или OCR_SPACE_API_KEY в свойствах скрипта. ' +
+        'Задайте GEMINI_API_KEY, ANYPARSER_API_KEY и/или OCR_SPACE_API_KEY в свойствах скрипта. ' +
         'Конвертация PDF→Google Doc отключена.',
       usedExternalApi: false,
       textSource: 'none',
@@ -308,6 +343,8 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
   let improved = null;
   if (mode === 'ocr') {
     improved = tryExternalTextExtractionOcrOnly_(pdfFileId);
+  } else if (mode === 'anyparser') {
+    improved = tryExternalTextExtractionAnyParserOnly_(pdfFileId);
   } else {
     improved = tryExternalTextExtractionGeminiFirst_(pdfFileId, '');
   }
@@ -326,7 +363,11 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
     textSource = improved.source || 'external';
     const q = analyzeDocTextQuality_(text);
     conversionOk =
-      looksStructuredGemini_(improved.text) || q.readable || text.length >= 120 || textSource === 'ocr.space';
+      looksStructuredGemini_(improved.text) ||
+      q.readable ||
+      text.length >= 120 ||
+      textSource === 'ocr.space' ||
+      textSource === 'anyparser';
     conversionNote = conversionOk ? '' : q.reason;
     Logger.log('Текст из ' + textSource + ': ' + text.length + ' симв., readable=' + conversionOk);
   } else {
@@ -352,7 +393,8 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
  * Старый путь: PDF → Google Doc, таблицы Document, при необходимости Gemini/OCR.
  */
 function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode =
+    recognitionMode === 'ocr' ? 'ocr' : recognitionMode === 'anyparser' ? 'anyparser' : 'gemini';
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -372,8 +414,16 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
   const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
-  const hasAnyExternal = hasGemini || hasOcr;
-  Logger.log('API-ключи: Gemini=' + (hasGemini ? 'да' : 'нет') + ', OCR.space=' + (hasOcr ? 'да' : 'нет'));
+  const hasAnyParser = !!props.getProperty('ANYPARSER_API_KEY');
+  const hasAnyExternal = hasGemini || hasOcr || hasAnyParser;
+  Logger.log(
+    'API-ключи: Gemini=' +
+      (hasGemini ? 'да' : 'нет') +
+      ', AnyParser=' +
+      (hasAnyParser ? 'да' : 'нет') +
+      ', OCR.space=' +
+      (hasOcr ? 'да' : 'нет')
+  );
 
   if (quality.readable) {
     docTable = extractMainGoodsTableFromDoc_(body);
@@ -385,10 +435,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
           ').'
       );
       usedExternalApi = true;
-      const improved =
-        mode === 'ocr'
-          ? tryExternalTextExtractionOcrOnly_(pdfFileId)
-          : tryExternalTextExtractionGeminiFirst_(pdfFileId, text);
+      const improved = pickExternalExtractionByMode_(pdfFileId, mode, text);
       if (improved && improved.text) {
         if (isGeminiStructuredExtract_(improved.text, improved.source)) {
           externalStructured = normalizeText_(improved.text);
@@ -419,10 +466,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
     usedExternalApi = true;
-    const improved =
-      mode === 'ocr'
-        ? tryExternalTextExtractionOcrOnly_(pdfFileId)
-        : tryExternalTextExtractionGeminiFirst_(pdfFileId, text);
+    const improved = pickExternalExtractionByMode_(pdfFileId, mode, text);
     if (improved && improved.text) {
       if (isGeminiStructuredExtract_(improved.text, improved.source)) {
         externalStructured = normalizeText_(improved.text);
@@ -530,6 +574,35 @@ function tryGeminiTextFromDoc_(docFallbackText, geminiKey) {
   return null;
 }
 
+/** Выбор цепочки внешнего API по режиму меню. */
+function pickExternalExtractionByMode_(pdfFileId, mode, docFallbackText) {
+  if (mode === 'ocr') {
+    return tryExternalTextExtractionOcrOnly_(pdfFileId);
+  }
+  if (mode === 'anyparser') {
+    return tryExternalTextExtractionAnyParserOnly_(pdfFileId);
+  }
+  return tryExternalTextExtractionGeminiFirst_(pdfFileId, docFallbackText || '');
+}
+
+/** Только AnyParser (меню «Загрузить из папки (AnyParser)»). */
+function tryExternalTextExtractionAnyParserOnly_(pdfFileId) {
+  Logger.log('Режим AnyParser: распознавание PDF через CambioML API.');
+  const props = PropertiesService.getScriptProperties();
+  const apiKey = props.getProperty('ANYPARSER_API_KEY');
+  if (!apiKey) {
+    Logger.log('ANYPARSER_API_KEY не задан.');
+    return null;
+  }
+  const ap = tryAnyParserPdfExtract_(pdfFileId, apiKey);
+  if (ap && ap.text && ap.text.length > 40) {
+    Logger.log('AnyParser: получен текст (' + ap.text.length + ' симв., страниц ' + (ap.pageCount || '?') + ').');
+    return { text: ap.text, source: 'anyparser' };
+  }
+  Logger.log('AnyParser: не удалось получить текст.');
+  return null;
+}
+
 /** Только OCR.space (меню «Загрузить из папки (OCR.space)»). */
 function tryExternalTextExtractionOcrOnly_(pdfFileId) {
   Logger.log('Режим OCR.space: распознавание без Gemini.');
@@ -587,6 +660,18 @@ function tryExternalTextExtractionGeminiFirst_(pdfFileId, docFallbackText) {
     }
   } else {
     Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
+  }
+  const apKey = props.getProperty('ANYPARSER_API_KEY');
+  if (apKey) {
+    Logger.log('Gemini не дал результат — пробуем AnyParser…');
+    const ap = tryAnyParserPdfExtract_(pdfFileId, apKey);
+    if (ap && ap.text && ap.text.length > 80) {
+      const qAp = analyzeDocTextQuality_(ap.text);
+      if (qAp.readable || ap.text.length >= 200) {
+        Logger.log('AnyParser (запасной): ' + ap.text.length + ' симв.');
+        return { text: ap.text, source: 'anyparser' };
+      }
+    }
   }
   return tryExternalTextExtractionOcrOnly_(pdfFileId);
 }
@@ -886,6 +971,208 @@ function getGeminiInvoicePrompt_() {
   );
 }
 
+function anyParserApiHeaders_(apiKey) {
+  return {
+    'x-api-key': String(apiKey || '').trim(),
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  };
+}
+
+function anyParserPostJson_(url, apiKey, payload) {
+  Utilities.sleep(ANYPARSER_RATE_LIMIT_MS);
+  return UrlFetchApp.fetch(url, {
+    method: 'post',
+    headers: anyParserApiHeaders_(apiKey),
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+}
+
+/** Ответ AnyParser: markdown может быть строкой или вложенным объектом. */
+function flattenAnyParserMarkdown_(markdown) {
+  if (markdown == null) {
+    return '';
+  }
+  if (typeof markdown === 'string') {
+    return normalizeText_(markdown);
+  }
+  const parts = [];
+  function walk(node, depth) {
+    if (depth > 10) {
+      return;
+    }
+    if (node == null) {
+      return;
+    }
+    if (typeof node === 'string') {
+      const s = node.trim();
+      if (s) {
+        parts.push(s);
+      }
+      return;
+    }
+    if (typeof node === 'number' || typeof node === 'boolean') {
+      return;
+    }
+    if (Object.prototype.toString.call(node) === '[object Array]') {
+      for (let i = 0; i < node.length; i++) {
+        walk(node[i], depth + 1);
+      }
+      return;
+    }
+    if (typeof node === 'object') {
+      const keys = Object.keys(node);
+      for (let k = 0; k < keys.length; k++) {
+        walk(node[keys[k]], depth + 1);
+      }
+    }
+  }
+  walk(markdown, 0);
+  return normalizeText_(parts.join('\n\n'));
+}
+
+function tryAnyParserParseSync_(base64Content, apiKey) {
+  const resp = anyParserPostJson_(ANYPARSER_API_BASE + '/parse', apiKey, {
+    file_content: base64Content,
+    file_type: 'pdf',
+  });
+  const code = resp.getResponseCode();
+  const raw = resp.getContentText();
+  if (code === 429) {
+    Logger.log('AnyParser sync: лимит 429 (1 запрос/с).');
+    return { rateLimited: true };
+  }
+  if (code < 200 || code >= 300) {
+    Logger.log('AnyParser sync HTTP ' + code + ': ' + raw.substring(0, 400));
+    return null;
+  }
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (parseErr) {
+    Logger.log('AnyParser sync: неверный JSON — ' + parseErr.message);
+    return null;
+  }
+  const text = flattenAnyParserMarkdown_(json.markdown);
+  if (!text || text.length < 20) {
+    Logger.log('AnyParser sync: пустой markdown.');
+    return null;
+  }
+  return { text: text, pageCount: json.pageCount || 0 };
+}
+
+function tryAnyParserParseAsync_(file, apiKey) {
+  const fileName = String(file.getName() || 'document.pdf').replace(/[^\w.\-() ]+/g, '_');
+  const uploadResp = anyParserPostJson_(ANYPARSER_API_BASE + '/async/upload', apiKey, {
+    file_name: fileName,
+    process_type: 'file',
+  });
+  const uploadCode = uploadResp.getResponseCode();
+  const uploadRaw = uploadResp.getContentText();
+  if (uploadCode < 200 || uploadCode >= 300) {
+    Logger.log('AnyParser async/upload HTTP ' + uploadCode + ': ' + uploadRaw.substring(0, 400));
+    return null;
+  }
+  let uploadJson;
+  try {
+    uploadJson = JSON.parse(uploadRaw);
+  } catch (e1) {
+    Logger.log('AnyParser async/upload: JSON — ' + e1.message);
+    return null;
+  }
+  const fileId = uploadJson.file_id;
+  const presignedUrl = uploadJson.presignedUrl;
+  if (!fileId || !presignedUrl) {
+    Logger.log('AnyParser async/upload: нет file_id или presignedUrl.');
+    return null;
+  }
+  Utilities.sleep(ANYPARSER_RATE_LIMIT_MS);
+  const putResp = UrlFetchApp.fetch(presignedUrl, {
+    method: 'put',
+    payload: file.getBlob().getBytes(),
+    contentType: 'application/pdf',
+    muteHttpExceptions: true,
+  });
+  const putCode = putResp.getResponseCode();
+  if (putCode < 200 || putCode >= 300) {
+    Logger.log('AnyParser PUT PDF HTTP ' + putCode + ': ' + putResp.getContentText().substring(0, 200));
+    return null;
+  }
+  const deadline = Date.now() + ANYPARSER_ASYNC_MAX_WAIT_MS;
+  while (Date.now() < deadline) {
+    Utilities.sleep(ANYPARSER_ASYNC_POLL_MS);
+    const fetchResp = anyParserPostJson_(ANYPARSER_API_BASE + '/async/fetch', apiKey, {
+      file_id: fileId,
+    });
+    const fetchCode = fetchResp.getResponseCode();
+    const fetchRaw = fetchResp.getContentText();
+    if (fetchCode === 202) {
+      continue;
+    }
+    if (fetchCode === 429) {
+      Logger.log('AnyParser async/fetch: 429, ждём…');
+      continue;
+    }
+    if (fetchCode < 200 || fetchCode >= 300) {
+      Logger.log('AnyParser async/fetch HTTP ' + fetchCode + ': ' + fetchRaw.substring(0, 400));
+      return null;
+    }
+    let fetchJson;
+    try {
+      fetchJson = JSON.parse(fetchRaw);
+    } catch (e2) {
+      Logger.log('AnyParser async/fetch: JSON — ' + e2.message);
+      return null;
+    }
+    const text = flattenAnyParserMarkdown_(fetchJson.markdown);
+    if (!text || text.length < 20) {
+      Logger.log('AnyParser async: пустой markdown.');
+      return null;
+    }
+    return { text: text, pageCount: fetchJson.pageCount || 0 };
+  }
+  Logger.log('AnyParser async: таймаут ожидания ' + ANYPARSER_ASYNC_MAX_WAIT_MS + ' мс.');
+  return null;
+}
+
+/**
+ * Распознавание PDF через AnyParser (sync до ~30 с, иначе async).
+ * @return {{text:string, pageCount:number}|{rateLimited:boolean}|null}
+ */
+function tryAnyParserPdfExtract_(pdfFileId, apiKey) {
+  const file = DriveApp.getFileById(pdfFileId);
+  const size = file.getSize();
+  if (size < 500) {
+    Logger.log('AnyParser: файл слишком маленький.');
+    return null;
+  }
+  if (size > 25 * 1024 * 1024) {
+    Logger.log('AnyParser: файл > 25 МБ — пропуск (лимит Apps Script / API).');
+    return null;
+  }
+  try {
+    if (size <= ANYPARSER_SYNC_MAX_BYTES) {
+      Logger.log('AnyParser: sync /parse (' + Math.round(size / 1024) + ' КБ)…');
+      const b64 = Utilities.base64Encode(file.getBlob().getBytes());
+      const sync = tryAnyParserParseSync_(b64, apiKey);
+      if (sync && sync.text) {
+        return sync;
+      }
+      if (sync && sync.rateLimited) {
+        Utilities.sleep(2000);
+      }
+      Logger.log('AnyParser: sync не удался — async…');
+    } else {
+      Logger.log('AnyParser: крупный PDF — сразу async (' + Math.round(size / 1024) + ' КБ)…');
+    }
+    return tryAnyParserParseAsync_(file, apiKey);
+  } catch (e) {
+    Logger.log('AnyParser: ' + e.message);
+    return null;
+  }
+}
+
 function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
   const MAX_OCR_SPACE_BYTES = 1024 * 1024;
   try {
@@ -1045,11 +1332,15 @@ function showRecognitionSetupHelp() {
       '   ИЛИ свойство:\n' +
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
+      '   ИЛИ свойство:\n' +
+      '   • ANYPARSER_API_KEY — https://www.cambioml.com/account (API: public-api.cambio-ai.com)\n' +
+      '     Markdown из PDF; sync до ~30 с, для крупных файлов — async.\n\n' +
       '3) Сохраните свойства и снова запустите загрузку из меню таблицы.\n\n' +
       'Меню:\n' +
-      '• «Загрузить из папки (Gemini)» — сначала Gemini, при сбое OCR.space; между PDF пауза ' +
+      '• «Загрузить из папки (Gemini)» — Gemini → AnyParser (если ключ есть) → OCR.space; пауза ' +
       Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
       ' с (лимит 429).\n' +
+      '• «Загрузить из папки (AnyParser)» — только AnyParser.\n' +
       '• «Загрузить из папки (OCR.space…)» — только OCR, без паузы.\n\n' +
       (USE_PDF_TO_DOC_CONVERSION
         ? 'Конвертация PDF→Doc включена; при нечитаемом Doc — внешний API по выбранному режиму.\n'

@@ -29,7 +29,7 @@
 
 ```
 PDF
-  → pdfToExtracted_(mode: gemini | ocr)
+  → pdfToExtracted_(mode: gemini | anyparser | ocr)
   → parseInvoiceData_
        шапка: продавец, счёт-фактура, платёжный документ, основание
        таблица: pickBestOcrTable_ → normalizeGoodsTableRows_
@@ -40,10 +40,13 @@ PDF
 
 | Меню | Режим |
 |------|--------|
-| Загрузить из папки (Gemini) | Gemini PDF → при сбое OCR.space, пауза ~20 с между файлами |
+| Загрузить из папки (Gemini) | Gemini → AnyParser (если ключ) → OCR.space; пауза ~20 с |
+| Загрузить из папки (AnyParser) | Только AnyParser API (markdown) |
 | Загрузить из папки (OCR.space) | Только OCR.space, без паузы |
 
-Ключи: `GEMINI_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
+Ключи: `GEMINI_API_KEY`, `ANYPARSER_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
+
+**AnyParser:** `POST /parse` (sync) или `async/upload` + `async/fetch`; заголовок `x-api-key`; см. [документацию](https://docs.cambioml.com/api-reference).
 
 ---
 
