@@ -18,7 +18,8 @@
  * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
  *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
  *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
- *   ANYPARSER_API_KEY — ключ AnyParser: https://app.cambioml.com (кабинет/Sandbox), API https://public-api.cambio-ai.com
+ *   ANYPARSER_API_KEY — AnyParser (платный тариф на https://app.cambioml.com → Настройки → Account → API Keys).
+ *     На бесплатном аккаунте раздел ключей скрыт. API: https://public-api.cambio-ai.com
  * — Приоритет: сначала Gemini, затем OCR.space. Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
  * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
  * Запуск:
@@ -45,7 +46,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-anyparser-api';
+const SCRIPT_VERSION = '2026-05-20-anyparser-paid-note';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -1333,9 +1334,10 @@ function showRecognitionSetupHelp() {
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
       '   ИЛИ свойство:\n' +
-      '   • ANYPARSER_API_KEY — кабинет: https://app.cambioml.com (страница /account на сайте — 404)\n' +
-      '     Документация: https://docs.cambioml.com/introduction , API: public-api.cambio-ai.com\n' +
-      '     Markdown из PDF; sync до ~30 с, для крупных файлов — async.\n\n' +
+      '   • ANYPARSER_API_KEY — только платная подписка CambioML.\n' +
+      '     Кабинет: https://app.cambioml.com → иконка профиля → Settings → вкладка Account → блок API Keys → Generate API Key.\n' +
+      '     На Free тарифе API недоступен (блок ключей не показывается). Документация: https://docs.cambioml.com/introduction\n' +
+      '     Без подписки используйте GEMINI_API_KEY или OCR_SPACE_API_KEY (см. выше).\n\n' +
       '3) Сохраните свойства и снова запустите загрузку из меню таблицы.\n\n' +
       'Меню:\n' +
       '• «Загрузить из папки (Gemini)» — Gemini → AnyParser (если ключ есть) → OCR.space; пауза ' +

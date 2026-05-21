@@ -48,8 +48,10 @@ PDF
 
 **AnyParser:** `POST /parse` (sync) или `async/upload` + `async/fetch`; заголовок `x-api-key`.
 
-- Ключ и Sandbox: **[https://app.cambioml.com](https://app.cambioml.com)** (не `cambioml.com/account` — там 404).
+- **Платный тариф:** API AnyParser в кабинете CambioML выдаётся только при платной подписке. На Free аккаунте раздел **API Keys** в настройках не отображается.
+- Ключ (если есть подписка): [app.cambioml.com](https://app.cambioml.com) → профиль → **Settings** → **Account** → **API Keys** → **Generate API Key**. Не используйте `cambioml.com/account` (404).
 - Документация: [docs.cambioml.com](https://docs.cambioml.com/introduction).
+- **Без подписки:** меню «Загрузить из папки (Gemini)» или «… (OCR.space)» — ключи `GEMINI_API_KEY` / `OCR_SPACE_API_KEY`.
 
 ---
 
