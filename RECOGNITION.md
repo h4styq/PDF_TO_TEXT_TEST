@@ -29,7 +29,7 @@
 
 ```
 PDF
-  → pdfToExtracted_(mode: gemini | anyparser | ocr)
+  → pdfToExtracted_(mode: gemini | ocr)
   → parseInvoiceData_
        шапка: продавец, счёт-фактура, платёжный документ, основание
        таблица: pickBestOcrTable_ → normalizeGoodsTableRows_
@@ -40,18 +40,12 @@ PDF
 
 | Меню | Режим |
 |------|--------|
-| Загрузить из папки (Gemini) | Gemini → AnyParser (если ключ) → OCR.space; пауза ~20 с |
-| Загрузить из папки (AnyParser) | Только AnyParser API (markdown) |
+| Загрузить из папки (Gemini) | Gemini → OCR.space; пауза ~20 с |
 | Загрузить из папки (OCR.space) | Только OCR.space, без паузы |
 
-Ключи: `GEMINI_API_KEY`, `ANYPARSER_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
+Ключи: `GEMINI_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
 
-**AnyParser:** `POST /parse` (sync) или `async/upload` + `async/fetch`; заголовок `x-api-key`.
-
-- **Платный тариф:** API AnyParser в кабинете CambioML выдаётся только при платной подписке. На Free аккаунте раздел **API Keys** в настройках не отображается.
-- Ключ (если есть подписка): [app.cambioml.com](https://app.cambioml.com) → профиль → **Settings** → **Account** → **API Keys** → **Generate API Key**. Не используйте `cambioml.com/account` (404).
-- Документация: [docs.cambioml.com](https://docs.cambioml.com/introduction).
-- **Без подписки:** меню «Загрузить из папки (Gemini)» или «… (OCR.space)» — ключи `GEMINI_API_KEY` / `OCR_SPACE_API_KEY`.
+**Другие API для PDF:** обзор бесплатных и условно-бесплатных вариантов — [PDF_OCR_ALTERNATIVES.md](PDF_OCR_ALTERNATIVES.md).
 
 ---
 
