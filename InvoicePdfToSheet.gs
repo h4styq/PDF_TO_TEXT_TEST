@@ -9,7 +9,7 @@
  * РАСПОЗНАВАНИЕ (основной путь, USE_PDF_TO_DOC_CONVERSION = false):
  * — PDF не конвертируется в Google Doc (для сканов Doc обычно даёт «кракозябры» без пользы).
  * — Текст и таблица извлекаются через Gemini (PDF) и/или OCR.space.
- * — См. RECOGNITION.md: общая схема (классификация строк, метрики, порядок) и тонкий слой эталонов.
+ * — См. RECOGNITION.md: общая схема распознавания OCR/таблицы.
  *
  * Запасной путь (USE_PDF_TO_DOC_CONVERSION = true):
  * — Старый вариант: PDF → Google Doc → при необходимости Gemini/OCR.
@@ -22,7 +22,7 @@
  * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
  * Запуск:
  * — в самой таблице: меню «Счета-фактуры (PDF)» → «Загрузить данные из папки Drive» (после сохранения скрипта обновите страницу F5);
- * — в редакторе Apps Script: список функций слева от кнопки «Выполнить» — выберите runProcessFolder (если пункта нет, проверьте ошибки подсветкой и что код в проекте этой таблицы).
+ * — в меню таблицы: «Загрузить из папки (Gemini)» или «… (OCR.space)» — см. runProcessFolderGemini / runProcessFolderOcr.
  */
 
 /** ID папки на Google Drive (из URL: .../folders/THIS_ID) */
@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-20-generic-ocr-pipeline';
+const SCRIPT_VERSION = '2026-05-20-gemini-ocr-menu';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -101,92 +101,34 @@ const CANONICAL_UPD_HEADERS = [
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Счета-фактуры (PDF)')
-    .addItem('Загрузить данные из папки Drive', 'runProcessFolder')
+    .addItem('Загрузить из папки (Gemini)', 'runProcessFolderGemini')
+    .addItem('Загрузить из папки (OCR.space, без паузы 20 с)', 'runProcessFolderOcr')
     .addSeparator()
     .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
-    .addSeparator()
-    .addItem('Сверить Дарт 4230 с эталоном', 'goldenCheckDart4230')
-    .addItem('Сверить Э прибор 11400 с эталоном', 'goldenCheckEpribor11400')
-    .addItem('Сверить Электромонтаж 13215 с эталоном', 'goldenCheckElectromontazh13215')
-    .addItem('Сверить ЛинкМаг 21 450 с эталоном', 'goldenCheckLinkmag21450')
-    .addItem('Сверить все эталоны (4 PDF)', 'goldenCheckAll')
-    .addSeparator()
-    .addItem('Проверить версию скрипта (есть ли сверка с эталоном)', 'verifyScriptHasGoldenChecks')
     .addToUi();
 }
 
-/**
- * Сверка с эталоном (короткие имена — ищите в списке «Выполнить»: goldenCheck…).
- * Старые имена runGoldenCheck…_ оставлены для совместимости.
- */
-function goldenCheckDart4230() {
-  runGoldenCheckForFile_('Дарт 4230.pdf');
-}
-
-function goldenCheckEpribor11400() {
-  runGoldenCheckForFile_('Э прибор 11400.pdf');
-}
-
-function goldenCheckElectromontazh13215() {
-  runGoldenCheckForFile_('Электромонтаж 13215.pdf');
-}
-
-function goldenCheckLinkmag21450() {
-  runGoldenCheckForFile_('ЛинкМаг 21 450.pdf');
-}
-
-function goldenCheckAll() {
-  goldenCheckDart4230();
-  goldenCheckEpribor11400();
-  goldenCheckElectromontazh13215();
-  goldenCheckLinkmag21450();
-}
-
-function runGoldenCheckDart4230_() {
-  goldenCheckDart4230();
-}
-
-function runGoldenCheckEpribor11400_() {
-  goldenCheckEpribor11400();
-}
-
-function runGoldenCheckElectromontazh13215_() {
-  goldenCheckElectromontazh13215();
-}
-
-function runGoldenCheckLinkmag21450_() {
-  goldenCheckLinkmag21450();
-}
-
-/** Проверка, что эталонная сверка установлена (запускать из меню таблицы, не обязательно из списка функций). */
-function verifyScriptHasGoldenChecks() {
-  const hasDart = typeof goldenCheckDart4230 === 'function';
-  const hasCore = typeof runGoldenCheckForFile_ === 'function';
-  const msg =
-    'Версия скрипта: ' +
-    SCRIPT_VERSION +
-    '\n\nСверка с эталоном: ' +
-    (hasDart && hasCore ? 'установлена' : 'НЕ найдена') +
-    '\n\nКак запускать сверку:\n' +
-    '1) Вернитесь в Google Таблицу, обновите страницу (F5).\n' +
-    '2) Меню «Счета-фактуры (PDF)» → «Сверить Дарт 4230…» (или другой файл).\n' +
-    '3) Результат — в «Расширения → Apps Script → Журнал выполнения».\n\n' +
-    'Список функций слева от «Выполнить» в редакторе часто не показывает все имена ' +
-    '(в файле сотни функций). Введите в поле поиска списка: goldenCheckDart4230';
-  Logger.log(msg);
-  SpreadsheetApp.getUi().alert(msg);
-}
-
-/**
- * Точка входа: обходит все PDF в папке, пишет строки на активный spreadsheet
- * (файл таблицы, в котором открыт редактор скрипта, или привязанный к контейнеру).
- */
-function runProcessFolder() {
+/** Режим внешнего распознавания: gemini | ocr */
+function runProcessFolderGemini() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
-    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id).');
+    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "gemini").');
   }
-  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId());
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'gemini');
+}
+
+/** Только OCR.space — без вызова Gemini и без паузы между PDF. */
+function runProcessFolderOcr() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "ocr").');
+  }
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'ocr');
+}
+
+/** Совместимость: то же, что runProcessFolderGemini. */
+function runProcessFolder() {
+  runProcessFolderGemini();
 }
 
 function countOutputRows_(items) {
@@ -204,12 +146,13 @@ function countOutputRows_(items) {
 /**
  * Если скрипт отдельный (standalone), можно передать ID таблицы.
  */
-function runProcessFolderForSpreadsheet(spreadsheetId) {
-  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId);
+function runProcessFolderForSpreadsheet(spreadsheetId, recognitionMode) {
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId, recognitionMode || 'gemini');
 }
 
-function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
-  Logger.log('Старт: папка Drive id=' + folderId + ', таблица id=' + spreadsheetId);
+function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode) {
+  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  Logger.log('Старт: папка Drive id=' + folderId + ', таблица id=' + spreadsheetId + ', режим=' + mode);
   if (!folderId || folderId.indexOf('ВСТАВЬТЕ') !== -1) {
     const msg = 'Задайте SOURCE_FOLDER_ID в коде (ID папки из URL Google Drive).';
     Logger.log(msg);
@@ -229,9 +172,10 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const rows = [];
   let maxTableCols = 0;
   let pauseBeforeNextPdf = false;
+  const useGeminiPause = mode === 'gemini';
 
   while (files.hasNext()) {
-    if (pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
+    if (useGeminiPause && pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
       Logger.log(
         'Пауза ' +
           Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
@@ -244,8 +188,8 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     const file = files.next();
     Logger.log('PDF: ' + file.getName());
     try {
-      const pack = pdfToExtracted_(file.getId());
-      if (pack.usedExternalApi) {
+      const pack = pdfToExtracted_(file.getId(), mode);
+      if (useGeminiPause && pack.usedExternalApi) {
         pauseBeforeNextPdf = true;
       }
       const parsed = parseInvoiceData_(
@@ -281,10 +225,19 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
 
   const pdfCount = rows.length;
   const outRows = countOutputRows_(rows);
+  const modeLabel = mode === 'ocr' ? 'OCR.space' : 'Gemini';
   const summary =
     pdfCount === 0
       ? 'В папке не найдено PDF. Проверьте папку и права доступа.'
-      : 'Обработано PDF: ' + pdfCount + '. Строк данных (с заголовком): ' + (outRows + 1) + '. Лист «' + OUTPUT_SHEET_NAME + '».';
+      : 'Обработано PDF: ' +
+        pdfCount +
+        ' (' +
+        modeLabel +
+        '). Строк данных (с заголовком): ' +
+        (outRows + 1) +
+        '. Лист «' +
+        OUTPUT_SHEET_NAME +
+        '».';
   Logger.log(summary);
   ss.toast(summary, 'Счета-фактуры (PDF)', 12);
 }
@@ -293,24 +246,44 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
  * Извлечение текста/талицы из PDF: внешнее API (по умолчанию) или PDF→Doc (опционально).
  * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string, usedExternalApi:boolean, textSource:string, externalStructured:string}}
  */
-function pdfToExtracted_(pdfFileId) {
+function pdfToExtracted_(pdfFileId, recognitionMode) {
   if (!USE_PDF_TO_DOC_CONVERSION) {
-    return pdfToExtractedViaExternalOnly_(pdfFileId);
+    return pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode);
   }
-  return pdfToExtractedViaGoogleDoc_(pdfFileId);
+  return pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode);
 }
 
 /**
  * Распознавание без конвертации PDF→Google Doc (Gemini PDF → OCR.space).
  */
-function pdfToExtractedViaExternalOnly_(pdfFileId) {
+function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
+  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
   const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
-  Logger.log('API-ключи: Gemini=' + (hasGemini ? 'да' : 'нет') + ', OCR.space=' + (hasOcr ? 'да' : 'нет'));
+  Logger.log(
+    'API-ключи: Gemini=' +
+      (hasGemini ? 'да' : 'нет') +
+      ', OCR.space=' +
+      (hasOcr ? 'да' : 'нет') +
+      ', режим=' +
+      mode
+  );
   Logger.log('Конвертация PDF→Doc отключена (USE_PDF_TO_DOC_CONVERSION = false).');
 
-  if (!hasGemini && !hasOcr) {
+  if (mode === 'ocr' && !hasOcr) {
+    return {
+      text: '',
+      textLength: 0,
+      docTable: null,
+      conversionOk: false,
+      conversionNote: 'Режим OCR: задайте OCR_SPACE_API_KEY в свойствах скрипта.',
+      usedExternalApi: false,
+      textSource: 'none',
+      externalStructured: '',
+    };
+  }
+  if (mode === 'gemini' && !hasGemini && !hasOcr) {
     return {
       text: '',
       textLength: 0,
@@ -325,7 +298,12 @@ function pdfToExtractedViaExternalOnly_(pdfFileId) {
     };
   }
 
-  const improved = tryExternalTextExtraction_(pdfFileId, '');
+  let improved = null;
+  if (mode === 'ocr') {
+    improved = tryExternalTextExtractionOcrOnly_(pdfFileId);
+  } else {
+    improved = tryExternalTextExtractionGeminiFirst_(pdfFileId, '');
+  }
   let text = '';
   let externalStructured = '';
   let textSource = 'none';
@@ -366,7 +344,8 @@ function pdfToExtractedViaExternalOnly_(pdfFileId) {
 /**
  * Старый путь: PDF → Google Doc, таблицы Document, при необходимости Gemini/OCR.
  */
-function pdfToExtractedViaGoogleDoc_(pdfFileId) {
+function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
+  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -394,10 +373,15 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId) {
     const tableEmpty = !docTable || !docTable.rows || !docTable.rows.length;
     if (tableEmpty && hasAnyExternal) {
       Logger.log(
-        'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
+        'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — внешнее распознавание (' +
+          mode +
+          ').'
       );
       usedExternalApi = true;
-      const improved = tryExternalTextExtraction_(pdfFileId, text);
+      const improved =
+        mode === 'ocr'
+          ? tryExternalTextExtractionOcrOnly_(pdfFileId)
+          : tryExternalTextExtractionGeminiFirst_(pdfFileId, text);
       if (improved && improved.text) {
         if (isGeminiStructuredExtract_(improved.text, improved.source)) {
           externalStructured = normalizeText_(improved.text);
@@ -428,7 +412,10 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId) {
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
     usedExternalApi = true;
-    const improved = tryExternalTextExtraction_(pdfFileId, text);
+    const improved =
+      mode === 'ocr'
+        ? tryExternalTextExtractionOcrOnly_(pdfFileId)
+        : tryExternalTextExtractionGeminiFirst_(pdfFileId, text);
     if (improved && improved.text) {
       if (isGeminiStructuredExtract_(improved.text, improved.source)) {
         externalStructured = normalizeText_(improved.text);
@@ -536,7 +523,26 @@ function tryGeminiTextFromDoc_(docFallbackText, geminiKey) {
   return null;
 }
 
-function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
+/** Только OCR.space (меню «Загрузить из папки (OCR.space)»). */
+function tryExternalTextExtractionOcrOnly_(pdfFileId) {
+  Logger.log('Режим OCR.space: распознавание без Gemini.');
+  const props = PropertiesService.getScriptProperties();
+  const ocrKey = props.getProperty('OCR_SPACE_API_KEY');
+  if (!ocrKey) {
+    Logger.log('OCR_SPACE_API_KEY не задан.');
+    return null;
+  }
+  const o = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
+  if (o && o.text && o.text.length > 40) {
+    Logger.log('OCR.space: получен текст (' + o.text.length + ' симв.).');
+    return { text: o.text, source: 'ocr.space' };
+  }
+  Logger.log('OCR.space: не удалось получить текст.');
+  return null;
+}
+
+/** Gemini (PDF → при неудаче OCR.space). Меню «Загрузить из папки (Gemini)». */
+function tryExternalTextExtractionGeminiFirst_(pdfFileId, docFallbackText) {
   const props = PropertiesService.getScriptProperties();
   const geminiKey = props.getProperty('GEMINI_API_KEY');
   if (geminiKey) {
@@ -575,20 +581,7 @@ function tryExternalTextExtraction_(pdfFileId, docFallbackText) {
   } else {
     Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
   }
-  const ocrKey = props.getProperty('OCR_SPACE_API_KEY');
-  if (ocrKey) {
-    Logger.log('Пробуем распознавание через OCR.space…');
-    const o = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
-    if (o && o.text && o.text.length > 40) {
-      Logger.log('OCR.space: получен текст (' + o.text.length + ' симв.).');
-      return { text: o.text, source: 'ocr.space' };
-    }
-    Logger.log('OCR.space: не удалось получить текст.');
-  } else {
-    Logger.log('OCR_SPACE_API_KEY не задан — пропускаем OCR.space.');
-  }
-  Logger.log('Внешнее распознавание не дало результата.');
-  return null;
+  return tryExternalTextExtractionOcrOnly_(pdfFileId);
 }
 
 /** Модели, которые в 2025–2026 часто отдают 404 в generativelanguage v1beta */
@@ -1045,14 +1038,17 @@ function showRecognitionSetupHelp() {
       '   ИЛИ свойство:\n' +
       '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
       '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
-      '3) Сохраните свойства и снова запустите «Загрузить данные из папки Drive». При запросе разрешите доступ к внешней сети (UrlFetchApp).\n\n' +
-      'Порядок: Gemini (PDF) → OCR.space' +
-      (USE_PDF_TO_DOC_CONVERSION ? ' → запасной запрос Gemini по тексту Doc.' : ' (конвертация PDF→Doc отключена).') +
-      ' При 429 подождите 2–3 мин.\n\n' +
-      'Один PDF за запуск надёжнее (лимит времени Apps Script ~6 мин).\n\n' +
-      'Сверка с эталоном: версия ' +
-      SCRIPT_VERSION +
-      '. В редакторе Ctrl+F → «2026-05-16-golden2». Сверка: меню таблицы → goldenCheck…'
+      '3) Сохраните свойства и снова запустите загрузку из меню таблицы.\n\n' +
+      'Меню:\n' +
+      '• «Загрузить из папки (Gemini)» — сначала Gemini, при сбое OCR.space; между PDF пауза ' +
+      Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+      ' с (лимит 429).\n' +
+      '• «Загрузить из папки (OCR.space…)» — только OCR, без паузы.\n\n' +
+      (USE_PDF_TO_DOC_CONVERSION
+        ? 'Конвертация PDF→Doc включена; при нечитаемом Doc — внешний API по выбранному режиму.\n'
+        : 'Конвертация PDF→Doc отключена.\n') +
+      'Версия скрипта: ' +
+      SCRIPT_VERSION
   );
 }
 
@@ -1592,14 +1588,6 @@ function formatOcrInvoiceLine_(num, datePart) {
     .trim()
     .replace(/(\d{4})\s+г\.?\s*$/i, '$1г');
   return ('Счет-фактура № ' + num + ' от ' + d).replace(/\s+/g, ' ');
-}
-
-function normalizeGoldenInvoiceLine_(v) {
-  return normalizeGoldenText_(v)
-    .replace(/ё/g, 'е')
-    .replace(/(\d{4})\s*г\.?/gi, '$1г')
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 /** Узкий фрагмент OCR только для одной позиции (без следующей строки УПД). */
@@ -4207,7 +4195,12 @@ function countDuplicateProductNamesInTable_(table) {
 }
 
 function productNameFingerprint_(name) {
-  return normalizeGoldenText_(cleanProductName_(name)).substring(0, 36);
+  return String(cleanProductName_(name) || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .substring(0, 36);
 }
 
 /** product | delivery | other — по наименованию и суммам, без ИНН контрагента. */
@@ -5222,346 +5215,3 @@ function buildGlobalHeader_(items, globalWidth) {
   return base.concat(cols).concat(['Основание передачи / счет']);
 }
 
-// =============================================================================
-// Эталонные данные и сверка (меню «Сверить … с эталоном»)
-// =============================================================================
-
-/** @type {Object<string, {invoiceLine:string, seller:string, paymentDoc:string, basis:string, rows: string[][]}>} */
-const GOLDEN_EXPECTED_BY_FILE = {
-  'Дарт 4230.pdf': {
-    invoiceLine: 'Счет-фактура № 765 от 29 января 2025г',
-    seller: 'ООО "ДАРТ ХОЛДИНГ"',
-    paymentDoc: '27 от 27.01.2025 г.',
-    basis: 'Счет 717 от 27.01.2025',
-    rows: [
-      [
-        '1',
-        'GX12-2YC розетка на кабель; никелирование; 2-конт.',
-        '--',
-        '796',
-        'шт',
-        '25',
-        '125,00',
-        '3125,00',
-        'без акциза',
-        '20%',
-        '625,00',
-        '3750,00',
-        '156',
-        'КИТАЙ',
-        '10005030/170323/3066479',
-      ],
-      [
-        '2',
-        'Услуги по организации доставки и упаковке',
-        '--',
-        '796',
-        'шт',
-        '1',
-        '400',
-        '400',
-        'без акциза',
-        '20%',
-        '80,00',
-        '480,00',
-        '--',
-        '--',
-        '--',
-      ],
-    ],
-  },
-  'Э прибор 11400.pdf': {
-    invoiceLine: 'Счет-фактура № 339 от 21 января 2025 г.',
-    seller: 'ООО "Электроприбор"',
-    paymentDoc: '№10 от 20.01.2025',
-    basis: 'Заказ клиента Nº 762 от 20 января 2025 г.',
-    rows: [
-      [
-        '1',
-        "45.7373.9002 (Техком)' Колодка штыревая (упаковка 50 шт.) 6,3мм., 1-контактная (ан.502601)",
-        '--',
-        '796',
-        'шт',
-        '700,00',
-        '5,83',
-        '4083,33',
-        'без акциза',
-        '20%',
-        '816,67',
-        '4900,00',
-        '--',
-        '--',
-        '--',
-      ],
-      [
-        '2',
-        "45.7373.9094 (Техком)' Колодка гнездовая 6,3 мм., 8-и конт, (ан.608608) )к выключателям 3842,86.3710",
-        '--',
-        '796',
-        'шт',
-        '250,00',
-        '21,67',
-        '5416,67',
-        'без акциза',
-        '20%',
-        '1083,33',
-        '6500,00',
-        '--',
-        '--',
-        '--',
-      ],
-    ],
-  },
-  'ЛинкМаг 21 450.pdf': {
-    invoiceLine: 'Счет-фактура № 10 от 21 января 2026г',
-    seller: 'Общество с ограниченной ответственностью "Линкмаг"',
-    paymentDoc: 'от',
-    basis: 'Основной договор',
-    rows: [
-      [
-        '1',
-        'Коаксиальный соединитель N female фланец 4 отв. для кабеля LMC086 (280052)',
-        '--',
-        '796',
-        'шт',
-        '25',
-        '790,48',
-        '19761,90',
-        'без акциза',
-        '5%',
-        '988,10',
-        '20750,00',
-        '156',
-        'Китай',
-        '--',
-      ],
-      [
-        '2',
-        'Доставка СДЭК НП',
-        '--',
-        '796',
-        'шт',
-        '1',
-        '666,67',
-        '666,67',
-        'без акциза',
-        '5%',
-        '33,33',
-        '700,00',
-        '--',
-        '--',
-        '--',
-      ],
-    ],
-  },
-  'Электромонтаж 13215.pdf': {
-    invoiceLine: 'Счет-фактура № 9677/19 от 27.01.2025',
-    seller: 'ЗАО "МПО Электромонтаж"',
-    paymentDoc: '№23 от 23.01.2025',
-    basis: 'Счёт-договор № 3Д532483 от 21.01.2025',
-    rows: [
-      [
-        '1',
-        'Г8510. Наконечник 47482 НКИ 6,0-6 медный 6мм2 кольцевой изолированный желтый, ПВХ (КВТ)',
-        '--',
-        '796',
-        'шт',
-        '1200',
-        '8,80',
-        '10560,00',
-        'без акциза',
-        '20%',
-        '2112,00',
-        '12672,00',
-        '156',
-        'Китай',
-        '10013160/100924/3272633',
-      ],
-      [
-        '2',
-        'Доставка товара Адрес доставки: Москва, Ленинская Слобода, ул, д.23, кор. Стр. 17',
-        '-',
-        '--',
-        '--',
-        '--',
-        '--',
-        '452,50',
-        'без акциза',
-        '20%',
-        '90,50',
-        '543,00',
-        '-',
-        '--',
-        '--',
-      ],
-    ],
-  },
-};
-
-function normalizeGoldenText_(v) {
-  return String(v || '')
-    .replace(/\u00a0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-/** Сверка «К платежно-расчетному документу»: № и хвост « г.» не обязательны. */
-function normalizeGoldenPaymentDocCompare_(v) {
-  let s = normalizeGoldenText_(v).replace(/^№\s*/, '');
-  s = s.replace(/\s*г\.?\s*$/i, '').trim();
-  return s;
-}
-
-/** Сверка основания: Nº / № / nº после lower-case. */
-function normalizeGoldenBasisCompare_(v) {
-  let s = normalizeGoldenText_(v).replace(/\s*\[\d+\]\s*$/, '');
-  s = s.replace(/n\u00ba/gi, '№').replace(/n\s*°/gi, '№');
-  s = s.replace(/\s*№\s*/g, ' № ');
-  s = s.replace(/^основание\s+передачи\s*\([^)]*\)\s*\/\s*получения\s*\([^)]*\)\s*/i, '').trim();
-  s = s.replace(/ё/g, 'е');
-  s = s.replace(/сч[её]т[- ]договор\s*№\s*зд(\d)/gi, 'счет-договор № 3д$1');
-  return s.replace(/\s+/g, ' ').trim();
-}
-
-function normalizeGoldenProductNameCompare_(v) {
-  return normalizeGoldenText_(v)
-    .replace(/[''`´]/g, "'")
-    .replace(/\)\s*'/g, ')');
-}
-
-function normalizeGoldenMoney_(v) {
-  const t = String(v || '')
-    .replace(/\u00a0/g, '')
-    .replace(/\s/g, '')
-    .replace(',', '.');
-  const n = parseFloat(t);
-  return isNaN(n) ? normalizeGoldenText_(v) : String(Math.round(n * 100) / 100);
-}
-
-function goldenCellsEqual_(got, expected, colIndex) {
-  const g = String(got || '').trim();
-  const e = String(expected || '').trim();
-  if (!e || e === '--') {
-    return !g || g === '--' || g === '—' || g === '-';
-  }
-  if (e === '-' || e === '—') {
-    return !g || g === '--' || g === '—' || g === '-';
-  }
-  if (colIndex >= 5 && colIndex <= 11) {
-    return normalizeGoldenMoney_(g) === normalizeGoldenMoney_(e);
-  }
-  if (colIndex === 1) {
-    const gn = normalizeGoldenProductNameCompare_(g);
-    const en = normalizeGoldenProductNameCompare_(e);
-    if (gn === en) {
-      return true;
-    }
-    return gn.indexOf(en.substring(0, 24)) === 0 || en.indexOf(gn.substring(0, 24)) === 0;
-  }
-  return normalizeGoldenText_(g) === normalizeGoldenText_(e);
-}
-
-function compareParsedToGolden_(fileName, parsed) {
-  const golden = GOLDEN_EXPECTED_BY_FILE[fileName];
-  if (!golden) {
-    return ['Нет эталона для файла: ' + fileName];
-  }
-  const diffs = [];
-  const hdrFields = [
-    ['invoiceLine', 'Счет-фактура'],
-    ['seller', 'Продавец'],
-    ['paymentDoc', 'К платежно-расчетному документу'],
-    ['basis', 'Основание'],
-  ];
-  for (let h = 0; h < hdrFields.length; h++) {
-    const key = hdrFields[h][0];
-    const label = hdrFields[h][1];
-    const got = parsed[key] || '';
-    const exp = golden[key] || '';
-    const gotN =
-      key === 'basis'
-        ? normalizeGoldenBasisCompare_(got)
-        : key === 'paymentDoc'
-          ? normalizeGoldenPaymentDocCompare_(got)
-          : key === 'invoiceLine'
-            ? normalizeGoldenInvoiceLine_(got)
-            : normalizeGoldenText_(got);
-    const expN =
-      key === 'basis'
-        ? normalizeGoldenBasisCompare_(exp)
-        : key === 'paymentDoc'
-          ? normalizeGoldenPaymentDocCompare_(exp)
-          : key === 'invoiceLine'
-            ? normalizeGoldenInvoiceLine_(exp)
-            : normalizeGoldenText_(exp);
-    if (gotN !== expN && exp) {
-      diffs.push(label + ': ожидалось «' + exp + '», получено «' + got + '»');
-    }
-  }
-  const gotRows = parsed.tableRows || [];
-  if (gotRows.length !== golden.rows.length) {
-    diffs.push('Число строк товаров: ожидалось ' + golden.rows.length + ', получено ' + gotRows.length);
-  }
-  const maxR = Math.min(gotRows.length, golden.rows.length);
-  for (let r = 0; r < maxR; r++) {
-    const got = gotRows[r];
-    const exp = golden.rows[r];
-    for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
-      const expVal = exp[c] || '';
-      if (!expVal || expVal === '--') {
-        continue;
-      }
-      if (!goldenCellsEqual_(got[c], expVal, c)) {
-        diffs.push(
-          'Строка ' +
-            (r + 1) +
-            ', «' +
-            CANONICAL_UPD_HEADERS[c] +
-            '»: ожидалось «' +
-            expVal +
-            '», получено «' +
-            (got[c] || '') +
-            '»'
-        );
-      }
-    }
-  }
-  return diffs;
-}
-
-function runGoldenCheckForFile_(fileName) {
-  if (!SOURCE_FOLDER_ID || SOURCE_FOLDER_ID.indexOf('ВСТАВЬТЕ') !== -1) {
-    throw new Error('Задайте SOURCE_FOLDER_ID');
-  }
-  if (!GOLDEN_EXPECTED_BY_FILE[fileName]) {
-    throw new Error('Нет эталона для: ' + fileName);
-  }
-  const folder = DriveApp.getFolderById(SOURCE_FOLDER_ID);
-  const files = folder.getFilesByName(fileName);
-  if (!files.hasNext()) {
-    throw new Error('В папке нет файла: ' + fileName);
-  }
-  const file = files.next();
-  const pack = pdfToExtracted_(file.getId());
-  const parsed = parseInvoiceData_(
-    pack.text,
-    pack.docTable,
-    pack.textLength,
-    pack.conversionOk,
-    pack.conversionNote,
-    pack.textSource,
-    pack.externalStructured
-  );
-  const diffs = compareParsedToGolden_(fileName, parsed);
-  if (!diffs.length) {
-    Logger.log('Эталон «' + fileName + '»: все проверенные поля совпали.');
-    SpreadsheetApp.getActiveSpreadsheet().toast('Эталон OK: ' + fileName, 'Сверка', 8);
-    return;
-  }
-  Logger.log('Эталон «' + fileName + '»: расхождений ' + diffs.length);
-  for (let i = 0; i < diffs.length; i++) {
-    Logger.log('  ' + (i + 1) + '. ' + diffs[i]);
-  }
-  SpreadsheetApp.getActiveSpreadsheet().toast('Эталон: ' + diffs.length + ' расхождений — см. журнал', 'Сверка', 12);
-}
