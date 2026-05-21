@@ -34,3 +34,21 @@ for (let i = 0; i < parts.length; i++) {
   }
 }
 console.log('OK: split into', parts.length, 'product lines');
+
+function stripProductNameAtOkeiMarker(name) {
+  let n = String(name || '').replace(/\s+/g, ' ').trim();
+  const okei = n.search(/\s796\s*(?:шт\.?|ШТ|wm|wт)(?:\s|$)/i);
+  if (okei > 4) n = n.substring(0, okei).replace(/\s*-\s*$/g, '').trim();
+  const money = n.search(/\d{1,3}(?:\s\d{3})*[.,]\d{2}/);
+  if (money > 8) n = n.substring(0, money).replace(/\s*-\s*$/g, '').trim();
+  return n;
+}
+
+const badName =
+  'Lech G703 Black (910-005644) - CN - 796 шт. 1 4 999,17 4 999,17 акциза 20% 999,83 5 999,00 156 Китай |54020';
+const good = stripProductNameAtOkeiMarker(badName);
+if (good !== 'Lech G703 Black (910-005644) - CN -' && good !== 'Lech G703 Black (910-005644) - CN') {
+  console.error('FAIL: strip name got', good);
+  process.exit(1);
+}
+console.log('OK: product name strip');

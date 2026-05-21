@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-retail-ocr-rows';
+const SCRIPT_VERSION = '2026-05-20-retail-name-strip';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2689,6 +2689,38 @@ function nameContainsEmbeddedOcrMetrics_(name) {
   );
 }
 
+/** Обрезка наименования до маркера ОКЕИ/сумм (после prestructured/TAB-разбора). */
+function stripProductNameAtOkeiMarker_(name) {
+  let n = String(name || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const okei = n.search(/\s796\s*(?:шт\.?|ШТ|wm|wт)(?:\s|$)/i);
+  if (okei > 4) {
+    n = n.substring(0, okei).trim();
+  }
+  const money = n.search(/\d{1,3}(?:\s\d{3})*[.,]\d{2}/);
+  if (money > 8) {
+    n = n.substring(0, money).trim();
+  }
+  return cleanProductName_(n);
+}
+
+/** «акциза» в графах акциза/страна → эталонные значения retail-УПД. */
+function fixExciseAndCountrySlots_(mapped) {
+  if (/^акциза$/i.test(String(mapped[8] || '').trim())) {
+    mapped[8] = 'без акциза';
+  }
+  if (/^акциза$/i.test(String(mapped[13] || '').trim())) {
+    mapped[13] = /китай/i.test(String(mapped[1] || '')) ? 'Китай' : '';
+  }
+  if (!mapped[8] || mapped[8] === '-' || mapped[8] === '--') {
+    if (mapped[9] && /%/.test(String(mapped[9]))) {
+      mapped[8] = 'без акциза';
+    }
+  }
+}
+
 /** Переразбор строки, если метрики УПД оказались в графе «наименование». */
 function repairRowFromEmbeddedOcrTokens_(mapped) {
   const name = String(mapped[1] || '').trim();
@@ -2702,18 +2734,12 @@ function repairRowFromEmbeddedOcrTokens_(mapped) {
   const seq = parseInt(String(mapped[0] || cells[0] || ''), 10) || 1;
   const repaired = alignRowToCanonicalGoodsColumns_(cells, seq);
   for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
-    if (repaired[c]) {
-      mapped[c] = repaired[c];
-    }
+    mapped[c] = repaired[c] != null ? repaired[c] : '';
   }
+  mapped[1] = stripProductNameAtOkeiMarker_(mapped[1]);
   repairOcrMetricsFromSourceLine_(mapped, name);
   finalizeRowVatTotalsGeneric_(mapped);
-  if (!mapped[8] || mapped[8] === '-' || mapped[8] === '--') {
-    mapped[8] = 'без акциза';
-  }
-  if (/^акциза$/i.test(String(mapped[13] || '').trim()) && /китай/i.test(name)) {
-    mapped[13] = 'Китай';
-  }
+  fixExciseAndCountrySlots_(mapped);
   return true;
 }
 
@@ -4066,8 +4092,14 @@ function tryMapPrestructuredRow_(cells, seqNum) {
   if (name.length < 4) {
     return null;
   }
+  if (nameContainsEmbeddedOcrMetrics_(name)) {
+    return null;
+  }
   const cyrInName = (name.match(/[а-яА-ЯёЁ]/g) || []).length;
-  if (cyrInName < 4 || isNumericOnlyProductName_(name)) {
+  if (cyrInName < 4 && !looksLikeOcrProductSkuLine_(name) && !/^\d{1,2}\s+[A-Za-z]/.test(name)) {
+    return null;
+  }
+  if (isNumericOnlyProductName_(name)) {
     return null;
   }
   const tail = r.slice(tailStart);
@@ -4164,11 +4196,38 @@ function semanticMapGoodsRow_(cells, seqNum) {
     out[3] = '796';
   }
 
+  if (nameContainsEmbeddedOcrMetrics_(out[1])) {
+    const reTok = tokenizeOcrProductLine_(out[1]);
+    if (reTok.length >= 4) {
+      const again = semanticMapGoodsRow_(reTok, seqNum);
+      for (let c = 0; c < CANONICAL_UPD_HEADERS.length; c++) {
+        out[c] = again[c] != null ? again[c] : '';
+      }
+    }
+  }
+  out[1] = stripProductNameAtOkeiMarker_(out[1]);
+  fixExciseAndCountrySlots_(out);
+
   return out;
 }
 
 /** Выравнивание под CANONICAL_UPD_HEADERS; № п/п = порядковый номер по документу. */
 function alignRowToCanonicalGoodsColumns_(cells, seqNum) {
+  const joined = stripLeadingProductCodeColumn_(cells)
+    .map(function (x) {
+      return String(x || '').trim();
+    })
+    .filter(function (x) {
+      return x.length > 0;
+    })
+    .join(' ')
+    .trim();
+  if (nameContainsEmbeddedOcrMetrics_(joined) || (/\b796\b/.test(joined) && /\bшт/i.test(joined))) {
+    const tok = tokenizeOcrProductLine_(joined);
+    if (tok.length >= 4) {
+      return semanticMapGoodsRow_(tok, seqNum);
+    }
+  }
   return semanticMapGoodsRow_(cells, seqNum);
 }
 
@@ -4552,12 +4611,25 @@ function applyVendorDocumentRepairs_(rows, fullText) {
  * Порядок: map → scramble repair → merge → классификация/порядок → опционально эталонный слой.
  */
 function normalizeGoodsTableRows_(rows, fullText) {
+  if (fullText) {
+    const rebuilt = parseOcrProductRowsOnly_(fullText);
+    const nIn = rows ? rows.length : 0;
+    const nRe = rebuilt && rebuilt.rows ? rebuilt.rows.length : 0;
+    if (nRe > nIn) {
+      Logger.log('OCR: пересборка таблицы из плоского текста: ' + nIn + ' → ' + nRe + ' строк');
+      rows = rebuilt.rows;
+    }
+  }
   const out = [];
   for (let i = 0; i < rows.length; i++) {
     const sourceLine = rows[i].join('\t');
     const mapped = alignRowToCanonicalGoodsColumns_(rows[i], out.length + 1);
     repairScrambledOcrRow_(mapped, sourceLine, fullText);
-    mapped[1] = cleanProductName_(mapped[1]);
+    if (nameContainsEmbeddedOcrMetrics_(mapped[1])) {
+      repairRowFromEmbeddedOcrTokens_(mapped);
+    }
+    mapped[1] = stripProductNameAtOkeiMarker_(mapped[1]);
+    fixExciseAndCountrySlots_(mapped);
     if (!isGarbageMappedRow_(mapped)) {
       out.push(mapped);
     }
@@ -4573,6 +4645,8 @@ function normalizeGoodsTableRows_(rows, fullText) {
       repairElectromontazhOcrMappedRow_(ordered[j], fullText);
     }
     applyDeliveryRowGoldenPlaceholders_(ordered[j]);
+    ordered[j][1] = stripProductNameAtOkeiMarker_(ordered[j][1]);
+    fixExciseAndCountrySlots_(ordered[j]);
     ordered[j][0] = String(j + 1);
   }
   if (ordered.length > MAX_GOODS_ROWS_PER_PDF) {
