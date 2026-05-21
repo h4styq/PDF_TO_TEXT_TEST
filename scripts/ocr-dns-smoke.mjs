@@ -74,3 +74,34 @@ if (!m5 || !/910-005644/.test(m5[1])) {
   process.exit(1);
 }
 console.log('OK: row 4 name and row 5 scan');
+
+function stripUpdColumnNumbersFromName(name) {
+  const tokens = String(name || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/);
+  let start = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^\d{1,2}a?$/i.test(t) || (/^\d{3,4}$/.test(t) && t !== '796')) continue;
+    if (/^[A-Za-zА-ЯЁа-яё]/.test(t) && !/^(шт|wm|без|акциза)$/i.test(t)) {
+      start = i;
+      break;
+    }
+    if (/^[A-Z0-9]{2,}[-/]/.test(t) || /^[A-Z]\d/.test(t)) {
+      start = i;
+      break;
+    }
+  }
+  let out = tokens.slice(start).join(' ');
+  out = out.replace(/^\d{1,2}\s+/, '');
+  return out.trim();
+}
+const junk =
+  '2a 3 4 5 6 7 8 9 10 10a 11 0912 1 Кабель 5D-FB CU PVC 006 м';
+const clean = stripUpdColumnNumbersFromName(junk);
+if (!/^Кабель 5D-FB/.test(clean)) {
+  console.error('FAIL: column strip got', clean);
+  process.exit(1);
+}
+console.log('OK: strip UPD column numbers from name');

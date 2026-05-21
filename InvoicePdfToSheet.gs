@@ -44,7 +44,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-20-regex-supplement-fix';
+const SCRIPT_VERSION = '2026-05-20-upd-column-junk-fix';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2264,6 +2264,10 @@ function looksLikeOcrUpdProductRowLine_(line) {
   if (isLikelyOcrDeliveryProductLine_(l)) {
     return false;
   }
+  const afterSeq = l.replace(/^\d{1,2}\s+/, '');
+  if (nameHasUpdColumnNumberPrefix_(afterSeq)) {
+    return false;
+  }
   const hasOkei = /\b796\b|(?:^|\s)796\s*шт|шт\.?/i.test(l);
   const hasMoney = /\d{1,3}(?:\s\d{3})*[.,]\d{2}|\d+[.,]\d{2}/.test(l);
   const hasVat = /\b\d{1,2}\s*%/.test(l);
@@ -2368,8 +2372,54 @@ function fixGluedRowNumBefore45Article_(name) {
     .replace(/^([12])(45\.7373\.\d{4})/i, '$2');
 }
 
+/** В начале наименования попали номера граф УПД (2, 2a, 3 … 11), а не товар. */
+function nameHasUpdColumnNumberPrefix_(name) {
+  const tokens = String(name || '')
+    .trim()
+    .split(/\s+/);
+  let numRun = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^\d{1,2}a?$/i.test(t) || (/^\d{3,4}$/.test(t) && t !== '796')) {
+      numRun++;
+      continue;
+    }
+    if (/^[A-Za-zА-ЯЁа-яё]/.test(t) || /^[A-Z0-9]{2,}[-/]/.test(t)) {
+      break;
+    }
+  }
+  return numRun >= 3;
+}
+
+/** Убрать префикс номеров колонок; оставить текст с первого «словесного» токена товара. */
+function stripUpdColumnNumbersFromName_(name) {
+  const tokens = String(name || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/\s+/);
+  let start = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (/^\d{1,2}a?$/i.test(t) || (/^\d{3,4}$/.test(t) && t !== '796')) {
+      continue;
+    }
+    if (/^[A-Za-zА-ЯЁа-яё]/.test(t) && !/^(шт|wm|без|акциза)$/i.test(t)) {
+      start = i;
+      break;
+    }
+    if (/^[A-Z0-9]{2,}[-/]/.test(t) || /^[A-Z]\d/.test(t)) {
+      start = i;
+      break;
+    }
+  }
+  let out = tokens.slice(start).join(' ');
+  out = out.replace(/^\d{1,2}\s+/, '');
+  return out.trim();
+}
+
 function stripOcrJunkPrefixFromName_(name) {
-  let n = fixGluedRowNumBefore45Article_(String(name || '').trim());
+  let n = stripUpdColumnNumbersFromName_(fixGluedRowNumBefore45Article_(String(name || '').trim()));
   n = n.replace(/^(\d{1,4}\s+){1,4}(?=(?:GX|Услуг|45\.|Г\d))/i, '');
   n = n.replace(/^\d{1,2}\s+(?=[A-Za-zА-ЯЁёGxУ])/i, '');
   return n.trim();
@@ -2388,6 +2438,9 @@ function cleanProductName_(name) {
 function isGarbageMappedRow_(mapped) {
   const name = cleanProductName_(mapped[1]);
   if (!name || name.length < 4) {
+    return true;
+  }
+  if (nameHasUpdColumnNumberPrefix_(mapped[1]) || nameHasUpdColumnNumberPrefix_(name)) {
     return true;
   }
   if (isOcrNoiseLine_(name) || isOcrInvoiceMetaLine_(name)) {
@@ -3333,15 +3386,23 @@ function splitLineByOcrRowNumbers_(line) {
     return [l];
   }
   const starts = [];
-  const re = /(?:^|\s)(\d{1,2})\s+(?=[A-Za-zА-ЯёЁ(])/g;
+  const re = /(?:^|\s)(\d{1,2})\s+(?=[A-Za-zА-ЯЁа-яё(])/g;
   let m;
   while ((m = re.exec(l)) !== null) {
     const idx = m.index + (m[0].charAt(0) === ' ' ? 1 : 0);
+    const seq = parseInt(m[1], 10);
+    if (seq < 1 || seq > 50) {
+      continue;
+    }
+    const probe = l.substring(idx, idx + 80).replace(/^\d{1,2}\s+/, '');
+    if (nameHasUpdColumnNumberPrefix_(probe)) {
+      continue;
+    }
     if (!starts.length || idx > starts[starts.length - 1] + 12) {
       starts.push(idx);
     }
   }
-  if (starts.length < 2) {
+  if (starts.length < 2 || starts.length > 20) {
     return [l];
   }
   const out = [];
@@ -3351,7 +3412,7 @@ function splitLineByOcrRowNumbers_(line) {
       out.push(chunk);
     }
   }
-  return out.length >= 2 ? out : [l];
+  return out.length >= 2 && out.length <= 20 ? out : [l];
 }
 
 function splitMergedOcrProductPhysicalLines_(line) {
@@ -3476,6 +3537,36 @@ function sortMappedRowsByDocumentSeq_(rows) {
 }
 
 /** Сохранить № из УПД (1…5), а не перенумеровать 1…N по порядку вывода. */
+/** Убрать повторы одной позиции (одинаковое наименование + близкая сумма). */
+function dedupeMappedGoodsRows_(rows) {
+  if (!rows || rows.length < 2) {
+    return rows;
+  }
+  const out = [];
+  const seen = {};
+  for (let i = 0; i < rows.length; i++) {
+    const mapped = rows[i];
+    const name = cleanProductName_(mapped[1]);
+    if (nameHasUpdColumnNumberPrefix_(mapped[1]) || nameHasUpdColumnNumberPrefix_(name)) {
+      continue;
+    }
+    const fp = productNameFingerprint_(name);
+    const cost = parseRuNumber_(mapped[7]);
+    const key = fp + '|' + (isNaN(cost) ? '0' : String(Math.round(cost)));
+    if (fp && fp.length > 8 && seen[key]) {
+      continue;
+    }
+    if (fp && fp.length > 8) {
+      seen[key] = true;
+    }
+    out.push(mapped);
+  }
+  if (out.length < rows.length) {
+    Logger.log('OCR: удалено дублей строк: ' + (rows.length - out.length));
+  }
+  return out;
+}
+
 function finalizeDocumentRowNumbers_(rows) {
   if (!rows || !rows.length) {
     return rows;
@@ -3529,21 +3620,40 @@ function ocrTableContinuesAfterTotals_(lines, fromIndex) {
   return false;
 }
 
+/** Строка с № п/п в плоском OCR — не номера граф таблицы. */
+function isPlausibleUpdRowSeqInFlat_(flat, n, index) {
+  const tail = String(flat || '')
+    .substring(index)
+    .replace(/^\s+/, '');
+  const chunk = tail.substring(0, 400);
+  if (!new RegExp('^' + n + '\\s+').test(chunk)) {
+    return false;
+  }
+  const after = chunk.replace(new RegExp('^' + n + '\\s+'), '');
+  if (nameHasUpdColumnNumberPrefix_(after)) {
+    return false;
+  }
+  if (stripUpdColumnNumbersFromName_(after).length < 4) {
+    return false;
+  }
+  return /\b796\b/.test(chunk) && (/\d+[.,]\d{2}/.test(chunk) || /\d+\s*%/.test(chunk));
+}
+
 /** Верхняя граница № п/п по всему OCR (склеенные строки и несколько страниц). */
 function detectHighestProductRowSeqInFlat_(flat) {
   const f = String(flat || '').replace(/\s+/g, ' ');
   let max = 0;
-  const re = /(?:^|\s)(\d{1,3})\s+(?=[A-Za-zА-ЯЁа-яё(])/g;
+  const re = /(?:^|\s)(\d{1,2})\s+(?=[A-Za-zА-ЯЁа-яё(])/g;
   let m;
   while ((m = re.exec(f)) !== null) {
     const n = parseInt(m[1], 10);
     if (n <= 0 || n > UPD_ROW_SEQ_MAX) {
       continue;
     }
-    const tail = f.substring(m.index, m.index + 450);
-    if (/\b796\b/.test(tail) && (/\d+[.,]\d{2}/.test(tail) || /\d{1,3}\s+\d{3},\d{2}/.test(tail))) {
-      max = Math.max(max, n);
+    if (!isPlausibleUpdRowSeqInFlat_(f, n, m.index + (m[0].charAt(0) === ' ' ? 1 : 0))) {
+      continue;
     }
+    max = Math.max(max, n);
   }
   return max;
 }
@@ -3559,11 +3669,21 @@ function supplementOcrProductRowsFromFlat_(text, rows) {
       have[seq] = true;
     }
   }
-  const maxSeq = Math.min(
+  let maxHave = 0;
+  for (const key in have) {
+    if (have[key]) {
+      maxHave = Math.max(maxHave, parseInt(key, 10) || 0);
+    }
+  }
+  const detected = detectHighestProductRowSeqInFlat_(flat);
+  const scanTo = Math.min(
     UPD_ROW_SEQ_MAX,
-    Math.max(20, detectHighestProductRowSeqInFlat_(flat))
+    Math.max(maxHave, detected),
+    maxHave + 4,
+    detected <= 12 ? detected : maxHave + 3,
+    12
   );
-  for (let n = 1; n <= maxSeq; n++) {
+  for (let n = 1; n <= scanTo; n++) {
     if (have[n]) {
       continue;
     }
@@ -3578,6 +3698,9 @@ function supplementOcrProductRowsFromFlat_(text, rows) {
     }
     const chunk = (n + ' ' + m[1].trim()).replace(/\s+/g, ' ');
     if (!looksLikeOcrUpdProductRowLine_(chunk) && !looksLikeProductDataLine_(chunk)) {
+      continue;
+    }
+    if (nameHasUpdColumnNumberPrefix_(m[1])) {
       continue;
     }
     const cells = tokenizeOcrProductLine_(chunk);
@@ -4837,7 +4960,12 @@ function normalizeGoodsTableRows_(rows, fullText) {
     const rebuilt = parseOcrProductRowsOnly_(fullText);
     const nIn = rows ? rows.length : 0;
     const nRe = rebuilt && rebuilt.rows ? rebuilt.rows.length : 0;
-    if (nRe > nIn || (expectedSeq > nIn && nRe >= Math.min(expectedSeq, nIn + 1))) {
+    const sensibleRebuild =
+      nRe > nIn &&
+      nRe <= Math.max(nIn + 5, 8) &&
+      nRe <= 25 &&
+      (expectedSeq <= 15 || nRe <= expectedSeq + 2);
+    if (sensibleRebuild) {
       Logger.log(
         'OCR: пересборка таблицы из плоского текста: ' +
           nIn +
@@ -4848,6 +4976,10 @@ function normalizeGoodsTableRows_(rows, fullText) {
           ')'
       );
       rows = rebuilt.rows;
+    } else if (nRe > nIn) {
+      Logger.log(
+        'OCR: пропуск пересборки (слишком много строк ' + nRe + ', было ' + nIn + ', ожид.№' + expectedSeq + ')'
+      );
     }
   }
   const out = [];
@@ -4866,7 +4998,7 @@ function normalizeGoodsTableRows_(rows, fullText) {
       out.push(mapped);
     }
   }
-  const merged = mergeOcrContinuationRows_(out);
+  const merged = mergeOcrContinuationRows_(dedupeMappedGoodsRows_(out));
   let ordered = normalizeGoodsTableRowOrderGeneric_(merged, fullText);
   ordered = applyVendorDocumentRepairs_(ordered, fullText);
   for (let j = 0; j < ordered.length; j++) {
