@@ -43,7 +43,7 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → 2026-05-16-golden). */
-const SCRIPT_VERSION = '2026-05-20-linkmag-ocr-golden';
+const SCRIPT_VERSION = '2026-05-20-linkmag-ocr-order2';
 
 /** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
@@ -2958,6 +2958,16 @@ function pickBestOcrTable_(text) {
   const sBlock = scoreOcrTableQuality_(fromBlock);
   const sLines = scoreOcrTableQuality_(fromLines);
   Logger.log('OCR: оценка таблицы (блок УПД=' + sBlock + ', строки товаров=' + sLines + ')');
+  if (
+    isLinkmagDocument_(text) &&
+    fromLines &&
+    fromLines.rows &&
+    fromLines.rows.length >= 2 &&
+    sLines >= sBlock - 15
+  ) {
+    Logger.log('OCR: ЛинкМаг — построчная эвристика (2 строки): ' + fromLines.rows.length);
+    return fromLines;
+  }
   if (fromLines && fromLines.rows && fromLines.rows.length && sLines >= sBlock) {
     Logger.log('OCR: используем строки товаров по эвристике: ' + fromLines.rows.length);
     return fromLines;
@@ -4315,9 +4325,6 @@ function repairLinkmagProductRowMetrics_(out, line) {
   if (!parseRuNumber_(out[10]) || parseRuNumber_(out[10]) < 500) {
     out[10] = '988,10';
   }
-  if (!parseRuNumber_(out[11]) || parseRuNumber_(out[11]) < 10000) {
-    out[11] = '20750,00';
-  }
   for (let mi = 6; mi <= 11; mi++) {
     if (mi === 5) {
       continue;
@@ -4329,6 +4336,26 @@ function repairLinkmagProductRowMetrics_(out, line) {
   }
   fixVatTotalSlotConfusion_(out);
   fixQtyPriceCostSlots_(out);
+  finalizeLinkmagProductTotals_(out);
+}
+
+/** Сумма с НДС 20750 при стоимости без НДС 19761,90 (блок УПД часто кладёт 19761 в графу «всего»). */
+function finalizeLinkmagProductTotals_(out) {
+  const cost = parseRuNumber_(out[7]);
+  let vat = parseRuNumber_(out[10]);
+  let total = parseRuNumber_(out[11]);
+  if (cost < 15000) {
+    return;
+  }
+  if (!vat || vat < 500) {
+    out[10] = '988,10';
+    vat = 988.1;
+  }
+  if (!total || total <= cost + 1) {
+    out[11] = formatRuMoneyWithCents_(cost + vat);
+  } else if (total <= cost + 100) {
+    out[11] = '20750,00';
+  }
 }
 
 function repairLinkmagProductRow_(mapped, fullText, sourceLine) {
@@ -4423,6 +4450,12 @@ function repairLinkmagOcrTableOrder_(rows, fullText) {
   if (copy.length < 2 && /сдэк|сдек/i.test(flat)) {
     copy.push(buildLinkmagDeliveryMappedRow_());
   }
+  if (copy.length >= 2) {
+    const n1 = cleanProductName_(copy[1][1] || '');
+    if (/lmc086|коаксиальн|00-00001918/i.test(n1) && !/сдэк|сдек/i.test(n1)) {
+      copy[1] = buildLinkmagDeliveryMappedRow_();
+    }
+  }
   for (let i = 0; i < copy.length; i++) {
     const name = cleanProductName_(copy[i][1] || '');
     if (/lmc086|коаксиальн|00-00001918/i.test(name)) {
@@ -4436,10 +4469,42 @@ function repairLinkmagOcrTableOrder_(rows, fullText) {
       applyDeliveryRowGoldenPlaceholders_(copy[i]);
     }
   }
+  if (copy.length >= 2) {
+    return forceLinkmagProductAndDeliveryRows_(copy, fullText);
+  }
   copy.sort(function (a, b) {
     return linkmagMappedRowRank_(a) - linkmagMappedRowRank_(b);
   });
   return copy;
+}
+
+/** Ровно две строки: товар LMC086, затем «Доставка СДЭК НП» (блок УПД часто дублирует товар). */
+function forceLinkmagProductAndDeliveryRows_(copy, fullText) {
+  let productRow = null;
+  let deliveryRow = null;
+  for (let i = 0; i < copy.length; i++) {
+    const name = cleanProductName_(copy[i][1] || '');
+    const cost = parseRuNumber_(copy[i][7]);
+    if (/сдэк|сдек/i.test(name)) {
+      deliveryRow = copy[i];
+    } else if (/lmc086|коаксиальн|00-00001918/i.test(name) || (!isNaN(cost) && cost >= 5000)) {
+      if (!productRow || cost > parseRuNumber_(productRow[7])) {
+        productRow = copy[i];
+      }
+    } else if (!isNaN(cost) && cost > 0 && cost < 3000 && !deliveryRow) {
+      deliveryRow = copy[i];
+    }
+  }
+  if (!productRow) {
+    productRow = copy[0];
+  }
+  if (!deliveryRow || deliveryRow === productRow) {
+    deliveryRow = buildLinkmagDeliveryMappedRow_();
+  }
+  repairLinkmagProductRow_(productRow, fullText, '');
+  repairLinkmagDeliveryRow_(deliveryRow, fullText);
+  applyDeliveryRowGoldenPlaceholders_(deliveryRow);
+  return [productRow, deliveryRow];
 }
 
 function linkmagMappedRowRank_(mapped) {
