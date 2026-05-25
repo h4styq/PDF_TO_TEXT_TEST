@@ -29,7 +29,8 @@
 
 ```
 PDF
-  → pdfToExtracted_(mode: gemini | ocr)
+  → pdfToExtracted_(mode: ocr-gemini | ocr-only)
+       OCR.space (PDF) → Gemini (текст) → parseInvoiceData_
   → parseInvoiceData_
        шапка: продавец, счёт-фактура, платёжный документ, основание
        таблица: pickBestOcrTable_ → normalizeGoodsTableRows_
@@ -40,12 +41,17 @@ PDF
 
 | Меню | Режим |
 |------|--------|
-| Загрузить из папки (Gemini) | Gemini → OCR.space; пауза ~20 с |
-| Загрузить из папки (OCR.space) | Только OCR.space, без паузы |
+| Загрузить из папки (OCR → Gemini) | OCR.space по PDF → Gemini разбирает текст; пауза ~20 с между PDF |
+| Загрузить из папки (только OCR) | Только OCR.space, парсинг эвристиками без Gemini |
 
-Ключи: `GEMINI_API_KEY`, `OCR_SPACE_API_KEY` (свойства скрипта).
+Ключи (свойства скрипта):
 
-**Другие API для PDF:** обзор бесплатных и условно-бесплатных вариантов — [PDF_OCR_ALTERNATIVES.md](PDF_OCR_ALTERNATIVES.md).
+- `OCR_SPACE_API_KEY` — **обязателен** для распознавания PDF.
+- `GEMINI_API_KEY` — разбор OCR-текста в шапку и таблицу (маркеры `===HEADER===` / `===TABLE===`).
+
+Gemini **не** читает PDF напрямую — только текст после OCR.space.
+
+**Другие API для PDF:** [PDF_OCR_ALTERNATIVES.md](PDF_OCR_ALTERNATIVES.md).
 
 ---
 

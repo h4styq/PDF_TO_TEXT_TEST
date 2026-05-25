@@ -7,30 +7,30 @@
  * 3) Первый запрос может запросить разрешения на Drive и Таблицы.
  *
  * РАСПОЗНАВАНИЕ (основной путь, USE_PDF_TO_DOC_CONVERSION = false):
- * — PDF не конвертируется в Google Doc (для сканов Doc обычно даёт «кракозябры» без пользы).
- * — Текст и таблица извлекаются через Gemini (PDF) и/или OCR.space.
- * — См. RECOGNITION.md: общая схема распознавания OCR/таблицы.
+ * — PDF → OCR.space (только распознавание текста).
+ * — Распознанный текст → Gemini (структура шапки и таблицы для листа).
+ * — См. RECOGNITION.md.
  *
  * Запасной путь (USE_PDF_TO_DOC_CONVERSION = true):
  * — Старый вариант: PDF → Google Doc → при необходимости Gemini/OCR.
  *
  * РАСПОЗНАВАНИЕ (ключи в свойствах скрипта):
  * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
- *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
- *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
- * — Приоритет: сначала Gemini, затем OCR.space. Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
+ *   OCR_SPACE_API_KEY — https://ocr.space/ocrapi (обязателен: распознавание PDF).
+ *   GEMINI_API_KEY — https://aistudio.google.com/apikey (разбор OCR-текста в колонки УПД).
+ * — Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
  * — Другие бесплатные API для PDF: см. PDF_OCR_ALTERNATIVES.md
  * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
  * Запуск:
  * — в самой таблице: меню «Счета-фактуры (PDF)» → «Загрузить данные из папки Drive» (после сохранения скрипта обновите страницу F5);
- * — в меню таблицы: «Загрузить из папки (Gemini)» или «… (OCR.space)» — см. runProcessFolderGemini / runProcessFolderOcr.
+ * — в меню: «Загрузить из папки (OCR → Gemini)» или «только OCR» без Gemini.
  */
 
 /** ID папки на Google Drive (из URL: .../folders/THIS_ID) */
 const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 
 /**
- * false (рекомендуется): не создавать Google Doc из PDF — только Gemini / OCR.space.
+ * false (рекомендуется): не создавать Google Doc из PDF — OCR.space + Gemini по тексту.
  * true: сначала конвертация PDF→Doc, затем при необходимости внешнее API.
  */
 const USE_PDF_TO_DOC_CONVERSION = false;
@@ -45,20 +45,15 @@ const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 
 /** Проверка обновления: в редакторе найдите эту строку (Ctrl+F → SCRIPT_VERSION). */
-const SCRIPT_VERSION = '2026-05-21-gemini-ocr-only';
+const SCRIPT_VERSION = '2026-05-21-ocr-then-gemini';
 
-/** Модель Gemini для чтения PDF (v1beta; при 429 на 2.0-flash используется gemini-2.5-flash) */
+/** Модель Gemini для разбора OCR-текста (не для PDF) */
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
-/** Макс. размер PDF для отправки в Gemini inline (байт); при превышении внешний шаг пропускается */
-const MAX_GEMINI_INLINE_PDF_BYTES = 6 * 1024 * 1024;
-
-/** Повторы при 429 (короткие паузы — лимит выполнения Apps Script ~6 мин) */
-const GEMINI_MAX_ATTEMPTS = 2;
+/** Повторы Gemini при разборе OCR-текста (HTTP 429 и т.д.) */
+const GEMINI_TEXT_MAX_ATTEMPTS = 2;
 const GEMINI_RETRY_BASE_DELAY_MS = 5000;
 const GEMINI_MAX_BACKOFF_MS = 20000;
-/** Повторы для запасного пути «только текст Doc» */
-const GEMINI_TEXT_MAX_ATTEMPTS = 1;
 /** Запасные модели при 429/недоступности основной */
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const OCR_SPACE_MAX_ATTEMPTS = 3;
@@ -109,34 +104,39 @@ const CANONICAL_UPD_HEADERS = [
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Счета-фактуры (PDF)')
-    .addItem('Загрузить из папки (Gemini)', 'runProcessFolderGemini')
-    .addItem('Загрузить из папки (OCR.space, без паузы 20 с)', 'runProcessFolderOcr')
+    .addItem('Загрузить из папки (OCR → Gemini)', 'runProcessFolder')
+    .addItem('Загрузить из папки (только OCR, без Gemini)', 'runProcessFolderOcrOnly')
     .addSeparator()
-    .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
+    .addItem('Как подключить распознавание (OCR + Gemini)', 'showRecognitionSetupHelp')
     .addToUi();
 }
 
-/** Режим внешнего распознавания: gemini | ocr */
-function runProcessFolderGemini() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) {
-    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "gemini").');
-  }
-  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'gemini');
-}
-
-/** Только OCR.space — без вызова Gemini и без паузы между PDF. */
-function runProcessFolderOcr() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) {
-    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "ocr").');
-  }
-  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'ocr');
-}
-
-/** Совместимость: то же, что runProcessFolderGemini. */
+/** OCR.space по PDF, затем Gemini структурирует текст (режим по умолчанию). */
 function runProcessFolder() {
-  runProcessFolderGemini();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "ocr-gemini").');
+  }
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'ocr-gemini');
+}
+
+/** Совместимость со старым именем пункта меню. */
+function runProcessFolderGemini() {
+  runProcessFolder();
+}
+
+/** Только OCR.space — эвристический парсинг без Gemini. */
+function runProcessFolderOcrOnly() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id, "ocr-only").');
+  }
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId(), 'ocr-only');
+}
+
+/** @deprecated используйте runProcessFolderOcrOnly */
+function runProcessFolderOcr() {
+  runProcessFolderOcrOnly();
 }
 
 function countOutputRows_(items) {
@@ -155,11 +155,22 @@ function countOutputRows_(items) {
  * Если скрипт отдельный (standalone), можно передать ID таблицы.
  */
 function runProcessFolderForSpreadsheet(spreadsheetId, recognitionMode) {
-  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId, recognitionMode || 'gemini');
+  processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId, recognitionMode || 'ocr-gemini');
+}
+
+/** @param {string} [recognitionMode] ocr-gemini | ocr-only | gemini | ocr (старые имена) */
+function normalizeRecognitionMode_(recognitionMode) {
+  const m = String(recognitionMode || 'ocr-gemini')
+    .trim()
+    .toLowerCase();
+  if (m === 'ocr-only' || m === 'ocr') {
+    return 'ocr-only';
+  }
+  return 'ocr-gemini';
 }
 
 function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode = normalizeRecognitionMode_(recognitionMode);
   Logger.log('Старт: папка Drive id=' + folderId + ', таблица id=' + spreadsheetId + ', режим=' + mode);
   if (!folderId || folderId.indexOf('ВСТАВЬТЕ') !== -1) {
     const msg = 'Задайте SOURCE_FOLDER_ID в коде (ID папки из URL Google Drive).';
@@ -180,7 +191,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode)
   const rows = [];
   let maxTableCols = 0;
   let pauseBeforeNextPdf = false;
-  const useGeminiPause = mode === 'gemini';
+  const useGeminiPause = mode === 'ocr-gemini';
 
   while (files.hasNext()) {
     if (useGeminiPause && pauseBeforeNextPdf && PAUSE_BETWEEN_PDF_MS > 0) {
@@ -233,7 +244,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId, recognitionMode)
 
   const pdfCount = rows.length;
   const outRows = countOutputRows_(rows);
-  const modeLabel = mode === 'ocr' ? 'OCR.space' : 'Gemini';
+  const modeLabel = mode === 'ocr-only' ? 'только OCR' : 'OCR → Gemini';
   const summary =
     pdfCount === 0
       ? 'В папке не найдено PDF. Проверьте папку и права доступа.'
@@ -262,56 +273,52 @@ function pdfToExtracted_(pdfFileId, recognitionMode) {
 }
 
 /**
- * Распознавание без конвертации PDF→Google Doc (Gemini PDF → OCR.space).
+ * Распознавание без конвертации PDF→Google Doc: OCR.space → (опционально) Gemini по тексту.
  */
 function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode = normalizeRecognitionMode_(recognitionMode);
   const props = PropertiesService.getScriptProperties();
   const hasGemini = !!props.getProperty('GEMINI_API_KEY');
   const hasOcr = !!props.getProperty('OCR_SPACE_API_KEY');
   Logger.log(
-    'API-ключи: Gemini=' +
-      (hasGemini ? 'да' : 'нет') +
-      ', OCR.space=' +
+    'API-ключи: OCR.space=' +
       (hasOcr ? 'да' : 'нет') +
+      ', Gemini=' +
+      (hasGemini ? 'да' : 'нет') +
       ', режим=' +
       mode
   );
   Logger.log('Конвертация PDF→Doc отключена (USE_PDF_TO_DOC_CONVERSION = false).');
 
-  if (mode === 'ocr' && !hasOcr) {
+  if (!hasOcr) {
     return {
       text: '',
       textLength: 0,
       docTable: null,
       conversionOk: false,
-      conversionNote: 'Режим OCR: задайте OCR_SPACE_API_KEY в свойствах скрипта.',
+      conversionNote: 'Задайте OCR_SPACE_API_KEY (распознавание PDF).',
       usedExternalApi: false,
       textSource: 'none',
       externalStructured: '',
     };
   }
-  if (mode === 'gemini' && !hasGemini && !hasOcr) {
+  if (mode === 'ocr-gemini' && !hasGemini) {
     return {
       text: '',
       textLength: 0,
       docTable: null,
       conversionOk: false,
       conversionNote:
-        'Задайте GEMINI_API_KEY и/или OCR_SPACE_API_KEY в свойствах скрипта. ' +
-        'Конвертация PDF→Google Doc отключена.',
+        'Режим OCR → Gemini: нужны OCR_SPACE_API_KEY и GEMINI_API_KEY. ' +
+        'Или запустите «только OCR» без Gemini.',
       usedExternalApi: false,
       textSource: 'none',
       externalStructured: '',
     };
   }
 
-  let improved = null;
-  if (mode === 'ocr') {
-    improved = tryExternalTextExtractionOcrOnly_(pdfFileId);
-  } else {
-    improved = tryExternalTextExtractionGeminiFirst_(pdfFileId, '');
-  }
+  const skipGemini = mode === 'ocr-only';
+  const improved = tryOcrThenGeminiExtract_(pdfFileId, skipGemini);
   let text = '';
   let externalStructured = '';
   let textSource = 'none';
@@ -330,12 +337,13 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
       looksStructuredGemini_(improved.text) ||
       q.readable ||
       text.length >= 120 ||
-      textSource === 'ocr.space';
+      textSource === 'ocr.space' ||
+      textSource === 'gemini-ocr-structure';
     conversionNote = conversionOk ? '' : q.reason;
     Logger.log('Текст из ' + textSource + ': ' + text.length + ' симв., readable=' + conversionOk);
   } else {
     externalFailNote =
-      ' Не удалось распознать PDF (часто Gemini HTTP 429 — пауза 2–3 мин; OCR.space — лимит размера файла).';
+      ' Не удалось распознать PDF (OCR.space — лимит ~1 МБ; Gemini 429 — пауза между PDF).';
     conversionNote = 'Внешнее распознавание не дало результата.';
     conversionOk = false;
   }
@@ -356,7 +364,7 @@ function pdfToExtractedViaExternalOnly_(pdfFileId, recognitionMode) {
  * Старый путь: PDF → Google Doc, таблицы Document, при необходимости Gemini/OCR.
  */
 function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
-  const mode = recognitionMode === 'ocr' ? 'ocr' : 'gemini';
+  const mode = normalizeRecognitionMode_(recognitionMode);
   const name = 'tmp_pdf_' + new Date().getTime();
   const resource = {
     name: name,
@@ -394,7 +402,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
           ').'
       );
       usedExternalApi = true;
-      const improved = pickExternalExtractionByMode_(pdfFileId, mode, text);
+      const improved = pickExternalExtractionByMode_(pdfFileId, mode);
       if (improved && improved.text) {
         if (isGeminiStructuredExtract_(improved.text, improved.source)) {
           externalStructured = normalizeText_(improved.text);
@@ -414,7 +422,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
         }
       } else if (!improved) {
         externalFailNote =
-          ' Внешнее распознавание не удалось (часто Gemini HTTP 429 — подождите 1–2 мин и запустите снова; OCR.space — файл >1 МБ на бесплатном тарифе).';
+          ' Внешнее распознавание не удалось (OCR.space — файл >1 МБ; Gemini 429 — пауза между PDF).';
       }
     } else if (tableEmpty && !hasAnyExternal) {
       Logger.log(
@@ -425,7 +433,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
   } else {
     Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
     usedExternalApi = true;
-    const improved = pickExternalExtractionByMode_(pdfFileId, mode, text);
+    const improved = pickExternalExtractionByMode_(pdfFileId, mode);
     if (improved && improved.text) {
       if (isGeminiStructuredExtract_(improved.text, improved.source)) {
         externalStructured = normalizeText_(improved.text);
@@ -443,7 +451,7 @@ function pdfToExtractedViaGoogleDoc_(pdfFileId, recognitionMode) {
       docTable = null;
     } else {
       externalFailNote =
-        ' Внешнее распознавание не удалось (Gemini 429 / OCR.space лимит размера). Повторите позже или уменьшите PDF.';
+        ' Внешнее распознавание не удалось (OCR.space лимит размера / Gemini 429). Повторите позже.';
     }
   }
   if (DELETE_TEMP_DOCS) {
@@ -498,10 +506,13 @@ function looksStructuredGemini_(raw) {
   return hasTabs && cyr > 100;
 }
 
-/** Маркеры Gemini — не путать с табличным OCR.space. */
+/** Маркеры Gemini — не путать с сырым OCR.space. */
 function isGeminiStructuredExtract_(raw, source) {
   if (source === 'ocr.space') {
     return false;
+  }
+  if (source === 'gemini-ocr-structure' || source === 'gemini' || source === 'gemini-doc-text') {
+    return !!raw && /===\s*HEADER\s*===/i.test(raw) && looksStructuredGemini_(raw);
   }
   if (!raw || !/===\s*HEADER\s*===/i.test(raw)) {
     return false;
@@ -510,96 +521,51 @@ function isGeminiStructuredExtract_(raw, source) {
 }
 
 /**
- * Если в свойствах скрипта задан ключ — пробуем извлечь читаемый текст из исходного PDF.
- * @return {{text:string, source:string}|null}
- */
-/**
+ * PDF → OCR.space; при skipGemini=false — Gemini разбирает OCR-текст в HEADER/TABLE.
  * @param {string} pdfFileId
- * @param {string} [docFallbackText] текст после PDF→Doc (запасной путь без повторной загрузки PDF)
+ * @param {boolean} skipGemini
+ * @return {{text:string, source:string, rateLimited?:boolean}|null}
  */
-function tryGeminiTextFromDoc_(docFallbackText, geminiKey) {
-  if (!geminiKey || !docFallbackText || docFallbackText.length < 80) {
-    return null;
-  }
-  Logger.log('Gemini: запрос по тексту Google Doc (' + docFallbackText.length + ' симв., модель ' + GEMINI_MODEL + ')…');
-  const gt = tryGeminiTextExtract_(docFallbackText, geminiKey, GEMINI_MODEL);
-  if (gt && gt.text && gt.text.length > 80) {
-    const mergedT = mergeExternalExtractIntoPlainText_(gt.text);
-    if (analyzeDocTextQuality_(mergedT).readable || looksStructuredGemini_(gt.text)) {
-      Logger.log('Gemini (текст Doc): получен структурированный ответ.');
-      return { text: gt.text, source: 'gemini-doc-text' };
-    }
-  }
-  return null;
-}
-
-/** Выбор цепочки внешнего API по режиму меню. */
-function pickExternalExtractionByMode_(pdfFileId, mode, docFallbackText) {
-  if (mode === 'ocr') {
-    return tryExternalTextExtractionOcrOnly_(pdfFileId);
-  }
-  return tryExternalTextExtractionGeminiFirst_(pdfFileId, docFallbackText || '');
-}
-
-/** Только OCR.space (меню «Загрузить из папки (OCR.space)»). */
-function tryExternalTextExtractionOcrOnly_(pdfFileId) {
-  Logger.log('Режим OCR.space: распознавание без Gemini.');
+function tryOcrThenGeminiExtract_(pdfFileId, skipGemini) {
   const props = PropertiesService.getScriptProperties();
   const ocrKey = props.getProperty('OCR_SPACE_API_KEY');
   if (!ocrKey) {
     Logger.log('OCR_SPACE_API_KEY не задан.');
     return null;
   }
+  Logger.log('Шаг 1/2: OCR.space — распознавание PDF…');
   const o = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
-  if (o && o.text && o.text.length > 40) {
-    Logger.log('OCR.space: получен текст (' + o.text.length + ' симв.).');
-    return { text: o.text, source: 'ocr.space' };
+  if (!o || !o.text || o.text.length < 40) {
+    Logger.log('OCR.space: не удалось получить текст.');
+    return null;
   }
-  Logger.log('OCR.space: не удалось получить текст.');
-  return null;
+  const ocrText = o.text;
+  Logger.log('OCR.space: получено ' + ocrText.length + ' симв.');
+  if (skipGemini) {
+    return { text: ocrText, source: 'ocr.space' };
+  }
+  const geminiKey = props.getProperty('GEMINI_API_KEY');
+  if (!geminiKey) {
+    Logger.log('GEMINI_API_KEY не задан — только сырой OCR.');
+    return { text: ocrText, source: 'ocr.space' };
+  }
+  Logger.log('Шаг 2/2: Gemini — разбор OCR-текста в колонки УПД…');
+  const g = tryGeminiStructureFromOcrTextAllModels_(ocrText, geminiKey);
+  if (g && g.rateLimited) {
+    Logger.log('Gemini: лимит 429 — в лист пойдёт сырой OCR (эвристический парсинг).');
+    return { text: ocrText, source: 'ocr.space', rateLimited: true };
+  }
+  if (g && g.text && g.text.length > 80 && /===\s*HEADER\s*===/i.test(g.text)) {
+    Logger.log('Gemini: структурированный ответ (' + g.text.length + ' симв., ' + (g.model || GEMINI_MODEL) + ').');
+    return { text: g.text, source: 'gemini-ocr-structure', model: g.model };
+  }
+  Logger.log('Gemini не вернул HEADER/TABLE — парсинг по сырому OCR.');
+  return { text: ocrText, source: 'ocr.space' };
 }
 
-/** Gemini (PDF → при неудаче OCR.space). Меню «Загрузить из папки (Gemini)». */
-function tryExternalTextExtractionGeminiFirst_(pdfFileId, docFallbackText) {
-  const props = PropertiesService.getScriptProperties();
-  const geminiKey = props.getProperty('GEMINI_API_KEY');
-  if (geminiKey) {
-    Logger.log('Пробуем распознавание через Gemini (PDF, модели: ' + getGeminiModelsToTry_().join(' → ') + ')…');
-    const g = tryGeminiPdfExtractAllModels_(pdfFileId, geminiKey);
-    let geminiDocTextTried = false;
-    if (g && g.rateLimited) {
-      if (docFallbackText && docFallbackText.length >= 80) {
-        Logger.log('Gemini: лимит 429 на PDF — сначала пробуем текст Google Doc, затем OCR.space.');
-        geminiDocTextTried = true;
-        const gtEarly = tryGeminiTextFromDoc_(docFallbackText, geminiKey);
-        if (gtEarly) {
-          return gtEarly;
-        }
-      } else {
-        Logger.log('Gemini: лимит 429 на PDF — переходим к OCR.space (текст Doc не используется).');
-      }
-    }
-    if (g && g.text && g.text.length > 80) {
-      const merged = mergeExternalExtractIntoPlainText_(g.text);
-      if (analyzeDocTextQuality_(merged).readable || looksStructuredGemini_(g.text)) {
-        Logger.log('Gemini: получен читаемый текст (' + g.text.length + ' симв., модель ' + g.model + ').');
-        return { text: g.text, source: 'gemini' };
-      }
-      Logger.log('Gemini: ответ есть (' + g.text.length + ' симв.), но слабый по качеству — пробуем текст Doc / OCR.space');
-    } else {
-      Logger.log('Gemini PDF: не удалось получить текст' + (g && g.text ? ' (короткий: ' + g.text.length + ')' : '') + '.');
-      if (!geminiDocTextTried) {
-        geminiDocTextTried = true;
-        const gtEarly = tryGeminiTextFromDoc_(docFallbackText, geminiKey);
-        if (gtEarly) {
-          return gtEarly;
-        }
-      }
-    }
-  } else {
-    Logger.log('GEMINI_API_KEY не задан — пропускаем Gemini.');
-  }
-  return tryExternalTextExtractionOcrOnly_(pdfFileId);
+/** Выбор цепочки внешнего API по режиму меню (всегда OCR PDF; Gemini только по тексту). */
+function pickExternalExtractionByMode_(pdfFileId, mode) {
+  return tryOcrThenGeminiExtract_(pdfFileId, mode === 'ocr-only');
 }
 
 /** Модели, которые в 2025–2026 часто отдают 404 в generativelanguage v1beta */
@@ -666,17 +632,15 @@ function geminiBackoffMs_(attempt, resp) {
   return Math.min(exp, GEMINI_MAX_BACKOFF_MS);
 }
 
-function tryGeminiPdfExtractAllModels_(pdfFileId, apiKey) {
+/** Разбор OCR-текста: перебор моделей Gemini. */
+function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey) {
   const models = getGeminiModelsToTry_();
   for (let mi = 0; mi < models.length; mi++) {
     const model = models[mi];
-    Logger.log('Gemini PDF, модель: ' + model);
-    const r = tryGeminiPdfExtract_(pdfFileId, apiKey, model);
-    if (r && r.notFound) {
-      continue;
-    }
+    Logger.log('Gemini (OCR-текст), модель: ' + model);
+    const r = tryGeminiTextExtract_(ocrText, apiKey, model);
     if (r && r.rateLimited) {
-      Logger.log('Gemini: HTTP 429 — не переключаем другие модели (экономия квоты и времени).');
+      Logger.log('Gemini: HTTP 429 — не переключаем модели.');
       return { rateLimited: true };
     }
     if (r && r.text) {
@@ -684,133 +648,13 @@ function tryGeminiPdfExtractAllModels_(pdfFileId, apiKey) {
       return r;
     }
     if (mi < models.length - 1) {
-      Logger.log('Следующая модель Gemini через 3 с…');
-      Utilities.sleep(3000);
+      Utilities.sleep(2000);
     }
   }
   return null;
 }
 
-function tryGeminiPdfExtract_(pdfFileId, apiKey, modelName) {
-  const model = modelName || GEMINI_MODEL;
-  try {
-    const file = DriveApp.getFileById(pdfFileId);
-    const blob = file.getBlob();
-    const size = blob.getBytes().length;
-    Logger.log('Gemini: размер PDF ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
-    if (size > MAX_GEMINI_INLINE_PDF_BYTES) {
-      Logger.log('Gemini: PDF слишком большой для inline: ' + size + ' байт');
-      return null;
-    }
-    const b64 = Utilities.base64Encode(blob.getBytes());
-    const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/' +
-      model +
-      ':generateContent?key=' +
-      encodeURIComponent(apiKey);
-
-    let only429 = true;
-    for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
-      const bodyObj = {
-        contents: [
-          {
-            parts: [
-              { inline_data: { mime_type: 'application/pdf', data: b64 } },
-              { text: getGeminiInvoicePrompt_() },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0,
-          topP: 0.95,
-          topK: 40,
-          maxOutputTokens: 8192,
-        },
-      };
-      const resp = UrlFetchApp.fetch(url, {
-        method: 'post',
-        contentType: 'application/json',
-        muteHttpExceptions: true,
-        payload: JSON.stringify(bodyObj),
-      });
-      const code = resp.getResponseCode();
-      const respText = resp.getContentText();
-      if (code === 404) {
-        only429 = false;
-        Logger.log(
-          'Gemini HTTP 404 — модель «' + model + '» недоступна. В свойствах скрипта задайте GEMINI_MODEL=gemini-2.0-flash'
-        );
-        return { notFound: true };
-      }
-      if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
-        if (code !== 429) {
-          only429 = false;
-        }
-        const waitMs = geminiBackoffMs_(attempt, resp);
-        Logger.log(
-          'Gemini HTTP ' + code + ', попытка ' + attempt + '/' + GEMINI_MAX_ATTEMPTS + ', пауза ' + Math.round(waitMs / 1000) + ' с'
-        );
-        if (attempt < GEMINI_MAX_ATTEMPTS) {
-          Utilities.sleep(waitMs);
-        }
-        continue;
-      }
-      only429 = false;
-      if (code !== 200) {
-        Logger.log('Gemini HTTP ' + code + ': ' + respText.substring(0, 800));
-        return null;
-      }
-      let json;
-      try {
-        json = JSON.parse(respText);
-      } catch (e1) {
-        Logger.log('Gemini: не JSON, попытка ' + attempt);
-        continue;
-      }
-      if (json.error) {
-        Logger.log('Gemini API error: ' + JSON.stringify(json.error));
-        return null;
-      }
-      if (json.promptFeedback && json.promptFeedback.blockReason) {
-        Logger.log('Gemini blockReason: ' + json.promptFeedback.blockReason + ', попытка ' + attempt);
-        continue;
-      }
-      const cand = json.candidates && json.candidates[0];
-      if (!cand) {
-        Logger.log('Gemini: нет candidates ' + respText.substring(0, 400));
-        continue;
-      }
-      if (cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'MAX_TOKENS') {
-        Logger.log('Gemini finishReason: ' + cand.finishReason + ', попытка ' + attempt);
-        continue;
-      }
-      const parts = cand.content && cand.content.parts;
-      if (!parts || !parts.length) {
-        Logger.log('Gemini: пустые parts, попытка ' + attempt);
-        continue;
-      }
-      let out = '';
-      for (let i = 0; i < parts.length; i++) {
-        out += parts[i].text || '';
-      }
-      if (out.length < 40) {
-        Logger.log('Gemini: слишком короткий текст (' + out.length + ' симв.), попытка ' + attempt);
-        continue;
-      }
-      return { text: out, model: model };
-    }
-    Logger.log('Gemini: исчерпаны попытки (' + GEMINI_MAX_ATTEMPTS + ') для модели ' + model);
-    if (only429) {
-      return { rateLimited: true };
-    }
-    return null;
-  } catch (e) {
-    Logger.log('Gemini: ' + e.message);
-    return null;
-  }
-}
-
-/** Тот же формат ответа, но без PDF — меньше нагрузка на квоту при 429 на inline PDF. */
+/** Запрос к Gemini только по тексту (после OCR.space), без PDF. */
 function tryGeminiTextExtract_(plainText, apiKey, modelName) {
   const model = modelName || GEMINI_MODEL;
   const url =
@@ -821,7 +665,8 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
   const snippet = plainText.length > 80000 ? plainText.substring(0, 80000) : plainText;
   const promptShort =
     getGeminiInvoicePrompt_() +
-    '\n\nТекст из PDF (Google Doc):\n\n' +
+    '\n\nНиже — текст УПД/счёт-фактуры после OCR (возможны опечатки и переносы строк). ' +
+    'Исправляй только очевидные OCR-ошибки в номерах и наименованиях, суммы не выдумывай.\n\n' +
     snippet;
 
   for (let attempt = 1; attempt <= GEMINI_TEXT_MAX_ATTEMPTS; attempt++) {
@@ -841,9 +686,12 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
       Logger.log('Gemini (текст) HTTP 404 — модель «' + model + '» недоступна.');
       return null;
     }
-    if (code === 429 || code === 503) {
+    if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
       const waitMs = Math.min(geminiBackoffMs_(attempt, resp), GEMINI_MAX_BACKOFF_MS);
       Logger.log('Gemini (текст) HTTP ' + code + ', пауза ' + Math.round(waitMs / 1000) + ' с');
+      if (code === 429 && attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
+        return { rateLimited: true };
+      }
       if (attempt < GEMINI_TEXT_MAX_ATTEMPTS) {
         Utilities.sleep(waitMs);
       }
@@ -876,7 +724,7 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
 
 function getGeminiInvoicePrompt_() {
   return (
-    'Извлеки данные из приложённого PDF (российский УПД или счёт-фактура). Ответ только текстом, без markdown.\n' +
+    'Извлеки данные из текста российского УПД или счёт-фактуры (источник — OCR). Ответ только текстом, без markdown.\n' +
     'Строго такой формат (строки-маркеры обязательны):\n' +
     '===HEADER===\n' +
     'Строка: «Счёт-фактура № … от …» или «УПД № … от …» — как в документе.\n' +
@@ -1048,20 +896,18 @@ function showRecognitionSetupHelp() {
   SpreadsheetApp.getUi().alert(
     'Распознавание текста из PDF\n\n' +
       '1) Расширения → Apps Script → слева «Свойства проекта» (шестерёнка) → «Свойства скрипта».\n\n' +
-      '2) Добавьте свойство:\n' +
-      '   • GEMINI_API_KEY — ключ: https://aistudio.google.com/apikey\n' +
-      '     (модель по умолчанию ' +
+      '2) Добавьте свойства:\n' +
+      '   • OCR_SPACE_API_KEY — https://ocr.space/ocrapi (обязателен: распознавание PDF, ~1 МБ/файл на free).\n' +
+      '   • GEMINI_API_KEY — https://aistudio.google.com/apikey (разбор OCR-текста в таблицу; модель ' +
       GEMINI_MODEL +
-      '; в свойствах GEMINI_MODEL не указывайте gemini-1.5-flash — даёт HTTP 404.)\n\n' +
-      '   ИЛИ свойство:\n' +
-      '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
-      '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
-      '3) Сохраните свойства и снова запустите загрузку из меню таблицы.\n\n' +
+      ').\n\n' +
+      '3) Сохраните свойства и запустите загрузку из меню.\n\n' +
+      'Схема: PDF → OCR.space → текст → Gemini → колонки на листе.\n\n' +
       'Меню:\n' +
-      '• «Загрузить из папки (Gemini)» — Gemini → OCR.space; пауза ' +
+      '• «Загрузить из папки (OCR → Gemini)» — оба ключа; пауза ' +
       Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
-      ' с (лимит 429).\n' +
-      '• «Загрузить из папки (OCR.space…)» — только OCR, без паузы.\n\n' +
+      ' с между PDF (лимит Gemini 429).\n' +
+      '• «только OCR, без Gemini» — только OCR_SPACE_API_KEY, эвристический парсинг.\n\n' +
       'Другие бесплатные API для PDF (обзор): файл PDF_OCR_ALTERNATIVES.md в репозитории.\n\n' +
       (USE_PDF_TO_DOC_CONVERSION
         ? 'Конвертация PDF→Doc включена; при нечитаемом Doc — внешний API по выбранному режиму.\n'
@@ -1368,7 +1214,7 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   if (conversionOk === false) {
     const advice = USE_PDF_TO_DOC_CONVERSION
       ? ' Рекомендации: GEMINI_API_KEY / OCR_SPACE_API_KEY; или PDF с текстовым слоем; повёрнутые страницы — выпрямить до OCR.'
-      : ' Задайте GEMINI_API_KEY и/или OCR_SPACE_API_KEY (меню «Как подключить распознавание»). При 429 подождите и повторите.';
+      : ' Задайте OCR_SPACE_API_KEY и GEMINI_API_KEY (меню «Как подключить распознавание»). При 429 Gemini подождите и повторите.';
     return {
       invoiceLine: (conversionNote || 'Конвертация PDF→Google Doc не дала читаемый текст.') + advice,
       seller: '',
@@ -1433,7 +1279,10 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
   }
   if (
     (!invoiceLine || !seller || !paymentDoc) &&
-    (textSource === 'gemini-doc-text' || textSource === 'gemini' || structuredSrc)
+    (textSource === 'gemini-doc-text' ||
+      textSource === 'gemini' ||
+      textSource === 'gemini-ocr-structure' ||
+      structuredSrc)
   ) {
     const oh = extractOcrHeaderFields_(text);
     if (!invoiceLine && oh.invoiceLine) {
@@ -1485,7 +1334,10 @@ function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNo
     }
     if (
       (!table || !table.rows.length) &&
-      (textSource === 'gemini-doc-text' || textSource === 'gemini' || structuredSrc)
+      (textSource === 'gemini-doc-text' ||
+      textSource === 'gemini' ||
+      textSource === 'gemini-ocr-structure' ||
+      structuredSrc)
     ) {
       Logger.log('Gemini: резерв — OCR-эвристика по плоскому тексту.');
       table = pickBestOcrTable_(text);

@@ -9,7 +9,7 @@
     "sourceType": "script"
   },
   "rules": {
-    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderGemini|runProcessFolderOcr|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_)$" }],
+    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderGemini|runProcessFolderOcr|runProcessFolderOcrOnly|runProcessFolderForSpreadsheet|showRecognitionSetupHelp|extractAfterLabel_)$" }],
     "no-undef": "error",
     "no-redeclare": "warn",
     "no-prototype-builtins": "off",
