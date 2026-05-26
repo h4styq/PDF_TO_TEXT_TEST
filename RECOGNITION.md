@@ -1,27 +1,28 @@
 # Распознавание УПД / счёт-фактур
 
-## Поток
+## Поток (гибрид, как рекомендует Gemini)
 
 ```
-PDF (Drive)
-  → OCR.space (полный сырой текст, без лимита размера в скрипте)
-  → Gemini (только текст OCR → ===HEADER=== / ===TABLE===)
-  → лист «Счета_фактуры» (15 граф CANONICAL_UPD_HEADERS)
+PDF → OCR.space (сырой текст, без структуры)
+    → Gemini (только текст, не PDF — меньше токенов и 429)
+    → JSON (предпочтительно) или ===HEADER=== / ===TABLE===
+    → Google Таблица (батч setValues, не построчно)
 ```
 
-## Ключи (свойства скрипта)
+OCR **не** раскладывает колонки — только «картинка → текст». Таблицу восстанавливает Gemini.
+
+## Ключи
 
 - `OCR_SPACE_API_KEY` — https://ocr.space/ocrapi
 - `GEMINI_API_KEY` — https://aistudio.google.com/apikey
+
+## Запись в Sheets
+
+- Данные собираются в памяти, на лист пишутся **пакетами** (`SHEETS_FLUSH_EVERY_N_PDF`, по умолчанию 25 PDF) одним вызовом `setValues` на блок строк.
+- Не используется `appendRow` / построчная запись (избегаем 429 от Google Sheets API).
 
 ## Меню
 
 **Загрузить из папки Drive** — оба ключа обязательны.
 
-Версия: см. `SCRIPT_VERSION` в `InvoicePdfToSheet.gs`.
-
-## Примечания
-
-- Крупные PDF: при ошибке upload OCR.space запрашивает файл по временной ссылке Drive.
-- Очень длинный OCR (>120 000 симв.) обрезается только для запроса к Gemini (лимит Apps Script), не на этапе OCR.
-- Эвристики по вендорам, golden-check и парсинг PDF через Gemini **удалены** — только OCR + структура от Gemini.
+Версия: `SCRIPT_VERSION` в `InvoicePdfToSheet.gs`.
