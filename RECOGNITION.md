@@ -4,8 +4,8 @@
 
 ```
 PDF (Drive)
-  → OCR.space (полный сырой текст, без лимита размера в скрипте)
-  → Gemini (только текст OCR → ===HEADER=== / ===TABLE===)
+  → OCR.space (upload, при неудаче URL; все страницы ParsedResults)
+  → Gemini (HEADER/TABLE TAB или JSON; повтор TAB при битом JSON)
   → лист «Счета_фактуры» (15 граф CANONICAL_UPD_HEADERS)
 ```
 

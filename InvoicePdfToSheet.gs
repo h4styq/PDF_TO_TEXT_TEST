@@ -8,6 +8,8 @@ const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 const SCRIPT_VERSION = '2026-05-21-slim-ocr-gemini';
+/** Порог: выше — сначала upload, при ошибке URL (как в исходном slim). */
+const OCR_LARGE_FILE_HINT_BYTES = Math.round(1.5 * 1024 * 1024);
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
@@ -17,10 +19,6 @@ const GEMINI_MAX_BACKOFF_MS = 20000;
 const GEMINI_OCR_TEXT_MAX_CHARS = 120000;
 const PAUSE_BETWEEN_PDF_MS = 20000;
 const OCR_SPACE_MAX_ATTEMPTS = 3;
-// Если PDF > ~1 МБ — грузим не file upload'ом, а через URL Drive.
-// Это обычно стабильнее в Apps Script.
-const OCR_TRY_DRIVE_URL_FOR_LARGE = true;
-
 const CANONICAL_UPD_HEADERS = [
   '№ п/п',
   'Наименование товара (описание выполненных работ, оказанных услуг), имущественного права',
@@ -162,17 +160,15 @@ function pdfToExtracted_(pdfFileId) {
   }
 
   const structured = step.structured || '';
-  const hasTable = /===\s*TABLE\s*===/i.test(structured);
-  const hasHeader = /===\s*HEADER\s*===/i.test(structured);
+  const okStruct = structured ? geminiStructuredResponseIsUsable_(structured) : false;
 
   return {
     rawOcr: step.rawOcr,
     externalStructured: structured,
     conversionOk: true,
-    conversionNote:
-      hasTable && hasHeader
-        ? ''
-        : 'Gemini не вернул HEADER/TABLE — проверьте лог; в листе может быть пустая таблица.',
+    conversionNote: okStruct
+      ? ''
+      : 'Gemini не вернул пригодный JSON/HEADER/TABLE — проверьте лог; таблица может быть пустой.',
     textSource: step.source || 'ocr.space',
   };
 }
@@ -199,103 +195,134 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   }
 
   Logger.log('Gemini: разбор OCR-текста в колонки…');
-  const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey);
+  const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
   if (g && g.rateLimited) {
     return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
   }
-  if (g && g.text && /===\s*HEADER\s*===/i.test(g.text)) {
-    return {
-      rawOcr: ocr.text,
-      structured: normalizeText_(g.text),
-      source: 'gemini-ocr-structure',
-    };
+  if (g && g.text) {
+    const normalized = normalizeGeminiStructuredText_(g.text);
+    if (geminiStructuredResponseIsUsable_(normalized)) {
+      return {
+        rawOcr: ocr.text,
+        structured: normalized,
+        source: 'gemini-ocr-structure',
+      };
+    }
+    if (geminiResponseLooksLikeJson_(normalized) || !/===\s*TABLE\s*===/i.test(normalized)) {
+      Logger.log('Gemini: ответ не в HEADER/TABLE — повтор (только TAB)…');
+      const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+      if (g2 && g2.text) {
+        const n2 = normalizeGeminiStructuredText_(g2.text);
+        if (geminiStructuredResponseIsUsable_(n2)) {
+          return {
+            rawOcr: ocr.text,
+            structured: n2,
+            source: 'gemini-ocr-structure-tab-retry',
+          };
+        }
+      }
+    }
+    if (normalized.length >= 40) {
+      Logger.log('Gemini: сохранён ответ для разбора (' + normalized.length + ' симв.), начало: ' + normalized.substring(0, 280));
+      return {
+        rawOcr: ocr.text,
+        structured: normalized,
+        source: 'gemini-ocr-structure-raw',
+      };
+    }
   }
-  Logger.log('Gemini: нет маркеров HEADER/TABLE в ответе.');
+  Logger.log('Gemini: пустой или слишком короткий ответ.');
   return { rawOcr: ocr.text, structured: '', source: 'ocr.space' };
 }
 
+function ocrSpaceCollectText_(json) {
+  const parts = [];
+  const list = json.ParsedResults || [];
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i] && list[i].ParsedText;
+    if (t) {
+      parts.push(String(t));
+    }
+  }
+  return parts.join('\n\n');
+}
+
+function ocrSpacePost_(apiKey, payload) {
+  for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      Utilities.sleep(1500 * attempt);
+    }
+    const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+      method: 'post',
+      muteHttpExceptions: true,
+      payload: payload,
+    });
+    const code = resp.getResponseCode();
+    const raw = resp.getContentText();
+    if (code === 429 || code === 503) {
+      Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
+      continue;
+    }
+    if (code !== 200) {
+      Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 350));
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (e1) {
+      continue;
+    }
+    if (json.IsErroredOnProcessing) {
+      Logger.log('OCR.space: ' + (json.ErrorMessage || json.ErrorDetails || ''));
+      continue;
+    }
+    const text = ocrSpaceCollectText_(json);
+    if (text.length > 0) {
+      return { text: text, json: json };
+    }
+  }
+  return null;
+}
+
 /**
- * OCR.space: распознавание PDF.
- * Логика как раньше: если PDF > ~1 МБ — используем Drive URL (стабильнее для Apps Script).
+ * OCR.space: сначала upload (все страницы ParsedResults), при неудаче — URL Drive.
  * @return {{text:string, viaUrl:boolean}|null}
  */
 function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
-  const MAX_OCR_SPACE_BYTES = 1024 * 1024;
   try {
     const file = DriveApp.getFileById(pdfFileId);
     const blob = file.getBlob().setContentType('application/pdf');
     const size = blob.getBytes().length;
     Logger.log('OCR.space: размер файла ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
-    if (size > MAX_OCR_SPACE_BYTES) {
-      if (OCR_TRY_DRIVE_URL_FOR_LARGE) {
-        return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
-      }
-      Logger.log('OCR.space: файл больше ~1 МБ (бесплатный тариф). ' + 'Сожмите PDF или задайте OCR_TRY_DRIVE_URL_FOR_LARGE = true.');
-      return null;
+    const basePayload = {
+      apikey: apiKey,
+      language: 'rus',
+      isOverlayRequired: 'false',
+      isTable: 'true',
+      detectOrientation: 'true',
+      scale: 'true',
+      OCREngine: '2',
+      file: blob,
+    };
+    const r = ocrSpacePost_(apiKey, basePayload);
+    if (r && r.text && r.text.length > 15) {
+      Logger.log('OCR.space upload: ' + r.text.length + ' симв.');
+      return { text: r.text, viaUrl: false };
     }
-    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        Utilities.sleep(1200 * attempt);
-      }
-      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
-        method: 'post',
-        muteHttpExceptions: true,
-        payload: {
-          apikey: apiKey,
-          language: 'rus',
-          isTable: 'true',
-          OCREngine: '2',
-          detectOrientation: 'true',
-          scale: 'true',
-          file: blob,
-        },
-      });
-      const code = resp.getResponseCode();
-      const raw = resp.getContentText();
-      if (code === 429 || code === 503) {
-        Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
-        continue;
-      }
-      if (code !== 200) {
-        Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 400));
-        return null;
-      }
-      let json;
-      try {
-        json = JSON.parse(raw);
-      } catch (ignore) {
-        Logger.log('OCR.space: ответ не JSON');
-        continue;
-      }
-      if (json.IsErroredOnProcessing) {
-        const em = json.ErrorMessage || '';
-        Logger.log('OCR.space: ' + em);
-        if (/limit|rate|many|quota/i.test(em) && attempt < OCR_SPACE_MAX_ATTEMPTS) {
-          continue;
-        }
-        return null;
-      }
-      const pr = json.ParsedResults && json.ParsedResults[0];
-      if (!pr) {
-        continue;
-      }
-      const txt = pr.ParsedText || '';
-      if (txt.length < 15 && attempt < OCR_SPACE_MAX_ATTEMPTS) {
-        continue;
-      }
-      return { text: txt, viaUrl: false };
+    if (size > OCR_LARGE_FILE_HINT_BYTES) {
+      Logger.log('OCR.space: upload не удался для файла > ~1,5 МБ — пробуем URL Drive…');
+    } else {
+      Logger.log('OCR.space upload не удался — пробуем URL Drive…');
     }
-    return null;
+    return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
   } catch (e) {
     Logger.log('OCR.space: ' + e.message);
     return null;
   }
 }
 
-/**
- * OCR.space: для PDF > ~1 МБ — распознавание по URL Drive.
- * @return {{text:string, viaUrl:boolean}|null}
- */
+/** OCR.space по публичной ссылке Drive (все страницы). */
 function tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file) {
   const origAccess = file.getSharingAccess();
   const origPerm = file.getSharingPermission();
@@ -308,47 +335,22 @@ function tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file) {
     }
     Utilities.sleep(2000);
     const driveUrl = 'https://drive.google.com/uc?export=download&id=' + pdfFileId;
-    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        Utilities.sleep(1500 * attempt);
-      }
-      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
-        method: 'post',
-        muteHttpExceptions: true,
-        payload: {
-          apikey: apiKey,
-          url: driveUrl,
-          filetype: 'PDF',
-          language: 'rus',
-          isTable: 'true',
-          OCREngine: '2',
-          detectOrientation: 'true',
-          scale: 'true',
-        },
-      });
-      const code = resp.getResponseCode();
-      const raw = resp.getContentText();
-      if (code !== 200) {
-        Logger.log('OCR.space (URL) HTTP ' + code + ': ' + raw.substring(0, 300));
-        continue;
-      }
-      let json;
-      try {
-        json = JSON.parse(raw);
-      } catch (ignore) {
-        continue;
-      }
-      if (json.IsErroredOnProcessing) {
-        Logger.log('OCR.space (URL): ' + (json.ErrorMessage || JSON.stringify(json)).substring(0, 400));
-        continue;
-      }
-      const pr = json.ParsedResults && json.ParsedResults[0];
-      if (pr && pr.ParsedText && pr.ParsedText.length > 15) {
-        Logger.log('OCR.space (URL): получен текст (' + pr.ParsedText.length + ' симв.).');
-        return { text: pr.ParsedText, viaUrl: true };
-      }
+    const r = ocrSpacePost_(apiKey, {
+      apikey: apiKey,
+      url: driveUrl,
+      filetype: 'PDF',
+      language: 'rus',
+      isOverlayRequired: 'false',
+      isTable: 'true',
+      detectOrientation: 'true',
+      scale: 'true',
+      OCREngine: '2',
+    });
+    if (r && r.text && r.text.length > 15) {
+      Logger.log('OCR.space (URL): получен текст (' + r.text.length + ' симв.).');
+      return { text: r.text, viaUrl: true };
     }
-    Logger.log('OCR.space (URL): не удалось распознать (лимит тарифа или Drive не отдал файл по ссылке).');
+    Logger.log('OCR.space (URL): не удалось распознать.');
     return null;
   } catch (e) {
     Logger.log('OCR.space (URL): ' + e.message);
@@ -404,10 +406,40 @@ function geminiBackoffMs_(attempt, resp) {
   return Math.min(GEMINI_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), GEMINI_MAX_BACKOFF_MS);
 }
 
-function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey) {
+function geminiStructuredResponseIsUsable_(text) {
+  if (!text || text.length < 20) {
+    return false;
+  }
+  if (/===\s*TABLE\s*===/i.test(text)) {
+    const table = parseGeminiTableSection_(text);
+    if (table && table.rows && table.rows.length) {
+      return true;
+    }
+  }
+  const parsed = parseGeminiJsonResponse_(text, true);
+  return !!(parsed && parsed.tableRows && parsed.tableRows.length);
+}
+
+function geminiResponseLooksLikeJson_(text) {
+  return /"rows"\s*:\s*\[/i.test(text) || /^\s*\{/.test(String(text || '').trim());
+}
+
+function normalizeGeminiStructuredText_(text) {
+  let t = normalizeText_(text);
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    t = fence[1].trim();
+  }
+  t = t.replace(/\*{1,2}\s*(===\s*HEADER\s*===)\s*\*{0,2}/gi, '$1');
+  t = t.replace(/\*{1,2}\s*(===\s*TABLE\s*===)\s*\*{0,2}/gi, '$1');
+  t = t.replace(/\*{1,2}\s*(===\s*END\s*===)\s*\*{0,2}/gi, '$1');
+  return t;
+}
+
+function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly) {
   const models = getGeminiModelsToTry_();
   for (let mi = 0; mi < models.length; mi++) {
-    const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi]);
+    const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi], tabFormatOnly);
     if (r && r.rateLimited) {
       return { rateLimited: true };
     }
@@ -422,10 +454,10 @@ function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey) {
   return null;
 }
 
-function getGeminiInvoicePrompt_() {
+function getGeminiInvoiceTabPrompt_() {
   return (
     'По сырому тексту УПД/счёт-фактуры (OCR, возможны ошибки) заполни данные для Google Таблицы.\n' +
-    'Ответ только текстом, без markdown.\n' +
+    'Ответ только текстом, без markdown, без JSON.\n' +
     '===HEADER===\n' +
     'Счёт-фактура или УПД (№ и дата)\n' +
     'Продавец: …\n' +
@@ -434,16 +466,25 @@ function getGeminiInvoicePrompt_() {
     '===TABLE===\n' +
     'Ровно ' +
     CANONICAL_UPD_HEADERS.length +
-    ' колонок (TAB), порядок:\n' +
+    ' колонок в строке, разделитель TAB (\\t). Порядок колонок:\n' +
     CANONICAL_UPD_HEADERS.join(' | ') +
     '\n' +
-    'Первая строка — эти заголовки. Далее все строки товаров из OCR (№ п/п 1, 2, 3…). ' +
-    'Не пропускай позиции. Без строки «Всего к оплате».\n' +
+    'Далее все строки товаров из OCR (№ п/п 1, 2, 3…). Не пропускай позиции. Без «Всего к оплате».\n' +
     '===END==='
   );
 }
 
-function tryGeminiTextExtract_(plainText, apiKey, modelName) {
+function getGeminiInvoicePrompt_() {
+  return (
+    getGeminiInvoiceTabPrompt_() +
+    '\n\nЕсли TAB неудобен — один валидный JSON: {"invoiceLine":"…","seller":"…","paymentDoc":"…","basis":"…",' +
+    '"rows":[{"seq":"1","name":"…","productCode":"","unitCode":"796","unit":"шт","qty":"…","price":"…",' +
+    '"costNoVat":"…","excise":"","vatRate":"22%","vatAmount":"…","costWithVat":"…",' +
+    '"countryCode":"","countryName":"","declaration":""}]} — предпочитай HEADER/TABLE.'
+  );
+}
+
+function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
   const model = modelName || GEMINI_MODEL;
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
@@ -460,7 +501,7 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
     );
   }
   const prompt =
-    getGeminiInvoicePrompt_() +
+    (tabFormatOnly ? getGeminiInvoiceTabPrompt_() : getGeminiInvoicePrompt_()) +
     '\n\n--- Полный OCR-текст документа ---\n\n' +
     snippet;
 
@@ -513,18 +554,19 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
 
 function parseInvoiceData_(pack) {
   if (!pack.conversionOk) {
-    return {
-      invoiceLine: pack.conversionNote || 'Нет текста OCR',
-      seller: '',
-      paymentDoc: '',
-      tableHeader: CANONICAL_UPD_HEADERS.slice(),
-      tableRows: [],
-      basis: '',
-      tableWidth: CANONICAL_UPD_HEADERS.length,
-    };
+    return emptyParsedInvoice_(pack.conversionNote || 'Нет текста OCR');
   }
 
   const structured = pack.externalStructured || '';
+  const fromJson = parseGeminiJsonResponse_(structured, false);
+  if (fromJson && fromJson.tableRows.length) {
+    let note = pack.conversionNote || '';
+    if (note) {
+      fromJson.invoiceLine = (fromJson.invoiceLine + ' ' + note).trim();
+    }
+    return fromJson;
+  }
+
   const hdr = parseStructuredHeaderBlock_(structured) || {};
   let table = parseGeminiTableSection_(structured);
   let rows = table && table.rows ? table.rows : [];
@@ -542,6 +584,197 @@ function parseInvoiceData_(pack) {
     tableHeader: CANONICAL_UPD_HEADERS.slice(),
     tableRows: rows,
     basis: hdr.basis || '',
+    tableWidth: CANONICAL_UPD_HEADERS.length,
+  };
+}
+
+function emptyParsedInvoice_(note) {
+  return {
+    invoiceLine: note,
+    seller: '',
+    paymentDoc: '',
+    tableHeader: CANONICAL_UPD_HEADERS.slice(),
+    tableRows: [],
+    basis: '',
+    tableWidth: CANONICAL_UPD_HEADERS.length,
+  };
+}
+
+function parseGeminiJsonResponse_(text, silent) {
+  let raw = String(text || '').trim();
+  if (!raw) {
+    return null;
+  }
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1) {
+    return null;
+  }
+  const jsonSlice = end > start ? raw.substring(start, end + 1) : raw.substring(start);
+  let obj = tryParseGeminiJsonObject_(jsonSlice, silent);
+  if (!obj) {
+    const rowObjs = extractRowObjectsFromJsonText_(raw);
+    if (rowObjs.length) {
+      obj = extractScalarFieldsFromJsonText_(raw) || {};
+      obj.rows = rowObjs;
+      if (!silent) {
+        Logger.log('Gemini JSON: извлечено строк из битого ответа: ' + rowObjs.length);
+      }
+    }
+  }
+  if (!obj) {
+    return null;
+  }
+  return geminiJsonObjectToParsed_(obj);
+}
+
+function tryParseGeminiJsonObject_(jsonSlice, silent) {
+  try {
+    return JSON.parse(jsonSlice);
+  } catch (e) {
+    if (!silent) {
+      Logger.log('Gemini JSON: ' + e.message);
+    }
+  }
+  const repaired = repairGeminiJsonString_(jsonSlice);
+  try {
+    const obj = JSON.parse(repaired);
+    if (!silent) {
+      Logger.log('Gemini JSON: восстановлено (repair).');
+    }
+    return obj;
+  } catch (e2) {
+    if (!silent) {
+      Logger.log('Gemini JSON (repair): ' + e2.message);
+    }
+  }
+  return null;
+}
+
+function repairGeminiJsonString_(s) {
+  let t = String(s || '').trim();
+  t = t.replace(/,\s*([}\]])/g, '$1');
+  t = t
+    .split('')
+    .map(function (ch) {
+      const code = ch.charCodeAt(0);
+      return code < 32 && code !== 9 && code !== 10 && code !== 13 ? ' ' : ch;
+    })
+    .join('');
+  const openBraces = (t.match(/\{/g) || []).length;
+  const closeBraces = (t.match(/\}/g) || []).length;
+  const openBrackets = (t.match(/\[/g) || []).length;
+  const closeBrackets = (t.match(/\]/g) || []).length;
+  for (let i = 0; i < openBrackets - closeBrackets; i++) {
+    t += ']';
+  }
+  for (let j = 0; j < openBraces - closeBraces; j++) {
+    t += '}';
+  }
+  return t;
+}
+
+function extractScalarFieldsFromJsonText_(text) {
+  const out = {};
+  const fields = ['invoiceLine', 'seller', 'paymentDoc', 'basis'];
+  for (let i = 0; i < fields.length; i++) {
+    const key = fields[i];
+    const re = new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"', 'i');
+    const m = String(text || '').match(re);
+    if (m) {
+      out[key] = m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function extractRowObjectsFromJsonText_(text) {
+  const slice = String(text || '');
+  const rowsKey = slice.search(/"rows"\s*:\s*\[/i);
+  const searchFrom = rowsKey >= 0 ? rowsKey : 0;
+  const out = [];
+  let depth = 0;
+  let start = -1;
+  for (let i = searchFrom; i < slice.length; i++) {
+    const ch = slice.charAt(i);
+    if (ch === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const chunk = slice.substring(start, i + 1);
+        if (/"(name|seq)"\s*:/i.test(chunk)) {
+          try {
+            const row = JSON.parse(chunk);
+            if (row && (row.name || row.seq)) {
+              out.push(row);
+            }
+          } catch (ignore) {
+            const fixed = repairGeminiJsonString_(chunk);
+            try {
+              const row2 = JSON.parse(fixed);
+              if (row2 && (row2.name || row2.seq)) {
+                out.push(row2);
+              }
+            } catch (ignore2) {}
+          }
+        }
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+function geminiJsonObjectToParsed_(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return null;
+  }
+  const rowsIn = obj.rows || obj.tableRows || obj.items || [];
+  if (!rowsIn || !rowsIn.length) {
+    return null;
+  }
+  const matrix = [];
+  for (let i = 0; i < rowsIn.length; i++) {
+    const row = rowsIn[i];
+    if (Object.prototype.toString.call(row) === '[object Array]') {
+      matrix.push(row);
+      continue;
+    }
+    if (row && typeof row === 'object') {
+      matrix.push([
+        row.seq != null ? String(row.seq) : '',
+        row.name != null ? String(row.name) : '',
+        row.productCode != null ? String(row.productCode) : '',
+        row.unitCode != null ? String(row.unitCode) : '',
+        row.unit != null ? String(row.unit) : '',
+        row.qty != null ? String(row.qty) : '',
+        row.price != null ? String(row.price) : '',
+        row.costNoVat != null ? String(row.costNoVat) : '',
+        row.excise != null ? String(row.excise) : '',
+        row.vatRate != null ? String(row.vatRate) : '',
+        row.vatAmount != null ? String(row.vatAmount) : '',
+        row.costWithVat != null ? String(row.costWithVat) : '',
+        row.countryCode != null ? String(row.countryCode) : '',
+        row.countryName != null ? String(row.countryName) : '',
+        row.declaration != null ? String(row.declaration) : '',
+      ]);
+    }
+  }
+  const rows = alignRowsToCanonical_(matrix);
+  if (!rows.length) {
+    return null;
+  }
+  return {
+    invoiceLine: String(obj.invoiceLine || obj.invoice || ''),
+    seller: String(obj.seller || ''),
+    paymentDoc: String(obj.paymentDoc || obj.payment || ''),
+    basis: String(obj.basis || ''),
+    tableHeader: CANONICAL_UPD_HEADERS.slice(),
+    tableRows: rows,
     tableWidth: CANONICAL_UPD_HEADERS.length,
   };
 }
@@ -688,7 +921,7 @@ function writeParsedRows_(sheet, items, maxTableCols) {
     const p = it.parsed;
     if (!p.tableRows.length) {
       const single = [it.fileName, p.invoiceLine, p.seller, p.paymentDoc]
-        .concat(padRow_(p.tableHeader, tableCols))
+        .concat(padRow_([], tableCols))
         .concat([p.basis]);
       sheet.getRange(rowPtr, 1, 1, totalCols).setValues([padRow_(single, totalCols)]);
       rowPtr++;
