@@ -8,8 +8,8 @@ const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
 const SCRIPT_VERSION = '2026-05-21-slim-ocr-gemini';
-/** Порог: выше — сначала upload, при ошибке URL (как в исходном slim). */
-const OCR_LARGE_FILE_HINT_BYTES = Math.round(1.5 * 1024 * 1024);
+/** OCR.space Free: upload до 1,5 МБ; больше — сразу URL Drive. */
+const OCR_SPACE_FREE_MAX_BYTES = Math.round(1.5 * 1024 * 1024);
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
@@ -195,6 +195,24 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   }
 
   Logger.log('Gemini: разбор OCR-текста в колонки…');
+  const fromSchema = tryGeminiJsonSchemaFromOcrTextAllModels_(ocr.text, geminiKey);
+  if (fromSchema && fromSchema.rateLimited) {
+    return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
+  }
+  if (fromSchema && fromSchema.text) {
+    const nSchema = normalizeGeminiStructuredText_(fromSchema.text);
+    const parsedSchema = parseGeminiJsonResponse_(nSchema, false);
+    if (parsedSchema && parsedSchema.tableRows.length) {
+      Logger.log('Gemini JSON schema: ' + parsedSchema.tableRows.length + ' строк (модель ' + fromSchema.model + ').');
+      return {
+        rawOcr: ocr.text,
+        structured: nSchema,
+        source: 'gemini-json-schema',
+      };
+    }
+    Logger.log('Gemini JSON schema: ответ без строк товаров, fallback HEADER/TABLE…');
+  }
+
   const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
   if (g && g.rateLimited) {
     return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
@@ -202,36 +220,36 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   if (g && g.text) {
     const normalized = normalizeGeminiStructuredText_(g.text);
     if (geminiStructuredResponseIsUsable_(normalized)) {
+      Logger.log('Gemini HEADER/TABLE: OK (' + normalized.length + ' симв., ' + g.model + ').');
       return {
         rawOcr: ocr.text,
         structured: normalized,
         source: 'gemini-ocr-structure',
       };
     }
-    if (geminiResponseLooksLikeJson_(normalized) || !/===\s*TABLE\s*===/i.test(normalized)) {
-      Logger.log('Gemini: ответ не в HEADER/TABLE — повтор (только TAB)…');
-      const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
-      if (g2 && g2.text) {
-        const n2 = normalizeGeminiStructuredText_(g2.text);
-        if (geminiStructuredResponseIsUsable_(n2)) {
-          return {
-            rawOcr: ocr.text,
-            structured: n2,
-            source: 'gemini-ocr-structure-tab-retry',
-          };
-        }
+    Logger.log('Gemini: ответ не разобран (' + normalized.length + ' симв.), повтор TAB…');
+    Logger.log('Gemini начало: ' + normalized.substring(0, 350).replace(/\n/g, ' '));
+    const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+    if (g2 && g2.text) {
+      const n2 = normalizeGeminiStructuredText_(g2.text);
+      if (geminiStructuredResponseIsUsable_(n2)) {
+        return {
+          rawOcr: ocr.text,
+          structured: n2,
+          source: 'gemini-ocr-structure-tab-retry',
+        };
       }
     }
-    if (normalized.length >= 40) {
-      Logger.log('Gemini: сохранён ответ для разбора (' + normalized.length + ' симв.), начало: ' + normalized.substring(0, 280));
+    if (normalized.length >= 20) {
       return {
         rawOcr: ocr.text,
         structured: normalized,
         source: 'gemini-ocr-structure-raw',
       };
     }
+  } else {
+    Logger.log('Gemini: нет текста в ответе API (проверьте ключ, квоту, модель).');
   }
-  Logger.log('Gemini: пустой или слишком короткий ответ.');
   return { rawOcr: ocr.text, structured: '', source: 'ocr.space' };
 }
 
@@ -295,6 +313,10 @@ function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
     const blob = file.getBlob().setContentType('application/pdf');
     const size = blob.getBytes().length;
     Logger.log('OCR.space: размер файла ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
+    if (size > OCR_SPACE_FREE_MAX_BYTES) {
+      Logger.log('OCR.space: > 1,5 МБ (Free) — распознавание по URL Drive…');
+      return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
+    }
     const basePayload = {
       apikey: apiKey,
       language: 'rus',
@@ -310,11 +332,7 @@ function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
       Logger.log('OCR.space upload: ' + r.text.length + ' симв.');
       return { text: r.text, viaUrl: false };
     }
-    if (size > OCR_LARGE_FILE_HINT_BYTES) {
-      Logger.log('OCR.space: upload не удался для файла > ~1,5 МБ — пробуем URL Drive…');
-    } else {
-      Logger.log('OCR.space upload не удался — пробуем URL Drive…');
-    }
+    Logger.log('OCR.space upload не удался — пробуем URL Drive…');
     return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
   } catch (e) {
     Logger.log('OCR.space: ' + e.message);
@@ -420,10 +438,6 @@ function geminiStructuredResponseIsUsable_(text) {
   return !!(parsed && parsed.tableRows && parsed.tableRows.length);
 }
 
-function geminiResponseLooksLikeJson_(text) {
-  return /"rows"\s*:\s*\[/i.test(text) || /^\s*\{/.test(String(text || '').trim());
-}
-
 function normalizeGeminiStructuredText_(text) {
   let t = normalizeText_(text);
   const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -434,6 +448,167 @@ function normalizeGeminiStructuredText_(text) {
   t = t.replace(/\*{1,2}\s*(===\s*TABLE\s*===)\s*\*{0,2}/gi, '$1');
   t = t.replace(/\*{1,2}\s*(===\s*END\s*===)\s*\*{0,2}/gi, '$1');
   return t;
+}
+
+function getGeminiInvoiceRowSchema_() {
+  return {
+    type: 'OBJECT',
+    properties: {
+      seq: { type: 'STRING' },
+      name: { type: 'STRING' },
+      productCode: { type: 'STRING' },
+      unitCode: { type: 'STRING' },
+      unit: { type: 'STRING' },
+      qty: { type: 'STRING' },
+      price: { type: 'STRING' },
+      costNoVat: { type: 'STRING' },
+      excise: { type: 'STRING' },
+      vatRate: { type: 'STRING' },
+      vatAmount: { type: 'STRING' },
+      costWithVat: { type: 'STRING' },
+      countryCode: { type: 'STRING' },
+      countryName: { type: 'STRING' },
+      declaration: { type: 'STRING' },
+    },
+  };
+}
+
+function getGeminiInvoiceResponseSchema_() {
+  return {
+    type: 'OBJECT',
+    properties: {
+      invoiceLine: { type: 'STRING' },
+      seller: { type: 'STRING' },
+      paymentDoc: { type: 'STRING' },
+      basis: { type: 'STRING' },
+      rows: {
+        type: 'ARRAY',
+        items: getGeminiInvoiceRowSchema_(),
+      },
+    },
+    required: ['invoiceLine', 'seller', 'rows'],
+  };
+}
+
+function getGeminiJsonSchemaPrompt_() {
+  return (
+    'Извлеки из OCR-текста счёт-фактуры/УПД все реквизиты и КАЖДУЮ строку товаров (№ п/п по порядку). ' +
+    'Числа и наименования — как в OCR, не выдумывай. Без итоговой строки «Всего к оплате».'
+  );
+}
+
+function logGeminiApiDiagnostics_(json, model) {
+  const pf = json.promptFeedback;
+  if (pf && pf.blockReason) {
+    Logger.log('Gemini blockReason: ' + pf.blockReason + (model ? ' (' + model + ')' : ''));
+  }
+  const list = json.candidates || [];
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    if (c.finishReason) {
+      Logger.log('Gemini candidate[' + i + '] finishReason=' + c.finishReason + (model ? ' ' + model : ''));
+    }
+  }
+}
+
+function extractGeminiCandidateText_(json, model) {
+  const list = json.candidates || [];
+  for (let ci = 0; ci < list.length; ci++) {
+    const parts = list[ci].content && list[ci].content.parts;
+    if (!parts || !parts.length) {
+      continue;
+    }
+    let out = '';
+    for (let i = 0; i < parts.length; i++) {
+      out += parts[i].text || '';
+    }
+    if (out.length >= 15) {
+      return out;
+    }
+  }
+  logGeminiApiDiagnostics_(json, model);
+  return '';
+}
+
+function tryGeminiJsonSchemaFromOcrTextAllModels_(ocrText, apiKey) {
+  const models = getGeminiModelsToTry_();
+  for (let mi = 0; mi < models.length; mi++) {
+    const r = tryGeminiJsonSchemaExtract_(ocrText, apiKey, models[mi]);
+    if (r && r.rateLimited) {
+      return { rateLimited: true };
+    }
+    if (r && r.text) {
+      r.model = models[mi];
+      return r;
+    }
+    if (mi < models.length - 1) {
+      Utilities.sleep(2000);
+    }
+  }
+  return null;
+}
+
+function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
+  const model = modelName || GEMINI_MODEL;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    model +
+    ':generateContent?key=' +
+    encodeURIComponent(apiKey);
+  const snippet =
+    plainText.length > GEMINI_OCR_TEXT_MAX_CHARS
+      ? plainText.substring(0, GEMINI_OCR_TEXT_MAX_CHARS)
+      : plainText;
+  const prompt = getGeminiJsonSchemaPrompt_() + '\n\n--- OCR-текст ---\n\n' + snippet;
+
+  for (let attempt = 1; attempt <= GEMINI_TEXT_MAX_ATTEMPTS; attempt++) {
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 8192,
+          responseMimeType: 'application/json',
+          responseSchema: getGeminiInvoiceResponseSchema_(),
+        },
+      }),
+    });
+    const code = resp.getResponseCode();
+    const raw = resp.getContentText();
+    if (code === 404) {
+      Logger.log('Gemini JSON schema 404: ' + model);
+      return null;
+    }
+    if (code === 400) {
+      Logger.log('Gemini JSON schema 400 (' + model + '): ' + raw.substring(0, 280));
+      return null;
+    }
+    if (code === 429 || code === 503) {
+      if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
+        return { rateLimited: true };
+      }
+      Utilities.sleep(geminiBackoffMs_(attempt, resp));
+      continue;
+    }
+    if (code !== 200) {
+      Logger.log('Gemini JSON schema HTTP ' + code + ' (' + model + ')');
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (e2) {
+      continue;
+    }
+    const out = extractGeminiCandidateText_(json, model);
+    if (out.length >= 15) {
+      return { text: out };
+    }
+  }
+  return null;
 }
 
 function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly) {
@@ -537,15 +712,8 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
     } catch (e2) {
       continue;
     }
-    const parts = json.candidates && json.candidates[0] && json.candidates[0].content && json.candidates[0].content.parts;
-    if (!parts || !parts.length) {
-      continue;
-    }
-    let out = '';
-    for (let i = 0; i < parts.length; i++) {
-      out += parts[i].text || '';
-    }
-    if (out.length >= 40) {
+    const out = extractGeminiCandidateText_(json, model);
+    if (out.length >= 15) {
       return { text: out };
     }
   }
@@ -567,13 +735,26 @@ function parseInvoiceData_(pack) {
     return fromJson;
   }
 
-  const hdr = parseStructuredHeaderBlock_(structured) || {};
+  const hdr = parseStructuredHeaderBlock_(structured) || parseLooseHeaderFromText_(structured) || {};
   let table = parseGeminiTableSection_(structured);
   let rows = table && table.rows ? table.rows : [];
+  if (!rows.length) {
+    rows = parseLooseProductTableFromText_(structured);
+  }
   rows = alignRowsToCanonical_(rows);
 
   let note = pack.conversionNote || '';
   if (!rows.length) {
+    if (!structured) {
+      Logger.log('parseInvoiceData_: Gemini не вернул текст (externalStructured пустой).');
+    } else {
+      Logger.log(
+        'parseInvoiceData_: 0 строк, structured ' +
+          structured.length +
+          ' симв.: ' +
+          structured.substring(0, 400).replace(/\n/g, ' ')
+      );
+    }
     note = (note ? note + ' ' : '') + 'Таблица пуста — проверьте ответ Gemini в логе.';
   }
 
@@ -817,9 +998,85 @@ function parseStructuredHeaderBlock_(text) {
   return { invoiceLine: invoiceLine, seller: seller, paymentDoc: paymentDoc, basis: basis };
 }
 
+/** Заголовок без маркеров ===HEADER=== */
+function parseLooseHeaderFromText_(text) {
+  const n = normalizeText_(text);
+  if (/===\s*HEADER\s*===/i.test(n)) {
+    return null;
+  }
+  const lines = n
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  let invoiceLine = '';
+  let seller = '';
+  let paymentDoc = '';
+  let basis = '';
+  for (let i = 0; i < Math.min(lines.length, 25); i++) {
+    const line = lines[i];
+    if (!invoiceLine && /^(Сч[её]т|УПД|Универсальн)/i.test(line)) {
+      invoiceLine = line;
+    } else if (!seller && /\bПродавец\s*:?/i.test(line)) {
+      seller = line.replace(/^.*?Продавец\s*:?\s*/i, '').trim();
+    } else if (!seller && /^(ООО|АО|ЗАО|ПАО|ИП)\s/i.test(line)) {
+      seller = line;
+    } else if (!paymentDoc && /платежно[-\s]*расчетному\s+документу/i.test(line)) {
+      paymentDoc = line.replace(/^.*документу\s*№?\s*/i, '').trim();
+    } else if (!basis && /Основание\s+передачи/i.test(line)) {
+      basis = line.replace(/^.*при[её]мки\)\s*/i, '').trim();
+    }
+  }
+  if (!invoiceLine && !seller) {
+    return null;
+  }
+  return { invoiceLine: invoiceLine, seller: seller, paymentDoc: paymentDoc, basis: basis };
+}
+
+/** Строки товаров: TAB, несколько табов/пробелов, или JSON уже обработан выше. */
+function parseLooseProductTableFromText_(text) {
+  const n = normalizeText_(text);
+  if (!n || n.indexOf('{') === 0) {
+    return [];
+  }
+  const lines = n.split('\n');
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\u00a0/g, ' ').trim();
+    if (!line || /^(===|```)/.test(line)) {
+      continue;
+    }
+    if (/Всего\s+к\s+оплате|^Итого\b|===\s*END/i.test(line)) {
+      break;
+    }
+    if (/^(наименование|№\s*п\/п|код\s+вида)/i.test(line)) {
+      continue;
+    }
+    let cells = splitTableLine_(line);
+    if (cells.length < 3) {
+      continue;
+    }
+    if (cells.length > CANONICAL_UPD_HEADERS.length) {
+      cells = cells.slice(0, CANONICAL_UPD_HEADERS.length);
+    }
+    const seq = String(cells[0] || '').trim();
+    if (!/^\d{1,4}$/.test(seq)) {
+      continue;
+    }
+    rows.push(cells);
+  }
+  return rows;
+}
+
 function parseGeminiTableSection_(text) {
   const n = normalizeText_(text);
-  const tm = n.match(/===\s*TABLE\s*===\s*([\s\S]*?)(?====\s*END\s*===|$)/i);
+  let tm = n.match(/===\s*TABLE\s*===\s*([\s\S]*?)(?====\s*END\s*===|$)/i);
+  if (!tm) {
+    tm = n.match(/(?:^|\n)\s*TABLE\s*:?\s*\n([\s\S]*?)(?====\s*END\s*===|$)/i);
+  }
   if (!tm) {
     return null;
   }
@@ -877,6 +1134,11 @@ function normalizeText_(t) {
 function splitTableLine_(line) {
   if (line.indexOf('\t') !== -1) {
     return line.split('\t').map(function (c) {
+      return c.trim();
+    });
+  }
+  if (line.indexOf('|') !== -1) {
+    return line.split('|').map(function (c) {
       return c.trim();
     });
   }

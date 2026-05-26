@@ -5,7 +5,7 @@
 ```
 PDF (Drive)
   → OCR.space (upload, при неудаче URL; все страницы ParsedResults)
-  → Gemini (HEADER/TABLE TAB или JSON; повтор TAB при битом JSON)
+  → Gemini (сначала JSON schema API, затем HEADER/TABLE TAB)
   → лист «Счета_фактуры» (15 граф CANONICAL_UPD_HEADERS)
 ```
 
