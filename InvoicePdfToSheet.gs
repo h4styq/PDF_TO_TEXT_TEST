@@ -16,6 +16,12 @@ const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
 const GEMINI_TEXT_MAX_ATTEMPTS = 2;
 const GEMINI_RETRY_BASE_DELAY_MS = 5000;
 const GEMINI_MAX_BACKOFF_MS = 20000;
+/** false = только HEADER/TABLE (1 запрос на PDF, экономия Free tier). true — свойство GEMINI_USE_JSON_SCHEMA=true */
+const GEMINI_USE_JSON_SCHEMA_DEFAULT = false;
+/** Сколько моделей пробовать на один PDF (1 = минимум запросов). */
+const GEMINI_MODELS_PER_PDF_DEFAULT = 1;
+/** false = не делать второй запрос TAB (экономия квоты Free tier). */
+const GEMINI_TAB_RETRY_DEFAULT = false;
 const GEMINI_OCR_TEXT_MAX_CHARS = 120000;
 const PAUSE_BETWEEN_PDF_MS = 20000;
 const OCR_SPACE_MAX_ATTEMPTS = 3;
@@ -170,7 +176,7 @@ function pdfToExtracted_(pdfFileId) {
       rawOcr: ocrOk ? step.rawOcr : '',
       externalStructured: '',
       conversionOk: ocrOk,
-      conversionNote: formatGemini429Note_(step.httpCode),
+      conversionNote: formatGemini429Note_(step.httpCode, step.quotaExceeded),
       textSource: 'gemini-429',
       rateLimited: true,
     };
@@ -253,16 +259,10 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
     return null;
   }
 
-  Logger.log('Gemini: HEADER/TABLE (основной путь)…');
+  Logger.log('Gemini: HEADER/TABLE (1 запрос на PDF, без JSON schema по умолчанию)…');
   const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
   if (g && g.rateLimited) {
-    return {
-      rawOcr: ocr.text,
-      structured: '',
-      source: 'ocr.space',
-      rateLimited: true,
-      httpCode: g.httpCode || 429,
-    };
+    return geminiRateLimitReturn_(ocr.text, g.httpCode || 429, g.quotaExceeded);
   }
   if (g && g.text) {
     const n = normalizeGeminiStructuredText_(g.text);
@@ -274,13 +274,7 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
     Logger.log('Gemini HEADER/TABLE: не разобран, повтор TAB (' + n.length + ' симв.)…');
     const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
     if (g2 && g2.rateLimited) {
-      return {
-        rawOcr: ocr.text,
-        structured: '',
-        source: 'ocr.space',
-        rateLimited: true,
-        httpCode: g2.httpCode || 429,
-      };
+      return geminiRateLimitReturn_(ocr.text, g2.httpCode || 429, g2.quotaExceeded);
     }
     if (g2 && g2.text) {
       const n2 = normalizeGeminiStructuredText_(g2.text);
@@ -294,16 +288,12 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
     diag.push('HEADER/TABLE: API не вернул текст');
   }
 
-  Logger.log('Gemini: JSON (schema / mime)…');
-  const fromSchema = tryGeminiJsonSchemaFromOcrTextAllModels_(ocr.text, geminiKey);
+  if (geminiUseJsonSchema_()) {
+    Logger.log('Gemini: JSON (schema / mime)…');
+  }
+  const fromSchema = geminiUseJsonSchema_() ? tryGeminiJsonSchemaFromOcrTextAllModels_(ocr.text, geminiKey) : null;
   if (fromSchema && fromSchema.rateLimited) {
-    return {
-      rawOcr: ocr.text,
-      structured: '',
-      source: 'ocr.space',
-      rateLimited: true,
-      httpCode: fromSchema.httpCode || 429,
-    };
+    return geminiRateLimitReturn_(ocr.text, fromSchema.httpCode || 429, fromSchema.quotaExceeded);
   }
   if (fromSchema && fromSchema.text) {
     const nSchema = normalizeGeminiStructuredText_(fromSchema.text);
@@ -313,7 +303,7 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
       return okSchema;
     }
     diag.push('JSON: текст ' + nSchema.length + ' симв., строки товаров не извлечены');
-  } else {
+  } else if (geminiUseJsonSchema_()) {
     diag.push('JSON: нет ответа');
   }
 
@@ -484,6 +474,52 @@ function isDeprecatedGeminiModel_(name) {
   return /^gemini-1\.5-(flash|pro)(-|$)/i.test(name || '') || name === 'gemini-1.5-flash' || name === 'gemini-1.5-pro';
 }
 
+function geminiUseTabRetry_() {
+  const v = (PropertiesService.getScriptProperties().getProperty('GEMINI_TAB_RETRY') || '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') {
+    return true;
+  }
+  if (v === 'false' || v === '0' || v === 'no') {
+    return false;
+  }
+  return GEMINI_TAB_RETRY_DEFAULT;
+}
+
+function geminiUseJsonSchema_() {
+  const v = (PropertiesService.getScriptProperties().getProperty('GEMINI_USE_JSON_SCHEMA') || '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') {
+    return true;
+  }
+  if (v === 'false' || v === '0' || v === 'no') {
+    return false;
+  }
+  return GEMINI_USE_JSON_SCHEMA_DEFAULT;
+}
+
+function getGeminiModelsForPdf_() {
+  const all = getGeminiModelsToTry_();
+  const raw = PropertiesService.getScriptProperties().getProperty('GEMINI_MODELS_PER_PDF');
+  let n = GEMINI_MODELS_PER_PDF_DEFAULT;
+  if (raw) {
+    const parsed = parseInt(String(raw).replace(/[^0-9]/g, ''), 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      n = parsed;
+    }
+  }
+  return all.slice(0, Math.min(n, all.length));
+}
+
+function geminiRateLimitReturn_(rawOcr, httpCode, quotaExceeded) {
+  return {
+    rawOcr: rawOcr,
+    structured: '',
+    source: 'ocr.space',
+    rateLimited: true,
+    httpCode: httpCode || 429,
+    quotaExceeded: !!quotaExceeded,
+  };
+}
+
 function getGeminiModelsToTry_() {
   const props = PropertiesService.getScriptProperties();
   const fromProps = (props.getProperty('GEMINI_MODEL') || '').trim();
@@ -528,15 +564,57 @@ function geminiApiIsRateLimited_(httpCode, responseText) {
   return false;
 }
 
-function formatGemini429Note_(httpCode) {
+/** Квота Free tier / billing — повтор бесполезен. */
+function geminiApiIsQuotaExceeded_(httpCode, responseText) {
+  const body = String(responseText || '');
+  if (/free_tier|quota exceeded|exceeded your current quota|billing details/i.test(body)) {
+    return true;
+  }
+  try {
+    const j = JSON.parse(body || '{}');
+    const msg = String((j.error && j.error.message) || '');
+    if (/free_tier|quota exceeded|exceeded your current quota|billing/i.test(msg)) {
+      return true;
+    }
+  } catch (ignore) {}
+  return httpCode === 429 && /quota/i.test(body);
+}
+
+/**
+ * @return {{rateLimited:boolean, httpCode:number, quotaExceeded?:boolean}|null} rateLimited — стоп; null — retry
+ */
+function geminiEvaluateRateLimit_(httpCode, responseText, model, mode, attempt, maxAttempts) {
+  if (!geminiApiIsRateLimited_(httpCode, responseText)) {
+    return null;
+  }
+  const quota = geminiApiIsQuotaExceeded_(httpCode, responseText);
+  logGeminiRateLimit_(httpCode, responseText, model, mode);
+  if (quota) {
+    Logger.log('Gemini: квота исчерпана — повтор запроса не выполняется.');
+    return { rateLimited: true, httpCode: httpCode, quotaExceeded: true };
+  }
+  if (attempt >= maxAttempts) {
+    return { rateLimited: true, httpCode: httpCode, quotaExceeded: false };
+  }
+  return null;
+}
+
+function formatGemini429Note_(httpCode, quotaExceeded) {
   const code = httpCode || 429;
+  if (quotaExceeded) {
+    return (
+      'Gemini: квота API исчерпана (HTTP ' +
+      code +
+      ', Free tier ~20 запросов). OCR выполнен. Включите биллинг в Google AI Studio или дождитесь сброса лимита. ' +
+      'На PDF — один запрос HEADER/TABLE (JSON schema отключён).'
+    );
+  }
   return (
     'Gemini: лимит запросов (HTTP ' +
     code +
-    '). OCR выполнен, разбор в колонки не сделан. ' +
-    'Подождите несколько минут или увеличьте PAUSE_BETWEEN_PDF_MS (' +
+    '). OCR выполнен. Подождите и повторите (пауза ' +
     Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
-    ' с сейчас).'
+    ' с между PDF).'
   );
 }
 
@@ -691,11 +769,11 @@ function extractGeminiCandidateText_(json, model) {
 }
 
 function tryGeminiJsonSchemaFromOcrTextAllModels_(ocrText, apiKey) {
-  const models = getGeminiModelsToTry_();
+  const models = getGeminiModelsForPdf_();
   for (let mi = 0; mi < models.length; mi++) {
     const r = tryGeminiJsonSchemaExtract_(ocrText, apiKey, models[mi]);
     if (r && r.rateLimited) {
-      return { rateLimited: true, httpCode: r.httpCode || 429 };
+      return { rateLimited: true, httpCode: r.httpCode || 429, quotaExceeded: r.quotaExceeded };
     }
     if (r && r.text) {
       r.model = models[mi];
@@ -750,11 +828,11 @@ function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
       }
       return null;
     }
-    if (geminiApiIsRateLimited_(code, raw)) {
-      logGeminiRateLimit_(code, raw, model, 'JSON schema');
-      if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
-        return { rateLimited: true, httpCode: code };
-      }
+    const limit = geminiEvaluateRateLimit_(code, raw, model, 'JSON schema', attempt, GEMINI_TEXT_MAX_ATTEMPTS);
+    if (limit && limit.rateLimited) {
+      return limit;
+    }
+    if (limit === null && geminiApiIsRateLimited_(code, raw)) {
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
@@ -828,11 +906,11 @@ function tryGeminiJsonMimeOnlyExtract_(plainText, apiKey, modelName) {
 }
 
 function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly) {
-  const models = getGeminiModelsToTry_();
+  const models = getGeminiModelsForPdf_();
   for (let mi = 0; mi < models.length; mi++) {
     const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi], tabFormatOnly);
     if (r && r.rateLimited) {
-      return { rateLimited: true, httpCode: r.httpCode || 429 };
+      return { rateLimited: true, httpCode: r.httpCode || 429, quotaExceeded: r.quotaExceeded };
     }
     if (r && r.text) {
       r.model = models[mi];
@@ -912,11 +990,11 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
       Logger.log('Gemini 404: модель ' + model);
       return null;
     }
-    if (geminiApiIsRateLimited_(code, raw)) {
-      logGeminiRateLimit_(code, raw, model, tabFormatOnly ? 'TAB' : 'text');
-      if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
-        return { rateLimited: true, httpCode: code };
-      }
+    const limit = geminiEvaluateRateLimit_(code, raw, model, tabFormatOnly ? 'TAB' : 'text', attempt, GEMINI_TEXT_MAX_ATTEMPTS);
+    if (limit && limit.rateLimited) {
+      return limit;
+    }
+    if (limit === null && geminiApiIsRateLimited_(code, raw)) {
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
