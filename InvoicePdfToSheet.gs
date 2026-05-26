@@ -102,8 +102,12 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const items = [];
   let maxCols = CANONICAL_UPD_HEADERS.length;
   let pauseNext = false;
+  let geminiHit429 = false;
 
   while (files.hasNext()) {
+    if (geminiHit429) {
+      break;
+    }
     if (pauseNext && PAUSE_BETWEEN_PDF_MS > 0) {
       Utilities.sleep(PAUSE_BETWEEN_PDF_MS);
     }
@@ -114,6 +118,9 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     try {
       const pack = pdfToExtracted_(file.getId());
       pauseNext = true;
+      if (pack.rateLimited) {
+        geminiHit429 = true;
+      }
       const parsed = parseInvoiceData_(pack);
       maxCols = Math.max(maxCols, parsed.tableWidth);
       items.push({ fileName: file.getName(), parsed: parsed });
@@ -136,12 +143,20 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
 
   writeParsedRows_(sheet, items, maxCols);
   const n = items.length;
-  const summary =
+  let summary =
     n === 0
       ? 'PDF не найдены.'
       : 'Готово: ' + n + ' PDF (OCR → Gemini). Лист «' + OUTPUT_SHEET_NAME + '».';
+  if (geminiHit429) {
+    summary =
+      'Gemini 429 (лимит): обработано ' +
+      n +
+      ' PDF, остальные пропущены. Подождите ' +
+      Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+      '+ с и запустите снова.';
+  }
   Logger.log(summary);
-  ss.toast(summary, 'Счета-фактуры', 12);
+  ss.toast(summary, 'Счета-фактуры', geminiHit429 ? 20 : 12);
 }
 
 /**
@@ -149,6 +164,17 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
  */
 function pdfToExtracted_(pdfFileId) {
   const step = tryOcrThenGeminiExtract_(pdfFileId);
+  if (step && step.rateLimited) {
+    const ocrOk = step.rawOcr && step.rawOcr.length >= 30;
+    return {
+      rawOcr: ocrOk ? step.rawOcr : '',
+      externalStructured: '',
+      conversionOk: ocrOk,
+      conversionNote: formatGemini429Note_(step.httpCode),
+      textSource: 'gemini-429',
+      rateLimited: true,
+    };
+  }
   if (!step || !step.rawOcr || step.rawOcr.length < 30) {
     return {
       rawOcr: '',
@@ -156,6 +182,7 @@ function pdfToExtracted_(pdfFileId) {
       conversionOk: false,
       conversionNote: 'OCR.space не вернул текст (проверьте ключ, доступ к файлу, тариф OCR).',
       textSource: 'none',
+      rateLimited: false,
     };
   }
 
@@ -170,11 +197,12 @@ function pdfToExtracted_(pdfFileId) {
       ? ''
       : 'Gemini не вернул пригодный JSON/HEADER/TABLE — проверьте лог; таблица может быть пустой.',
     textSource: step.source || 'ocr.space',
+    rateLimited: false,
   };
 }
 
 /**
- * @return {{rawOcr:string, structured:string, source:string, rateLimited?:boolean}|null}
+ * @return {{rawOcr:string, structured:string, source:string, rateLimited?:boolean, httpCode?:number}|null}
  */
 function tryOcrThenGeminiExtract_(pdfFileId) {
   const ocrKey = PropertiesService.getScriptProperties().getProperty('OCR_SPACE_API_KEY');
@@ -197,7 +225,13 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   Logger.log('Gemini: разбор OCR-текста в колонки…');
   const fromSchema = tryGeminiJsonSchemaFromOcrTextAllModels_(ocr.text, geminiKey);
   if (fromSchema && fromSchema.rateLimited) {
-    return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
+    return {
+      rawOcr: ocr.text,
+      structured: '',
+      source: 'ocr.space',
+      rateLimited: true,
+      httpCode: fromSchema.httpCode || 429,
+    };
   }
   if (fromSchema && fromSchema.text) {
     const nSchema = normalizeGeminiStructuredText_(fromSchema.text);
@@ -215,7 +249,13 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
 
   const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
   if (g && g.rateLimited) {
-    return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
+    return {
+      rawOcr: ocr.text,
+      structured: '',
+      source: 'ocr.space',
+      rateLimited: true,
+      httpCode: g.httpCode || 429,
+    };
   }
   if (g && g.text) {
     const normalized = normalizeGeminiStructuredText_(g.text);
@@ -230,6 +270,15 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
     Logger.log('Gemini: ответ не разобран (' + normalized.length + ' симв.), повтор TAB…');
     Logger.log('Gemini начало: ' + normalized.substring(0, 350).replace(/\n/g, ' '));
     const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+    if (g2 && g2.rateLimited) {
+      return {
+        rawOcr: ocr.text,
+        structured: '',
+        source: 'ocr.space',
+        rateLimited: true,
+        httpCode: g2.httpCode || 429,
+      };
+    }
     if (g2 && g2.text) {
       const n2 = normalizeGeminiStructuredText_(g2.text);
       if (geminiStructuredResponseIsUsable_(n2)) {
@@ -410,6 +459,56 @@ function getGeminiModelsToTry_() {
   return out.length ? out : [GEMINI_MODEL];
 }
 
+/** HTTP 429 / 503 или quota в теле ответа Gemini API. */
+function geminiApiIsRateLimited_(httpCode, responseText) {
+  if (httpCode === 429 || httpCode === 503) {
+    return true;
+  }
+  try {
+    const j = JSON.parse(responseText || '{}');
+    const err = j.error;
+    if (!err) {
+      return false;
+    }
+    const code = err.code;
+    if (code === 429 || code === 503) {
+      return true;
+    }
+    const msg = String(err.message || err.status || '');
+    if (/resource exhausted|quota exceeded|rate limit|too many requests|overloaded/i.test(msg)) {
+      return true;
+    }
+  } catch (ignore) {}
+  return false;
+}
+
+function formatGemini429Note_(httpCode) {
+  const code = httpCode || 429;
+  return (
+    'Gemini: лимит запросов (HTTP ' +
+    code +
+    '). OCR выполнен, разбор в колонки не сделан. ' +
+    'Подождите несколько минут или увеличьте PAUSE_BETWEEN_PDF_MS (' +
+    Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+    ' с сейчас).'
+  );
+}
+
+function logGeminiRateLimit_(httpCode, responseText, model, mode) {
+  Logger.log(
+    'Gemini' +
+      (mode ? ' [' + mode + ']' : '') +
+      ': ошибка ' +
+      (httpCode || 429) +
+      ' (лимит / квота)' +
+      (model ? ', модель ' + model : '') +
+      '.'
+  );
+  if (responseText) {
+    Logger.log('Gemini 429 тело: ' + String(responseText).substring(0, 400));
+  }
+}
+
 function geminiBackoffMs_(attempt, resp) {
   try {
     const h = resp.getHeaders();
@@ -535,7 +634,7 @@ function tryGeminiJsonSchemaFromOcrTextAllModels_(ocrText, apiKey) {
   for (let mi = 0; mi < models.length; mi++) {
     const r = tryGeminiJsonSchemaExtract_(ocrText, apiKey, models[mi]);
     if (r && r.rateLimited) {
-      return { rateLimited: true };
+      return { rateLimited: true, httpCode: r.httpCode || 429 };
     }
     if (r && r.text) {
       r.model = models[mi];
@@ -586,9 +685,10 @@ function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
       Logger.log('Gemini JSON schema 400 (' + model + '): ' + raw.substring(0, 280));
       return null;
     }
-    if (code === 429 || code === 503) {
+    if (geminiApiIsRateLimited_(code, raw)) {
+      logGeminiRateLimit_(code, raw, model, 'JSON schema');
       if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
-        return { rateLimited: true };
+        return { rateLimited: true, httpCode: code };
       }
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
@@ -601,6 +701,14 @@ function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
     try {
       json = JSON.parse(raw);
     } catch (e2) {
+      continue;
+    }
+    if (geminiApiIsRateLimited_(200, raw)) {
+      logGeminiRateLimit_(429, raw, model, 'JSON schema body');
+      if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
+        return { rateLimited: true, httpCode: 429 };
+      }
+      Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
     const out = extractGeminiCandidateText_(json, model);
@@ -616,7 +724,7 @@ function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly)
   for (let mi = 0; mi < models.length; mi++) {
     const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi], tabFormatOnly);
     if (r && r.rateLimited) {
-      return { rateLimited: true };
+      return { rateLimited: true, httpCode: r.httpCode || 429 };
     }
     if (r && r.text) {
       r.model = models[mi];
@@ -691,13 +799,15 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
       }),
     });
     const code = resp.getResponseCode();
+    const raw = resp.getContentText();
     if (code === 404) {
       Logger.log('Gemini 404: модель ' + model);
       return null;
     }
-    if (code === 429 || code === 503) {
+    if (geminiApiIsRateLimited_(code, raw)) {
+      logGeminiRateLimit_(code, raw, model, tabFormatOnly ? 'TAB' : 'text');
       if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
-        return { rateLimited: true };
+        return { rateLimited: true, httpCode: code };
       }
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
@@ -708,8 +818,16 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
     }
     let json;
     try {
-      json = JSON.parse(resp.getContentText());
+      json = JSON.parse(raw);
     } catch (e2) {
+      continue;
+    }
+    if (geminiApiIsRateLimited_(200, raw)) {
+      logGeminiRateLimit_(429, raw, model, tabFormatOnly ? 'TAB body' : 'text body');
+      if (attempt >= GEMINI_TEXT_MAX_ATTEMPTS) {
+        return { rateLimited: true, httpCode: 429 };
+      }
+      Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
     const out = extractGeminiCandidateText_(json, model);
