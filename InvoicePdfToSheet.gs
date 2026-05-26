@@ -17,6 +17,9 @@ const GEMINI_MAX_BACKOFF_MS = 20000;
 const GEMINI_OCR_TEXT_MAX_CHARS = 120000;
 const PAUSE_BETWEEN_PDF_MS = 20000;
 const OCR_SPACE_MAX_ATTEMPTS = 3;
+// Если PDF > ~1 МБ — грузим не file upload'ом, а через URL Drive.
+// Это обычно стабильнее в Apps Script.
+const OCR_TRY_DRIVE_URL_FOR_LARGE = true;
 
 const CANONICAL_UPD_HEADERS = [
   '№ п/п',
@@ -54,11 +57,6 @@ function runProcessFolder() {
 
 function runProcessFolderForSpreadsheet(spreadsheetId) {
   processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId);
-}
-
-/** @deprecated используйте runProcessFolder */
-function runProcessFolderGemini() {
-  runProcessFolder();
 }
 
 function showRecognitionSetupHelp() {
@@ -216,113 +214,153 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   return { rawOcr: ocr.text, structured: '', source: 'ocr.space' };
 }
 
-function ocrSpaceCollectText_(json) {
-  const parts = [];
-  const list = json.ParsedResults || [];
-  for (let i = 0; i < list.length; i++) {
-    const t = list[i] && list[i].ParsedText;
-    if (t) {
-      parts.push(String(t));
-    }
-  }
-  return parts.join('\n\n');
-}
-
-function ocrSpacePost_(apiKey, payload) {
-  for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
-    if (attempt > 1) {
-      Utilities.sleep(1500 * attempt);
-    }
-    const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
-      method: 'post',
-      muteHttpExceptions: true,
-      payload: payload,
-    });
-    const code = resp.getResponseCode();
-    const raw = resp.getContentText();
-    if (code === 429 || code === 503) {
-      Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
-      continue;
-    }
-    if (code !== 200) {
-      Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 350));
-      return null;
-    }
-    let json;
-    try {
-      json = JSON.parse(raw);
-    } catch (e1) {
-      continue;
-    }
-    if (json.IsErroredOnProcessing) {
-      Logger.log('OCR.space: ' + (json.ErrorMessage || json.ErrorDetails || ''));
-      continue;
-    }
-    const text = ocrSpaceCollectText_(json);
-    if (text.length > 0) {
-      return { text: text, json: json };
-    }
-  }
-  return null;
-}
-
-/** Без лимита размера в скрипте: upload, при неудаче — URL Drive. */
+/**
+ * OCR.space: распознавание PDF.
+ * Логика как раньше: если PDF > ~1 МБ — используем Drive URL (стабильнее для Apps Script).
+ * @return {{text:string, viaUrl:boolean}|null}
+ */
 function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
+  const MAX_OCR_SPACE_BYTES = 1024 * 1024;
   try {
     const file = DriveApp.getFileById(pdfFileId);
     const blob = file.getBlob().setContentType('application/pdf');
-    Logger.log('OCR.space upload: ' + (blob.getBytes().length / 1024 / 1024).toFixed(2) + ' МБ');
-    const basePayload = {
-      apikey: apiKey,
-      language: 'rus',
-      isOverlayRequired: 'false',
-      detectOrientation: 'true',
-      scale: 'true',
-      OCREngine: '2',
-      file: blob,
-    };
-    let r = ocrSpacePost_(apiKey, basePayload);
-    if (r && r.text) {
-      return { text: r.text, viaUrl: false };
+    const size = blob.getBytes().length;
+    Logger.log('OCR.space: размер файла ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
+    if (size > MAX_OCR_SPACE_BYTES) {
+      if (OCR_TRY_DRIVE_URL_FOR_LARGE) {
+        return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
+      }
+      Logger.log('OCR.space: файл больше ~1 МБ (бесплатный тариф). ' + 'Сожмите PDF или задайте OCR_TRY_DRIVE_URL_FOR_LARGE = true.');
+      return null;
     }
-    Logger.log('OCR.space upload не удался — пробуем URL Drive…');
-    return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
+    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        Utilities.sleep(1200 * attempt);
+      }
+      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+        method: 'post',
+        muteHttpExceptions: true,
+        payload: {
+          apikey: apiKey,
+          language: 'rus',
+          isTable: 'true',
+          OCREngine: '2',
+          detectOrientation: 'true',
+          scale: 'true',
+          file: blob,
+        },
+      });
+      const code = resp.getResponseCode();
+      const raw = resp.getContentText();
+      if (code === 429 || code === 503) {
+        Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
+        continue;
+      }
+      if (code !== 200) {
+        Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 400));
+        return null;
+      }
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch (ignore) {
+        Logger.log('OCR.space: ответ не JSON');
+        continue;
+      }
+      if (json.IsErroredOnProcessing) {
+        const em = json.ErrorMessage || '';
+        Logger.log('OCR.space: ' + em);
+        if (/limit|rate|many|quota/i.test(em) && attempt < OCR_SPACE_MAX_ATTEMPTS) {
+          continue;
+        }
+        return null;
+      }
+      const pr = json.ParsedResults && json.ParsedResults[0];
+      if (!pr) {
+        continue;
+      }
+      const txt = pr.ParsedText || '';
+      if (txt.length < 15 && attempt < OCR_SPACE_MAX_ATTEMPTS) {
+        continue;
+      }
+      return { text: txt, viaUrl: false };
+    }
+    return null;
   } catch (e) {
     Logger.log('OCR.space: ' + e.message);
     return null;
   }
 }
 
+/**
+ * OCR.space: для PDF > ~1 МБ — распознавание по URL Drive.
+ * @return {{text:string, viaUrl:boolean}|null}
+ */
 function tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file) {
   const origAccess = file.getSharingAccess();
   const origPerm = file.getSharingPermission();
-  let changed = false;
+  let changedSharing = false;
   try {
     if (origAccess !== DriveApp.Access.ANYONE_WITH_LINK && origAccess !== DriveApp.Access.ANYONE) {
       file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-      changed = true;
+      changedSharing = true;
+      Logger.log('OCR.space: временно «доступ по ссылке» для загрузки PDF по URL.');
     }
     Utilities.sleep(2000);
     const driveUrl = 'https://drive.google.com/uc?export=download&id=' + pdfFileId;
-    const r = ocrSpacePost_(apiKey, {
-      apikey: apiKey,
-      url: driveUrl,
-      filetype: 'PDF',
-      language: 'rus',
-      isOverlayRequired: 'false',
-      detectOrientation: 'true',
-      scale: 'true',
-      OCREngine: '2',
-    });
-    if (r && r.text) {
-      return { text: r.text, viaUrl: true };
+    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        Utilities.sleep(1500 * attempt);
+      }
+      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+        method: 'post',
+        muteHttpExceptions: true,
+        payload: {
+          apikey: apiKey,
+          url: driveUrl,
+          filetype: 'PDF',
+          language: 'rus',
+          isTable: 'true',
+          OCREngine: '2',
+          detectOrientation: 'true',
+          scale: 'true',
+        },
+      });
+      const code = resp.getResponseCode();
+      const raw = resp.getContentText();
+      if (code !== 200) {
+        Logger.log('OCR.space (URL) HTTP ' + code + ': ' + raw.substring(0, 300));
+        continue;
+      }
+      let json;
+      try {
+        json = JSON.parse(raw);
+      } catch (ignore) {
+        continue;
+      }
+      if (json.IsErroredOnProcessing) {
+        Logger.log('OCR.space (URL): ' + (json.ErrorMessage || JSON.stringify(json)).substring(0, 400));
+        continue;
+      }
+      const pr = json.ParsedResults && json.ParsedResults[0];
+      if (pr && pr.ParsedText && pr.ParsedText.length > 15) {
+        Logger.log('OCR.space (URL): получен текст (' + pr.ParsedText.length + ' симв.).');
+        return { text: pr.ParsedText, viaUrl: true };
+      }
     }
+    Logger.log('OCR.space (URL): не удалось распознать (лимит тарифа или Drive не отдал файл по ссылке).');
+    return null;
+  } catch (e) {
+    Logger.log('OCR.space (URL): ' + e.message);
     return null;
   } finally {
-    if (changed) {
+    if (changedSharing) {
       try {
         file.setSharing(origAccess, origPerm);
-      } catch (ignore) {}
+        Logger.log('OCR.space: доступ к файлу на Drive восстановлен.');
+      } catch (restoreErr) {
+        Logger.log('OCR.space: не удалось восстановить доступ: ' + restoreErr.message);
+      }
     }
   }
 }
