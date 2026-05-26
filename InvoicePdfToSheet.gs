@@ -7,7 +7,7 @@
 const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
-const SCRIPT_VERSION = '2026-05-21-ocr-gemini-batch';
+const SCRIPT_VERSION = '2026-05-26-gemini-json-fallback';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
@@ -175,7 +175,7 @@ function pdfToExtracted_(pdfFileId) {
   }
 
   const structured = step.structured || '';
-  const okStruct = geminiResponseLooksStructured_(structured);
+  const okStruct = structured ? geminiStructuredResponseIsUsable_(structured) : false;
 
   return {
     rawOcr: step.rawOcr,
@@ -183,7 +183,7 @@ function pdfToExtracted_(pdfFileId) {
     conversionOk: true,
     conversionNote: okStruct
       ? ''
-      : 'Gemini не вернул JSON/HEADER/TABLE — проверьте лог; таблица может быть пустой.',
+      : 'Gemini не вернул пригодный JSON/HEADER/TABLE — проверьте лог; таблица может быть пустой.',
     textSource: step.source || 'ocr.space',
   };
 }
@@ -210,18 +210,32 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
   }
 
   Logger.log('Gemini: разбор OCR-текста в колонки…');
-  const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey);
+  const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
   if (g && g.rateLimited) {
     return { rawOcr: ocr.text, structured: '', source: 'ocr.space', rateLimited: true };
   }
-  if (g && g.text && geminiResponseLooksStructured_(g.text)) {
-    return {
-      rawOcr: ocr.text,
-      structured: normalizeText_(g.text),
-      source: 'gemini-ocr-structure',
-    };
+  if (g && g.text) {
+    const normalized = normalizeText_(g.text);
+    if (geminiStructuredResponseIsUsable_(normalized)) {
+      return {
+        rawOcr: ocr.text,
+        structured: normalized,
+        source: 'gemini-ocr-structure',
+      };
+    }
+    if (geminiResponseLooksLikeJson_(normalized)) {
+      Logger.log('Gemini: битый JSON — повтор с форматом HEADER/TABLE (TAB)…');
+      const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+      if (g2 && g2.text && geminiStructuredResponseIsUsable_(normalizeText_(g2.text))) {
+        return {
+          rawOcr: ocr.text,
+          structured: normalizeText_(g2.text),
+          source: 'gemini-ocr-structure-tab-retry',
+        };
+      }
+    }
   }
-  Logger.log('Gemini: нет маркеров HEADER/TABLE в ответе.');
+  Logger.log('Gemini: нет пригодного JSON/HEADER/TABLE в ответе.');
   return { rawOcr: ocr.text, structured: '', source: 'ocr.space' };
 }
 
@@ -415,10 +429,26 @@ function geminiBackoffMs_(attempt, resp) {
   return Math.min(GEMINI_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), GEMINI_MAX_BACKOFF_MS);
 }
 
-function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey) {
+/** Ответ пригоден для parseInvoiceData_: валидный JSON с строками или блок HEADER/TABLE. */
+function geminiStructuredResponseIsUsable_(text) {
+  if (!text || text.length < 20) {
+    return false;
+  }
+  if (/===\s*HEADER\s*===/i.test(text) && /===\s*TABLE\s*===/i.test(text)) {
+    return true;
+  }
+  const parsed = parseGeminiJsonResponse_(text, true);
+  return !!(parsed && parsed.tableRows && parsed.tableRows.length);
+}
+
+function geminiResponseLooksLikeJson_(text) {
+  return /"rows"\s*:\s*\[/i.test(text) || /^\s*\{/.test(String(text || '').trim());
+}
+
+function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly) {
   const models = getGeminiModelsToTry_();
   for (let mi = 0; mi < models.length; mi++) {
-    const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi]);
+    const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi], tabFormatOnly);
     if (r && r.rateLimited) {
       return { rateLimited: true };
     }
@@ -433,14 +463,24 @@ function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey) {
   return null;
 }
 
-function geminiResponseLooksStructured_(text) {
-  if (!text || text.length < 20) {
-    return false;
-  }
-  if (/===\s*HEADER\s*===/i.test(text) && /===\s*TABLE\s*===/i.test(text)) {
-    return true;
-  }
-  return /"rows"\s*:\s*\[/i.test(text) && /"invoiceLine"|"seller"|"paymentDoc"/i.test(text);
+function getGeminiInvoiceTabPrompt_() {
+  return (
+    'Ты получаешь СЫРОЙ текст УПД/счёт-фактуры после OCR (таблицы могут быть «кашей» — восстанови структуру).\n' +
+    'Верни ТОЛЬКО текст в формате ниже (без markdown, без ```, без JSON):\n\n' +
+    '===HEADER===\n' +
+    'Счёт-фактура № … от …\n' +
+    'Продавец: …\n' +
+    'К платежно-расчетному документу № …\n' +
+    'Основание передачи …\n' +
+    '===TABLE===\n' +
+    'Строки таблицы: ровно ' +
+    CANONICAL_UPD_HEADERS.length +
+    ' колонок в строке, разделитель — символ TAB (\\t).\n' +
+    'Первая строка TABLE — заголовки как в УПД (можно опустить, если ясно из OCR).\n' +
+    'Далее — ВСЕ позиции товаров по № п/п, без строки «Всего к оплате».\n' +
+    '===END===\n' +
+    'Не выдумывай суммы. Числа — как в OCR.'
+  );
 }
 
 function getGeminiInvoicePrompt_() {
@@ -462,30 +502,19 @@ function getGeminiInvoicePrompt_() {
     'declaration',
   ];
   return (
-    'Ты получаешь СЫРОЙ текст УПД/счёт-фактуры после OCR (таблицы могут быть «кашей» — восстанови структуру).\n' +
-    'Верни ТОЛЬКО валидный JSON (без markdown, без ```), одной строкой или с переносами:\n' +
-    '{\n' +
-    '  "invoiceLine": "Счёт-фактура № … от …",\n' +
-    '  "seller": "…",\n' +
-    '  "paymentDoc": "…",\n' +
-    '  "basis": "…",\n' +
-    '  "rows": [\n' +
-    '    {"seq":"1","name":"…","productCode":"","unitCode":"796","unit":"шт","qty":"…","price":"…",' +
-    '"costNoVat":"…","excise":"","vatRate":"20%","vatAmount":"…","costWithVat":"…",' +
-    '"countryCode":"","countryName":"","declaration":""}\n' +
-    '  ]\n' +
-    '}\n' +
-    'Поля rows — ВСЕ позиции товаров из OCR по порядку № п/п. Ключи строк: ' +
+    getGeminiInvoiceTabPrompt_() +
+    '\n\nЗапасной формат (только если TAB неудобен): валидный JSON без markdown:\n' +
+    '{"invoiceLine":"…","seller":"…","paymentDoc":"…","basis":"…","rows":[' +
+    '{"seq":"1","name":"…","productCode":"","unitCode":"796","unit":"шт","qty":"…","price":"…",' +
+    '"costNoVat":"…","excise":"","vatRate":"22%","vatAmount":"…","costWithVat":"…",' +
+    '"countryCode":"","countryName":"","declaration":""}]}\n' +
+    'Ключи rows: ' +
     colKeys.join(', ') +
-    '.\n' +
-    'Не выдумывай суммы. Без итогов «Всего к оплате».\n' +
-    'Если JSON не получается — запасной формат: ===HEADER=== … ===TABLE=== (TAB, ' +
-    CANONICAL_UPD_HEADERS.length +
-    ' колонок) … ===END===.'
+    '. Предпочитай TAB-формат HEADER/TABLE.'
   );
 }
 
-function tryGeminiTextExtract_(plainText, apiKey, modelName) {
+function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
   const model = modelName || GEMINI_MODEL;
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' +
@@ -502,7 +531,7 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName) {
     );
   }
   const prompt =
-    getGeminiInvoicePrompt_() +
+    (tabFormatOnly ? getGeminiInvoiceTabPrompt_() : getGeminiInvoicePrompt_()) +
     '\n\n--- Полный OCR-текст документа ---\n\n' +
     snippet;
 
@@ -559,7 +588,7 @@ function parseInvoiceData_(pack) {
   }
 
   const structured = pack.externalStructured || '';
-  const fromJson = parseGeminiJsonResponse_(structured);
+  const fromJson = parseGeminiJsonResponse_(structured, false);
   if (fromJson) {
     let note = pack.conversionNote || '';
     if (!fromJson.tableRows.length) {
@@ -604,7 +633,11 @@ function emptyParsedInvoice_(note) {
   };
 }
 
-function parseGeminiJsonResponse_(text) {
+/**
+ * @param {string} text
+ * @param {boolean} silent — не писать в лог (для проверки usable)
+ */
+function parseGeminiJsonResponse_(text, silent) {
   let raw = String(text || '').trim();
   if (!raw) {
     return null;
@@ -615,17 +648,129 @@ function parseGeminiJsonResponse_(text) {
   }
   const start = raw.indexOf('{');
   const end = raw.lastIndexOf('}');
-  if (start === -1 || end <= start) {
+  if (start === -1) {
     return null;
   }
-  let obj;
-  try {
-    obj = JSON.parse(raw.substring(start, end + 1));
-  } catch (e) {
-    Logger.log('Gemini JSON: ' + e.message);
+  const jsonSlice = end > start ? raw.substring(start, end + 1) : raw.substring(start);
+  let obj = tryParseGeminiJsonObject_(jsonSlice, silent);
+  if (!obj) {
+    const rowObjs = extractRowObjectsFromJsonText_(raw);
+    if (rowObjs.length) {
+      obj = extractScalarFieldsFromJsonText_(raw) || {};
+      obj.rows = rowObjs;
+      if (!silent) {
+        Logger.log('Gemini JSON: извлечено строк из битого ответа: ' + rowObjs.length);
+      }
+    }
+  }
+  if (!obj) {
     return null;
   }
   return geminiJsonObjectToParsed_(obj);
+}
+
+function tryParseGeminiJsonObject_(jsonSlice, silent) {
+  try {
+    return JSON.parse(jsonSlice);
+  } catch (e) {
+    if (!silent) {
+      Logger.log('Gemini JSON: ' + e.message);
+    }
+  }
+  const repaired = repairGeminiJsonString_(jsonSlice);
+  if (repaired !== jsonSlice) {
+    try {
+      const obj = JSON.parse(repaired);
+      if (!silent) {
+        Logger.log('Gemini JSON: восстановлено (repair).');
+      }
+      return obj;
+    } catch (e2) {
+      if (!silent) {
+        Logger.log('Gemini JSON (repair): ' + e2.message);
+      }
+    }
+  }
+  return null;
+}
+
+function repairGeminiJsonString_(s) {
+  let t = String(s || '').trim();
+  t = t.replace(/,\s*([}\]])/g, '$1');
+  t = t
+    .split('')
+    .map(function (ch) {
+      const code = ch.charCodeAt(0);
+      return code < 32 && code !== 9 && code !== 10 && code !== 13 ? ' ' : ch;
+    })
+    .join('');
+  const openBraces = (t.match(/\{/g) || []).length;
+  const closeBraces = (t.match(/\}/g) || []).length;
+  const openBrackets = (t.match(/\[/g) || []).length;
+  const closeBrackets = (t.match(/\]/g) || []).length;
+  for (let i = 0; i < openBrackets - closeBrackets; i++) {
+    t += ']';
+  }
+  for (let j = 0; j < openBraces - closeBraces; j++) {
+    t += '}';
+  }
+  return t;
+}
+
+function extractScalarFieldsFromJsonText_(text) {
+  const out = {};
+  const fields = ['invoiceLine', 'seller', 'paymentDoc', 'basis'];
+  for (let i = 0; i < fields.length; i++) {
+    const key = fields[i];
+    const re = new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"', 'i');
+    const m = String(text || '').match(re);
+    if (m) {
+      out[key] = m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Из битого JSON вытаскивает целые объекты в массиве rows. */
+function extractRowObjectsFromJsonText_(text) {
+  const slice = String(text || '');
+  const rowsKey = slice.search(/"rows"\s*:\s*\[/i);
+  const searchFrom = rowsKey >= 0 ? rowsKey : 0;
+  const out = [];
+  let depth = 0;
+  let start = -1;
+  for (let i = searchFrom; i < slice.length; i++) {
+    const ch = slice.charAt(i);
+    if (ch === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const chunk = slice.substring(start, i + 1);
+        if (/"(name|seq)"\s*:/i.test(chunk)) {
+          try {
+            const row = JSON.parse(chunk);
+            if (row && (row.name || row.seq)) {
+              out.push(row);
+            }
+          } catch (ignore) {
+            const fixed = repairGeminiJsonString_(chunk);
+            try {
+              const row2 = JSON.parse(fixed);
+              if (row2 && (row2.name || row2.seq)) {
+                out.push(row2);
+              }
+            } catch (ignore2) {}
+          }
+        }
+        start = -1;
+      }
+    }
+  }
+  return out;
 }
 
 function geminiJsonObjectToParsed_(obj) {
@@ -824,7 +969,7 @@ function buildSheetDataRowsMatrix_(items) {
     if (!p.tableRows.length) {
       matrix.push(
         padRow_(
-          [it.fileName, p.invoiceLine, p.seller, p.paymentDoc].concat(padRow_(p.tableHeader, tableCols)).concat([p.basis]),
+          [it.fileName, p.invoiceLine, p.seller, p.paymentDoc].concat(padRow_([], tableCols)).concat([p.basis]),
           totalCols
         )
       );
