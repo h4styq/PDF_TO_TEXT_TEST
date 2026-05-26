@@ -7,7 +7,7 @@
 const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
 const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
-const SCRIPT_VERSION = '2026-05-26-gemini-json-fallback';
+const SCRIPT_VERSION = '2026-05-21-slim-ocr-gemini';
 
 const GEMINI_MODEL = 'gemini-2.5-flash';
 const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
