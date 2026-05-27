@@ -70,13 +70,16 @@ function showRecognitionSetupHelp() {
       '»\n\n' +
       'Свойства скрипта (Apps Script → Свойства проекта → Свойства скрипта):\n' +
       '• OCR_SPACE_API_KEY — https://ocr.space/ocrapi\n' +
-      '• GEMINI_API_KEY — https://aistudio.google.com/apikey\n\n' +
-      'OCR отдаёт полный сырой текст (без обрезки в скрипте). Gemini раскладывает его в ' +
+      '• GEMINI_API_KEY — https://aistudio.google.com/apikey\n' +
+      '• GEMINI_MODELS_PER_PDF=1 — один запрос Gemini на PDF (Free tier)\n' +
+      '• GEMINI_USE_JSON_SCHEMA=false — не тратить квоту на JSON schema\n' +
+      '• GEMINI_TAB_RETRY=false — без второго запроса TAB\n\n' +
+      'OCR → Gemini HEADER/TABLE → ' +
       CANONICAL_UPD_HEADERS.length +
-      ' граф УПД.\n\n' +
+      ' граф УПД. При HTTP 429 (квота) — стоп пакета.\n\n' +
       'Пауза между PDF: ' +
       Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
-      ' с (лимит Gemini).\n' +
+      ' с.\n' +
       'Версия: ' +
       SCRIPT_VERSION
   );
@@ -147,7 +150,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     }
   }
 
-  writeParsedRows_(sheet, items, maxCols);
+  writeParsedRows_(sheet, items, maxCols, folder.getUrl());
   const n = items.length;
   let summary =
     n === 0
@@ -271,18 +274,22 @@ function tryOcrThenGeminiExtract_(pdfFileId) {
     if (ok) {
       return ok;
     }
-    Logger.log('Gemini HEADER/TABLE: не разобран, повтор TAB (' + n.length + ' симв.)…');
-    const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
-    if (g2 && g2.rateLimited) {
-      return geminiRateLimitReturn_(ocr.text, g2.httpCode || 429, g2.quotaExceeded);
-    }
-    if (g2 && g2.text) {
-      const n2 = normalizeGeminiStructuredText_(g2.text);
-      bestText = geminiKeepBestText_(bestText, n2);
-      const ok2 = tryReturnIfUsable(n2, 'gemini-ocr-structure-tab-retry', g2.model);
-      if (ok2) {
-        return ok2;
+    if (geminiUseTabRetry_()) {
+      Logger.log('Gemini HEADER/TABLE: не разобран, повтор TAB (' + n.length + ' симв.)…');
+      const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+      if (g2 && g2.rateLimited) {
+        return geminiRateLimitReturn_(ocr.text, g2.httpCode || 429, g2.quotaExceeded);
       }
+      if (g2 && g2.text) {
+        const n2 = normalizeGeminiStructuredText_(g2.text);
+        bestText = geminiKeepBestText_(bestText, n2);
+        const ok2 = tryReturnIfUsable(n2, 'gemini-ocr-structure-tab-retry', g2.model);
+        if (ok2) {
+          return ok2;
+        }
+      }
+    } else {
+      diag.push('TAB-retry отключён (экономия квоты)');
     }
   } else {
     diag.push('HEADER/TABLE: API не вернул текст');
@@ -1461,8 +1468,10 @@ function padRow_(cells, width) {
   return out;
 }
 
-function writeParsedRows_(sheet, items, maxTableCols) {
-  sheet.clearContents();
+function writeParsedRows_(sheet, items, maxTableCols, folderUrl) {
+  if (!items || !items.length) {
+    return;
+  }
   const tableCols = Math.max(maxTableCols, CANONICAL_UPD_HEADERS.length);
   const globalHeader = [
     'Файл',
@@ -1474,11 +1483,30 @@ function writeParsedRows_(sheet, items, maxTableCols) {
     .concat(['Основание передачи / счет']);
   const totalCols = globalHeader.length;
 
-  sheet.getRange(1, 1, 1, totalCols).setValues([globalHeader]);
-  let rowPtr = 2;
+  const lastRow = sheet.getLastRow();
+  const headerCell = sheet.getRange(1, 1, 1, 1).getValue();
+  const needHeader = lastRow < 1 || String(headerCell) !== 'Файл';
+  if (needHeader && lastRow < 1) {
+    sheet.getRange(1, 1, 1, totalCols).setValues([globalHeader]);
+  } else if (needHeader) {
+    // Лист уже содержит данные, поэтому заголовок не перезаписываем.
+    Logger.log('writeParsedRows_: заголовок не найден (ожидается "Файл"), но данные уже есть — не перезаписываю A1.');
+  }
+
+  // Стартуем с конца существующих данных.
+  let rowPtr = Math.max(1, lastRow) + 1;
+
+  // Строка с ссылкой на папку (одна на пачку запуска).
+  const folderLabel = folderUrl ? 'Папка: ' + folderUrl : 'Папка';
+  sheet.getRange(rowPtr, 1, 1, totalCols).setValues([padRow_([folderLabel], totalCols)]);
+  rowPtr++;
+
+  const dataRows = [];
   for (let i = 0; i < items.length; i++) {
     if (i > 0) {
-      rowPtr += BLANK_ROWS_BETWEEN_PDF_FILES;
+      for (let b = 0; b < BLANK_ROWS_BETWEEN_PDF_FILES; b++) {
+        dataRows.push(padRow_([], totalCols));
+      }
     }
     const it = items[i];
     const p = it.parsed;
@@ -1486,8 +1514,7 @@ function writeParsedRows_(sheet, items, maxTableCols) {
       const single = [it.fileName, p.invoiceLine, p.seller, p.paymentDoc]
         .concat(padRow_([], tableCols))
         .concat([p.basis]);
-      sheet.getRange(rowPtr, 1, 1, totalCols).setValues([padRow_(single, totalCols)]);
-      rowPtr++;
+      dataRows.push(padRow_(single, totalCols));
       continue;
     }
     for (let r = 0; r < p.tableRows.length; r++) {
@@ -1500,8 +1527,9 @@ function writeParsedRows_(sheet, items, maxTableCols) {
       ]
         .concat(tr)
         .concat([r === 0 ? p.basis : '']);
-      sheet.getRange(rowPtr, 1, 1, totalCols).setValues([padRow_(row, totalCols)]);
-      rowPtr++;
+      dataRows.push(padRow_(row, totalCols));
     }
   }
+
+  sheet.getRange(rowPtr, 1, dataRows.length, totalCols).setValues(dataRows);
 }
