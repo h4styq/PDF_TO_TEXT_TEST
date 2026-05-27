@@ -1353,6 +1353,7 @@ function parseLooseProductTableFromText_(text) {
   }
   const lines = n.split('\n');
   const rows = [];
+  const seen = {};
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].replace(/\u00a0/g, ' ').trim();
     if (!line || /^(===|```)/.test(line)) {
@@ -1364,20 +1365,55 @@ function parseLooseProductTableFromText_(text) {
     if (/^(наименование|№\s*п\/п|код\s+вида)/i.test(line)) {
       continue;
     }
-    let cells = splitTableLine_(line);
-    if (cells.length < 3) {
+    let cells = normalizeLooseRowCells_(splitTableLine_(line));
+    if (!cells || cells.length < 3) {
       continue;
     }
-    if (cells.length > CANONICAL_UPD_HEADERS.length) {
-      cells = cells.slice(0, CANONICAL_UPD_HEADERS.length);
+    const key = cells.join('\t');
+    if (!seen[key]) {
+      rows.push(cells);
+      seen[key] = true;
     }
-    const seq = String(cells[0] || '').trim();
-    if (!/^\d{1,4}$/.test(seq)) {
+  }
+
+  // Фолбэк: Gemini иногда склеивает HEADER и TABLE в одну строку.
+  const inline = n.match(/\d{1,4}\t[^\n]+/g) || [];
+  for (let j = 0; j < inline.length; j++) {
+    const cellsInline = normalizeLooseRowCells_(splitTableLine_(inline[j]));
+    if (!cellsInline || cellsInline.length < 3) {
       continue;
     }
-    rows.push(cells);
+    const keyInline = cellsInline.join('\t');
+    if (!seen[keyInline]) {
+      rows.push(cellsInline);
+      seen[keyInline] = true;
+    }
   }
   return rows;
+}
+
+function normalizeLooseRowCells_(cells) {
+  if (!cells || !cells.length) {
+    return null;
+  }
+  let idx = -1;
+  for (let i = 0; i < cells.length; i++) {
+    if (/^\d{1,4}$/.test(String(cells[i] || '').trim())) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) {
+    return null;
+  }
+  let out = cells.slice(idx);
+  if (out.length > CANONICAL_UPD_HEADERS.length) {
+    out = out.slice(0, CANONICAL_UPD_HEADERS.length);
+  }
+  if (!/^\d{1,4}$/.test(String(out[0] || '').trim())) {
+    return null;
+  }
+  return out;
 }
 
 function parseGeminiTableSection_(text) {
