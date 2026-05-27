@@ -111,10 +111,10 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   const items = [];
   let maxCols = CANONICAL_UPD_HEADERS.length;
   let pauseNext = false;
-  let geminiHit429 = false;
+  let geminiHardStop = false;
 
   while (files.hasNext()) {
-    if (geminiHit429) {
+    if (geminiHardStop) {
       break;
     }
     if (pauseNext && PAUSE_BETWEEN_PDF_MS > 0) {
@@ -127,8 +127,8 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     try {
       const pack = pdfToExtracted_(file.getId());
       pauseNext = true;
-      if (pack.rateLimited) {
-        geminiHit429 = true;
+      if (pack.rateLimited && pack.quotaExceeded) {
+        geminiHardStop = true;
       }
       const parsed = parseInvoiceData_(pack);
       maxCols = Math.max(maxCols, parsed.tableWidth);
@@ -156,7 +156,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
     n === 0
       ? 'PDF не найдены.'
       : 'Готово: ' + n + ' PDF (OCR → Gemini). Лист «' + OUTPUT_SHEET_NAME + '».';
-  if (geminiHit429) {
+  if (geminiHardStop) {
     summary =
       'Gemini 429 (лимит): обработано ' +
       n +
@@ -165,7 +165,7 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
       '+ с и запустите снова.';
   }
   Logger.log(summary);
-  ss.toast(summary, 'Счета-фактуры', geminiHit429 ? 20 : 12);
+  ss.toast(summary, 'Счета-фактуры', geminiHardStop ? 20 : 12);
 }
 
 /**
@@ -182,6 +182,7 @@ function pdfToExtracted_(pdfFileId) {
       conversionNote: formatGemini429Note_(step.httpCode, step.quotaExceeded),
       textSource: 'gemini-429',
       rateLimited: true,
+      quotaExceeded: !!step.quotaExceeded,
     };
   }
   if (!step || !step.rawOcr || step.rawOcr.length < 30) {
@@ -651,7 +652,7 @@ function logGeminiRateLimit_(httpCode, responseText, model, mode) {
       '.'
   );
   if (responseText) {
-    Logger.log('Gemini 429 тело: ' + String(responseText).substring(0, 400));
+    Logger.log('Gemini тело ошибки: ' + String(responseText).substring(0, 400));
   }
 }
 
@@ -839,7 +840,7 @@ function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
     if (limit && limit.rateLimited) {
       return limit;
     }
-    if (limit === null && geminiApiIsRateLimited_(code, raw)) {
+    if (!limit && geminiApiIsRateLimited_(code, raw)) {
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
@@ -1001,7 +1002,7 @@ function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
     if (limit && limit.rateLimited) {
       return limit;
     }
-    if (limit === null && geminiApiIsRateLimited_(code, raw)) {
+    if (!limit && geminiApiIsRateLimited_(code, raw)) {
       Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
