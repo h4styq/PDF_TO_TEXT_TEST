@@ -1,59 +1,37 @@
 /**
- * Парсинг счетов-фактур из PDF в Google Таблицу.
+ * УПД / счета-фактуры: PDF на Drive → OCR.space (сырой текст) → Gemini (колонки) → Google Таблица.
  *
- * ВАЖНО:
- * 1) Apps Script НЕ видит диск C:\ — положите PDF в папку на Google Drive и укажите SOURCE_FOLDER_ID.
- * 2) Включите сервис: Расширения → Apps Script → Сервисы → Google Drive API (v3).
- * 3) Первый запрос может запросить разрешения на Drive и Таблицы.
- *
- * ОГРАНИЧЕНИЯ PDF В APPS SCRIPT:
- * — Текст берётся после конвертации «PDF → Google Документ». Сканы без текстового слоя дадут пустой/бесполезный текст — нужен OCR (Document AI, Cloud Vision и т.д.), это уже вне этого скрипта.
- * — Поворот страницы на 90° иногда ломает порядок строк/таблиц при конвертации; надёжнее заранее выпрямить PDF (вручную или утилитой) либо использовать OCR по изображению страницы.
- * — Если в Doc «кракозябры» (>&F, случайные латинские куски без нормального русского текста) — это не ошибка скрипта: движок Google не смог извлечь текстовый слой из вашего PDF (часто скан, нестандартные шрифты, «картинка вместо текста»). Нужен другой исходный файл (OCR → поисковый PDF) или внешний OCR/API; Apps Script сам PDF не расшифрует.
- *
- * РАСПОЗНАВАНИЕ (опционально), если конвертация PDF→Doc нечитаема:
- * — В редакторе Apps Script: Проект → Свойства проекта → Свойства скрипта — добавьте один или оба ключа:
- *   GEMINI_API_KEY — ключ с https://aistudio.google.com/apikey (модель читает PDF и возвращает структурированный текст).
- *   OCR_SPACE_API_KEY — ключ с https://ocr.space/ocrapi (распознавание PDF, на бесплатном тарифе обычно лимит ~1 МБ на файл).
- * — Приоритет: сначала Gemini, затем OCR.space. Нужен доступ к внешней сети (UrlFetchApp) при первом запуске подтвердите разрешения.
- * — Если один раз всё получилось, а при повторе с теми же PDF — нет: часто лимиты/перегрузка API (429) или нестабильный ответ модели. В скрипте включены повторные запросы и более строгий сценарий вызова внешнего API.
- * Запуск:
- * — в самой таблице: меню «Счета-фактуры (PDF)» → «Загрузить данные из папки Drive» (после сохранения скрипта обновите страницу F5);
- * — в редакторе Apps Script: список функций слева от кнопки «Выполнить» — выберите runProcessFolder (если пункта нет, проверьте ошибки подсветкой и что код в проекте этой таблицы).
+ * Свойства скрипта: OCR_SPACE_API_KEY, GEMINI_API_KEY
+ * Сервис: Google Drive API v3 (Расширения → Сервисы).
  */
-
-/** ID папки на Google Drive (из URL: .../folders/THIS_ID) */
 const SOURCE_FOLDER_ID = 'ВСТАВЬТЕ_ID_ПАПКИ';
-
-/** true — удалять временные Google Docs после чтения текста */
-const DELETE_TEMP_DOCS = true;
-
-/** Имя листа для результата (создастся, если нет) */
 const OUTPUT_SHEET_NAME = 'Счета_фактуры';
+const BLANK_ROWS_BETWEEN_PDF_FILES = 2;
+const SCRIPT_VERSION = '2026-05-21-slim-ocr-gemini';
+/** OCR.space Free: upload до 1,5 МБ; больше — сразу URL Drive. */
+const OCR_SPACE_FREE_MAX_BYTES = Math.round(1.5 * 1024 * 1024);
 
-/** Модель Gemini для чтения PDF (при ошибке 404 смените на gemini-1.5-flash или gemini-2.5-flash) */
-const GEMINI_MODEL = 'gemini-2.0-flash';
-
-/** Макс. размер PDF для отправки в Gemini inline (байт); при превышении внешний шаг пропускается */
-const MAX_GEMINI_INLINE_PDF_BYTES = 6 * 1024 * 1024;
-
-/** Повторы при 429/5xx и «пустом» ответе Gemini (нестабильность API и модели) */
-const GEMINI_MAX_ATTEMPTS = 4;
-const GEMINI_RETRY_BASE_DELAY_MS = 2000;
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const GEMINI_FALLBACK_MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite'];
+const GEMINI_TEXT_MAX_ATTEMPTS = 2;
+const GEMINI_RETRY_BASE_DELAY_MS = 5000;
+const GEMINI_MAX_BACKOFF_MS = 20000;
+/** false = только HEADER/TABLE (1 запрос на PDF, экономия Free tier). true — свойство GEMINI_USE_JSON_SCHEMA=true */
+const GEMINI_USE_JSON_SCHEMA_DEFAULT = false;
+/** Сколько моделей пробовать на один PDF (1 = минимум запросов). */
+const GEMINI_MODELS_PER_PDF_DEFAULT = 1;
+/** false = не делать второй запрос TAB (экономия квоты Free tier). */
+const GEMINI_TAB_RETRY_DEFAULT = false;
+const GEMINI_OCR_TEXT_MAX_CHARS = 120000;
+const PAUSE_BETWEEN_PDF_MS = 20000;
 const OCR_SPACE_MAX_ATTEMPTS = 3;
-
-/**
- * Заголовки граф таблицы товаров (УПД / счёт-фактура), как в типовой форме.
- * Если в документе больше колонок — справа добавятся «Доп. столбец N».
- */
-const USE_CANONICAL_TABLE_HEADERS = true;
 const CANONICAL_UPD_HEADERS = [
-  'Код товара/работ, услуг',
   '№ п/п',
   'Наименование товара (описание выполненных работ, оказанных услуг), имущественного права',
   'Код вида товара',
   'Единица измерения: код',
   'Единица измерения: условное обозначение (национальное)',
+  'Количество (объем)',
   'Цена (тариф) за единицу измерения',
   'Стоимость товаров (работ, услуг), имущественных прав без налога — всего',
   'В том числе сумма акциза',
@@ -65,52 +43,59 @@ const CANONICAL_UPD_HEADERS = [
   'Регистрационный номер декларации на товары или регистрационный номер партии товара, подлежащего прослеживаемости',
 ];
 
-/**
- * Меню в таблице — чтобы не искать runProcessFolder в редакторе.
- * Если меню не появилось: сохраните проект (Ctrl+S), вернитесь в таблицу и обновите страницу.
- */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Счета-фактуры (PDF)')
-    .addItem('Загрузить данные из папки Drive', 'runProcessFolder')
-    .addSeparator()
-    .addItem('Как подключить распознавание (Gemini / OCR)', 'showRecognitionSetupHelp')
+    .addItem('Загрузить из папки Drive', 'runProcessFolder')
+    .addItem('Как подключить (OCR + Gemini)', 'showRecognitionSetupHelp')
     .addToUi();
 }
 
-/**
- * Точка входа: обходит все PDF в папке, пишет строки на активный spreadsheet
- * (файл таблицы, в котором открыт редактор скрипта, или привязанный к контейнеру).
- */
 function runProcessFolder() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
-    throw new Error('Откройте таблицу и привязанный к ней скрипт, либо вызовите runProcessFolderForSpreadsheet(id).');
+    throw new Error('Откройте таблицу с привязанным скриптом.');
   }
   processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, ss.getId());
 }
 
-function countOutputRows_(items) {
-  let n = 0;
-  for (let i = 0; i < items.length; i++) {
-    const r = items[i].parsed.tableRows.length;
-    n += r === 0 ? 1 : r;
-  }
-  return n;
-}
-
-/**
- * Если скрипт отдельный (standalone), можно передать ID таблицы.
- */
 function runProcessFolderForSpreadsheet(spreadsheetId) {
   processFolderIntoSpreadsheet_(SOURCE_FOLDER_ID, spreadsheetId);
 }
 
+function showRecognitionSetupHelp() {
+  SpreadsheetApp.getUi().alert(
+    'PDF → OCR.space → Gemini → лист «' +
+      OUTPUT_SHEET_NAME +
+      '»\n\n' +
+      'Свойства скрипта (Apps Script → Свойства проекта → Свойства скрипта):\n' +
+      '• OCR_SPACE_API_KEY — https://ocr.space/ocrapi\n' +
+      '• GEMINI_API_KEY — https://aistudio.google.com/apikey\n' +
+      '• GEMINI_MODELS_PER_PDF=1 — один запрос Gemini на PDF (Free tier)\n' +
+      '• GEMINI_USE_JSON_SCHEMA=false — не тратить квоту на JSON schema\n' +
+      '• GEMINI_TAB_RETRY=false — без второго запроса TAB\n\n' +
+      'OCR → Gemini HEADER/TABLE → ' +
+      CANONICAL_UPD_HEADERS.length +
+      ' граф УПД. При HTTP 429 (квота) — стоп пакета.\n\n' +
+      'Пауза между PDF: ' +
+      Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+      ' с.\n' +
+      'Версия: ' +
+      SCRIPT_VERSION
+  );
+}
+
 function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
-  Logger.log('Старт: папка Drive id=' + folderId + ', таблица id=' + spreadsheetId);
+  Logger.log('Старт ' + SCRIPT_VERSION + ', папка=' + folderId);
   if (!folderId || folderId.indexOf('ВСТАВЬТЕ') !== -1) {
-    const msg = 'Задайте SOURCE_FOLDER_ID в коде (ID папки из URL Google Drive).';
-    Logger.log(msg);
+    const msg = 'Задайте SOURCE_FOLDER_ID в коде.';
+    SpreadsheetApp.openById(spreadsheetId).toast(msg, 'Счета-фактуры', 12);
+    throw new Error(msg);
+  }
+
+  const props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('OCR_SPACE_API_KEY') || !props.getProperty('GEMINI_API_KEY')) {
+    const msg = 'Нужны OCR_SPACE_API_KEY и GEMINI_API_KEY в свойствах скрипта.';
     SpreadsheetApp.openById(spreadsheetId).toast(msg, 'Счета-фактуры', 12);
     throw new Error(msg);
   }
@@ -120,900 +105,1388 @@ function processFolderIntoSpreadsheet_(folderId, spreadsheetId) {
   let sheet = ss.getSheetByName(OUTPUT_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(OUTPUT_SHEET_NAME);
-    Logger.log('Создан лист: ' + OUTPUT_SHEET_NAME);
   }
 
   const files = folder.getFilesByType(MimeType.PDF);
-  const rows = [];
-  let maxTableCols = 0;
+  const items = [];
+  let maxCols = CANONICAL_UPD_HEADERS.length;
+  let pauseNext = false;
+  let geminiHardStop = false;
 
   while (files.hasNext()) {
+    if (geminiHardStop) {
+      break;
+    }
+    if (pauseNext && PAUSE_BETWEEN_PDF_MS > 0) {
+      Utilities.sleep(PAUSE_BETWEEN_PDF_MS);
+    }
+    pauseNext = false;
+
     const file = files.next();
     Logger.log('PDF: ' + file.getName());
     try {
       const pack = pdfToExtracted_(file.getId());
-      const parsed = parseInvoiceData_(
-        pack.text,
-        pack.docTable,
-        pack.textLength,
-        pack.conversionOk,
-        pack.conversionNote
-      );
-      maxTableCols = Math.max(maxTableCols, parsed.tableWidth);
-      rows.push({ fileName: file.getName(), fileId: file.getId(), parsed: parsed });
+      pauseNext = true;
+      if (pack.rateLimited && pack.quotaExceeded) {
+        geminiHardStop = true;
+      }
+      const parsed = parseInvoiceData_(pack);
+      maxCols = Math.max(maxCols, parsed.tableWidth);
+      items.push({ fileName: file.getName(), parsed: parsed });
     } catch (e) {
-      Logger.log('Ошибка по файлу ' + file.getName() + ': ' + e.message);
-      rows.push({
+      Logger.log('Ошибка: ' + e.message);
+      items.push({
         fileName: file.getName(),
-        fileId: file.getId(),
         parsed: {
           invoiceLine: 'ОШИБКА: ' + e.message,
           seller: '',
           paymentDoc: '',
-          tableHeader: [],
+          tableHeader: CANONICAL_UPD_HEADERS.slice(),
           tableRows: [],
           basis: '',
-          tableWidth: 0,
+          tableWidth: CANONICAL_UPD_HEADERS.length,
         },
       });
     }
   }
 
-  writeParsedRows_(sheet, rows, maxTableCols);
-
-  const pdfCount = rows.length;
-  const outRows = countOutputRows_(rows);
-  const summary =
-    pdfCount === 0
-      ? 'В папке не найдено PDF. Проверьте папку и права доступа.'
-      : 'Обработано PDF: ' + pdfCount + '. Строк данных (с заголовком): ' + (outRows + 1) + '. Лист «' + OUTPUT_SHEET_NAME + '».';
+  writeParsedRows_(sheet, items, maxCols, folder.getUrl());
+  const n = items.length;
+  let summary =
+    n === 0
+      ? 'PDF не найдены.'
+      : 'Готово: ' + n + ' PDF (OCR → Gemini). Лист «' + OUTPUT_SHEET_NAME + '».';
+  if (geminiHardStop) {
+    summary =
+      'Gemini 429 (лимит): обработано ' +
+      n +
+      ' PDF, остальные пропущены. Подождите ' +
+      Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+      '+ с и запустите снова.';
+  }
   Logger.log(summary);
-  ss.toast(summary, 'Счета-фактуры (PDF)', 12);
+  ss.toast(summary, 'Счета-фактуры', geminiHardStop ? 20 : 12);
 }
 
 /**
- * Конвертирует PDF в Google Doc, забирает плоский текст и пытается прочитать таблицы Document (структура УПД).
- * @return {{text:string, textLength:number, docTable:Object|null, conversionOk:boolean, conversionNote:string}}
+ * @return {{rawOcr:string, externalStructured:string, conversionOk:boolean, conversionNote:string, textSource:string}}
  */
 function pdfToExtracted_(pdfFileId) {
-  const name = 'tmp_pdf_' + new Date().getTime();
-  const resource = {
-    name: name,
-    mimeType: MimeType.GOOGLE_DOCS,
-  };
-  const copied = Drive.Files.copy(resource, pdfFileId, { supportsAllDrives: true, fields: 'id' });
-  const docId = copied.id;
-  const doc = DocumentApp.openById(docId);
-  const body = doc.getBody();
-  let text = body.getText();
-  let quality = analyzeDocTextQuality_(text);
-  let docTable = null;
-  const props = PropertiesService.getScriptProperties();
-  const hasGemini = !!props.getProperty('GEMINI_API_KEY');
+  const step = tryOcrThenGeminiExtract_(pdfFileId);
+  if (step && step.rateLimited) {
+    const ocrOk = step.rawOcr && step.rawOcr.length >= 30;
+    return {
+      rawOcr: ocrOk ? step.rawOcr : '',
+      externalStructured: '',
+      conversionOk: ocrOk,
+      conversionNote: formatGemini429Note_(step.httpCode, step.quotaExceeded),
+      textSource: 'gemini-429',
+      rateLimited: true,
+      quotaExceeded: !!step.quotaExceeded,
+    };
+  }
+  if (!step || !step.rawOcr || step.rawOcr.length < 30) {
+    return {
+      rawOcr: '',
+      externalStructured: '',
+      conversionOk: false,
+      conversionNote: 'OCR.space не вернул текст (проверьте ключ, доступ к файлу, тариф OCR).',
+      textSource: 'none',
+      rateLimited: false,
+    };
+  }
 
-  if (quality.readable) {
-    docTable = extractMainGoodsTableFromDoc_(body);
-    const tableEmpty = !docTable || !docTable.rows || !docTable.rows.length;
-    if (tableEmpty && hasGemini) {
-      Logger.log(
-        'Текст после PDF→Doc прошёл проверку, но таблица товаров не извлечена — вызываем внешнее распознавание (Gemini/OCR).'
-      );
-      const improved = tryExternalTextExtraction_(pdfFileId);
-      if (improved && improved.text) {
-        const merged = mergeExternalExtractIntoPlainText_(improved.text);
-        const q2 = analyzeDocTextQuality_(merged);
-        if (q2.readable || looksStructuredGemini_(improved.text) || merged.length > text.length * 0.5) {
-          text = merged;
-          docTable = null;
-          if (q2.readable || looksStructuredGemini_(improved.text)) {
-            quality = { readable: true, reason: '' };
-          } else {
-            quality = q2;
-          }
-          Logger.log('Подставлен текст из ' + improved.source + ' (таблица из Doc была пуста).');
-        }
-      }
-    }
-  } else {
-    Logger.log('Конвертация PDF→Doc нечитаема: ' + quality.reason);
-    const improved = tryExternalTextExtraction_(pdfFileId);
-    if (improved && improved.text) {
-      const merged = mergeExternalExtractIntoPlainText_(improved.text);
-      text = merged;
-      const q3 = analyzeDocTextQuality_(text);
-      if (q3.readable || looksStructuredGemini_(improved.text)) {
-        quality = { readable: true, reason: '' };
-      } else {
-        quality = q3;
-      }
-      Logger.log('После внешнего распознавания (' + improved.source + '): readable=' + quality.readable);
-      docTable = null;
-    }
+  const structured = step.structured || '';
+  const okStruct = structured ? geminiStructuredResponseIsUsable_(structured) : false;
+  let note = '';
+  if (!okStruct) {
+    note = step.geminiDiag
+      ? 'Gemini: ответ не разобран. ' + step.geminiDiag
+      : structured
+        ? 'Gemini: текст есть, но таблица не разобрана — см. лог parseInvoiceData_.'
+        : 'Gemini: API не вернул текст (ключ, модель, 429 — см. журнал).';
   }
-  if (DELETE_TEMP_DOCS) {
-    DriveApp.getFileById(docId).setTrashed(true);
-  }
+
   return {
-    text: text,
-    textLength: text ? text.length : 0,
-    docTable: docTable,
-    conversionOk: quality.readable,
-    conversionNote: quality.reason,
+    rawOcr: step.rawOcr,
+    externalStructured: structured,
+    conversionOk: true,
+    conversionNote: note,
+    textSource: step.source || 'ocr.space',
+    rateLimited: false,
+    geminiDiag: step.geminiDiag || '',
   };
-}
-
-/** Склеивает ответ Gemini (маркеры) или возвращает сырой текст OCR. */
-function mergeExternalExtractIntoPlainText_(raw) {
-  if (!raw) {
-    return '';
-  }
-  const n = normalizeText_(raw);
-  if (n.indexOf('===HEADER===') === -1) {
-    return n;
-  }
-  const hm = n.match(/===HEADER===\s*([\s\S]*?)(?====TABLE===|$)/i);
-  const tm = n.match(/===TABLE===\s*([\s\S]*?)(?====END===|$)/i);
-  const h = hm ? hm[1].trim() : '';
-  const t = tm ? tm[1].trim() : '';
-  if (!h && !t) {
-    return n.replace(/===HEADER===|===TABLE===|===END===/gi, '').trim();
-  }
-  return (h + (h && t ? '\n\n' : '') + t).trim();
-}
-
-/** Ответ модели похож на ожидаемый формат (даже если эвристика analyzeDocTextQuality строгая). */
-function looksStructuredGemini_(raw) {
-  if (!raw || raw.length < 80) {
-    return false;
-  }
-  const low = raw.toLowerCase();
-  const hasTabs = raw.indexOf('\t') !== -1;
-  if (low.indexOf('===header===') !== -1 && low.indexOf('===table===') !== -1 && hasTabs) {
-    return true;
-  }
-  if (/(счет|универсальн)[\s\S]{0,200}(фактур|передаточн)/i.test(raw) && hasTabs) {
-    return true;
-  }
-  const cyr = (raw.match(/[а-яА-ЯёЁ]/g) || []).length;
-  return hasTabs && cyr > 100;
 }
 
 /**
- * Если в свойствах скрипта задан ключ — пробуем извлечь читаемый текст из исходного PDF.
- * @return {{text:string, source:string}|null}
+ * @return {{rawOcr:string, structured:string, source:string, rateLimited?:boolean, httpCode?:number, geminiDiag?:string}|null}
  */
-function tryExternalTextExtraction_(pdfFileId) {
-  const props = PropertiesService.getScriptProperties();
-  const geminiKey = props.getProperty('GEMINI_API_KEY');
-  if (geminiKey) {
-    const g = tryGeminiPdfExtract_(pdfFileId, geminiKey);
-    if (g && g.text && g.text.length > 80) {
-      const merged = mergeExternalExtractIntoPlainText_(g.text);
-      if (analyzeDocTextQuality_(merged).readable || looksStructuredGemini_(g.text)) {
-        return { text: g.text, source: 'gemini' };
+function tryOcrThenGeminiExtract_(pdfFileId) {
+  const ocrKey = PropertiesService.getScriptProperties().getProperty('OCR_SPACE_API_KEY');
+  const geminiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!ocrKey) {
+    return null;
+  }
+
+  Logger.log('OCR.space: распознавание PDF (полный текст)…');
+  const ocr = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
+  if (!ocr || !ocr.text) {
+    return null;
+  }
+  Logger.log('OCR.space: ' + ocr.text.length + ' симв.' + (ocr.viaUrl ? ' (URL Drive)' : ' (upload)'));
+
+  if (!geminiKey) {
+    Logger.log('Gemini: GEMINI_API_KEY не задан в свойствах скрипта.');
+    return {
+      rawOcr: ocr.text,
+      structured: '',
+      source: 'ocr.space',
+      geminiDiag: 'нет GEMINI_API_KEY',
+    };
+  }
+
+  let bestText = '';
+  const diag = [];
+
+  function finishOk(structured, source) {
+    return { rawOcr: ocr.text, structured: structured, source: source, geminiDiag: '' };
+  }
+
+  function tryReturnIfUsable(text, source, modelLabel) {
+    if (!text || text.length < 10) {
+      return null;
+    }
+    if (geminiStructuredResponseIsUsable_(text)) {
+      Logger.log('Gemini OK [' + source + ']' + (modelLabel ? ' ' + modelLabel : '') + ': ' + text.length + ' симв.');
+      return finishOk(text, source);
+    }
+    return null;
+  }
+
+  Logger.log('Gemini: HEADER/TABLE (1 запрос на PDF, без JSON schema по умолчанию)…');
+  const g = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, false);
+  if (g && g.rateLimited) {
+    return geminiRateLimitReturn_(ocr.text, g.httpCode || 429, g.quotaExceeded);
+  }
+  if (g && g.text) {
+    const n = normalizeGeminiStructuredText_(g.text);
+    bestText = geminiKeepBestText_(bestText, n);
+    const ok = tryReturnIfUsable(n, 'gemini-ocr-structure', g.model);
+    if (ok) {
+      return ok;
+    }
+    if (geminiUseTabRetry_()) {
+      Logger.log('Gemini HEADER/TABLE: не разобран, повтор TAB (' + n.length + ' симв.)…');
+      const g2 = tryGeminiStructureFromOcrTextAllModels_(ocr.text, geminiKey, true);
+      if (g2 && g2.rateLimited) {
+        return geminiRateLimitReturn_(ocr.text, g2.httpCode || 429, g2.quotaExceeded);
       }
-      Logger.log('Gemini: ответ есть, но слабый по качеству — при наличии ключа пробуем OCR.space');
+      if (g2 && g2.text) {
+        const n2 = normalizeGeminiStructuredText_(g2.text);
+        bestText = geminiKeepBestText_(bestText, n2);
+        const ok2 = tryReturnIfUsable(n2, 'gemini-ocr-structure-tab-retry', g2.model);
+        if (ok2) {
+          return ok2;
+        }
+      }
+    } else {
+      diag.push('TAB-retry отключён (экономия квоты)');
+    }
+  } else {
+    diag.push('HEADER/TABLE: API не вернул текст');
+  }
+
+  if (geminiUseJsonSchema_()) {
+    Logger.log('Gemini: JSON (schema / mime)…');
+  }
+  const fromSchema = geminiUseJsonSchema_() ? tryGeminiJsonSchemaFromOcrTextAllModels_(ocr.text, geminiKey) : null;
+  if (fromSchema && fromSchema.rateLimited) {
+    return geminiRateLimitReturn_(ocr.text, fromSchema.httpCode || 429, fromSchema.quotaExceeded);
+  }
+  if (fromSchema && fromSchema.text) {
+    const nSchema = normalizeGeminiStructuredText_(fromSchema.text);
+    bestText = geminiKeepBestText_(bestText, nSchema);
+    const okSchema = tryReturnIfUsable(nSchema, 'gemini-json-schema', fromSchema.model);
+    if (okSchema) {
+      return okSchema;
+    }
+    diag.push('JSON: текст ' + nSchema.length + ' симв., строки товаров не извлечены');
+  } else if (geminiUseJsonSchema_()) {
+    diag.push('JSON: нет ответа');
+  }
+
+  if (bestText.length >= 10) {
+    Logger.log(
+      'Gemini: сохранён лучший ответ для разбора (' +
+        bestText.length +
+        ' симв.), начало: ' +
+        bestText.substring(0, 280).replace(/\n/g, ' ')
+    );
+    return {
+      rawOcr: ocr.text,
+      structured: bestText,
+      source: 'gemini-ocr-best-effort',
+      geminiDiag: diag.join('; '),
+    };
+  }
+
+  const summary = diag.length ? diag.join('; ') : 'все модели без текста в ответе';
+  Logger.log('Gemini: ' + summary + '. Проверьте GEMINI_API_KEY, квоту, 429 в логе выше.');
+  return { rawOcr: ocr.text, structured: '', source: 'ocr.space', geminiDiag: summary };
+}
+
+function geminiKeepBestText_(currentBest, candidate) {
+  const c = String(candidate || '').trim();
+  if (!c) {
+    return currentBest || '';
+  }
+  if (!currentBest || c.length > currentBest.length) {
+    return c;
+  }
+  return currentBest;
+}
+
+function ocrSpaceCollectText_(json) {
+  const parts = [];
+  const list = json.ParsedResults || [];
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i] && list[i].ParsedText;
+    if (t) {
+      parts.push(String(t));
     }
   }
-  const ocrKey = props.getProperty('OCR_SPACE_API_KEY');
-  if (ocrKey) {
-    const o = tryOcrSpacePdfExtract_(pdfFileId, ocrKey);
-    if (o && o.text && o.text.length > 40) {
-      return { text: o.text, source: 'ocr.space' };
+  return parts.join('\n\n');
+}
+
+function ocrSpacePost_(apiKey, payload) {
+  for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      Utilities.sleep(1500 * attempt);
+    }
+    const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
+      method: 'post',
+      muteHttpExceptions: true,
+      payload: payload,
+    });
+    const code = resp.getResponseCode();
+    const raw = resp.getContentText();
+    if (code === 429 || code === 503) {
+      Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
+      continue;
+    }
+    if (code !== 200) {
+      Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 350));
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (e1) {
+      continue;
+    }
+    if (json.IsErroredOnProcessing) {
+      Logger.log('OCR.space: ' + (json.ErrorMessage || json.ErrorDetails || ''));
+      continue;
+    }
+    const text = ocrSpaceCollectText_(json);
+    if (text.length > 0) {
+      return { text: text, json: json };
     }
   }
   return null;
 }
 
-function tryGeminiPdfExtract_(pdfFileId, apiKey) {
-  try {
-    const file = DriveApp.getFileById(pdfFileId);
-    const blob = file.getBlob();
-    const size = blob.getBytes().length;
-    if (size > MAX_GEMINI_INLINE_PDF_BYTES) {
-      Logger.log('Gemini: PDF слишком большой для inline: ' + size + ' байт');
-      return null;
-    }
-    const b64 = Utilities.base64Encode(blob.getBytes());
-    const url =
-      'https://generativelanguage.googleapis.com/v1beta/models/' +
-      GEMINI_MODEL +
-      ':generateContent?key=' +
-      encodeURIComponent(apiKey);
-
-    for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        Utilities.sleep(GEMINI_RETRY_BASE_DELAY_MS * (attempt - 1));
-      }
-      const bodyObj = {
-        contents: [
-          {
-            parts: [
-              { inline_data: { mime_type: 'application/pdf', data: b64 } },
-              { text: getGeminiInvoicePrompt_() },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0,
-          topP: 0.95,
-          topK: 40,
-          maxOutputTokens: 8192,
-        },
-      };
-      const resp = UrlFetchApp.fetch(url, {
-        method: 'post',
-        contentType: 'application/json',
-        muteHttpExceptions: true,
-        payload: JSON.stringify(bodyObj),
-      });
-      const code = resp.getResponseCode();
-      const respText = resp.getContentText();
-      if (code === 429 || code === 500 || code === 502 || code === 503 || code === 504) {
-        Logger.log('Gemini HTTP ' + code + ', попытка ' + attempt + '/' + GEMINI_MAX_ATTEMPTS);
-        continue;
-      }
-      if (code !== 200) {
-        Logger.log('Gemini HTTP ' + code + ': ' + respText.substring(0, 800));
-        return null;
-      }
-      let json;
-      try {
-        json = JSON.parse(respText);
-      } catch (e1) {
-        Logger.log('Gemini: не JSON, попытка ' + attempt);
-        continue;
-      }
-      if (json.error) {
-        Logger.log('Gemini API error: ' + JSON.stringify(json.error));
-        return null;
-      }
-      if (json.promptFeedback && json.promptFeedback.blockReason) {
-        Logger.log('Gemini blockReason: ' + json.promptFeedback.blockReason + ', попытка ' + attempt);
-        continue;
-      }
-      const cand = json.candidates && json.candidates[0];
-      if (!cand) {
-        Logger.log('Gemini: нет candidates ' + respText.substring(0, 400));
-        continue;
-      }
-      if (cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'MAX_TOKENS') {
-        Logger.log('Gemini finishReason: ' + cand.finishReason + ', попытка ' + attempt);
-        continue;
-      }
-      const parts = cand.content && cand.content.parts;
-      if (!parts || !parts.length) {
-        Logger.log('Gemini: пустые parts, попытка ' + attempt);
-        continue;
-      }
-      let out = '';
-      for (let i = 0; i < parts.length; i++) {
-        out += parts[i].text || '';
-      }
-      if (out.length < 40) {
-        Logger.log('Gemini: слишком короткий текст (' + out.length + ' симв.), попытка ' + attempt);
-        continue;
-      }
-      return { text: out };
-    }
-    Logger.log('Gemini: исчерпаны попытки (' + GEMINI_MAX_ATTEMPTS + ')');
-    return null;
-  } catch (e) {
-    Logger.log('Gemini: ' + e.message);
-    return null;
-  }
-}
-
-function getGeminiInvoicePrompt_() {
-  return (
-    'Извлеки данные из приложённого PDF (российский УПД или счёт-фактура). Ответ только текстом, без markdown.\n' +
-    'Строго такой формат (строки-маркеры обязательны):\n' +
-    '===HEADER===\n' +
-    'Строка: «Счёт-фактура № … от …» или «УПД № … от …» — как в документе.\n' +
-    'Строка: «Продавец:» и далее наименование продавца одной строкой.\n' +
-    'Строка: «К платежно-расчетному документу №» и номер(а).\n' +
-    'Строка с «Основание передачи (сдачи) / получения (приемки)» и текст основания; при наличии рядом «Счёт № …» — добавь в той же или следующей строке.\n' +
-    '===TABLE===\n' +
-    'Первая строка блока — заголовки граф таблицы товаров, разделённые символом TAB (табуляция).\n' +
-    'Далее каждая строка — одна строка таблицы тем же числом колонок (TAB). Не включай строку «Всего к оплате» и итоги после неё.\n' +
-    '===END===\n' +
-    'Если фрагмента нет — оставь маркер и пустую секцию. Не выдумывай суммы и реквизиты.'
-  );
-}
-
+/**
+ * OCR.space: сначала upload (все страницы ParsedResults), при неудаче — URL Drive.
+ * @return {{text:string, viaUrl:boolean}|null}
+ */
 function tryOcrSpacePdfExtract_(pdfFileId, apiKey) {
-  const MAX_OCR_SPACE_BYTES = 1024 * 1024;
   try {
     const file = DriveApp.getFileById(pdfFileId);
     const blob = file.getBlob().setContentType('application/pdf');
-    if (blob.getBytes().length > MAX_OCR_SPACE_BYTES) {
-      Logger.log('OCR.space: файл больше ~1 МБ (лимит бесплатного тарифа).');
-      return null;
+    const size = blob.getBytes().length;
+    Logger.log('OCR.space: размер файла ' + (size / 1024 / 1024).toFixed(2) + ' МБ');
+    if (size > OCR_SPACE_FREE_MAX_BYTES) {
+      Logger.log('OCR.space: > 1,5 МБ (Free) — распознавание по URL Drive…');
+      return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
     }
-    for (let attempt = 1; attempt <= OCR_SPACE_MAX_ATTEMPTS; attempt++) {
-      if (attempt > 1) {
-        Utilities.sleep(1200 * attempt);
-      }
-      const resp = UrlFetchApp.fetch('https://api.ocr.space/parse/image', {
-        method: 'post',
-        muteHttpExceptions: true,
-        payload: {
-          apikey: apiKey,
-          language: 'rus',
-          isTable: 'true',
-          OCREngine: '2',
-          detectOrientation: 'true',
-          scale: 'true',
-          file: blob,
-        },
-      });
-      const code = resp.getResponseCode();
-      const raw = resp.getContentText();
-      if (code === 429 || code === 503) {
-        Logger.log('OCR.space HTTP ' + code + ', попытка ' + attempt);
-        continue;
-      }
-      if (code !== 200) {
-        Logger.log('OCR.space HTTP ' + code + ': ' + raw.substring(0, 400));
-        return null;
-      }
-      let json;
-      try {
-        json = JSON.parse(raw);
-      } catch (ignore) {
-        Logger.log('OCR.space: ответ не JSON');
-        continue;
-      }
-      if (json.IsErroredOnProcessing) {
-        const em = json.ErrorMessage || '';
-        Logger.log('OCR.space: ' + em);
-        if (/limit|rate|many|quota/i.test(em) && attempt < OCR_SPACE_MAX_ATTEMPTS) {
-          continue;
-        }
-        return null;
-      }
-      const pr = json.ParsedResults && json.ParsedResults[0];
-      if (!pr) {
-        continue;
-      }
-      const txt = pr.ParsedText || '';
-      if (txt.length < 15 && attempt < OCR_SPACE_MAX_ATTEMPTS) {
-        continue;
-      }
-      return { text: txt };
+    const basePayload = {
+      apikey: apiKey,
+      language: 'rus',
+      isOverlayRequired: 'false',
+      isTable: 'true',
+      detectOrientation: 'true',
+      scale: 'true',
+      OCREngine: '2',
+      file: blob,
+    };
+    const r = ocrSpacePost_(apiKey, basePayload);
+    if (r && r.text && r.text.length > 15) {
+      Logger.log('OCR.space upload: ' + r.text.length + ' симв.');
+      return { text: r.text, viaUrl: false };
     }
-    return null;
+    Logger.log('OCR.space upload не удался — пробуем URL Drive…');
+    return tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file);
   } catch (e) {
     Logger.log('OCR.space: ' + e.message);
     return null;
   }
 }
 
-function showRecognitionSetupHelp() {
-  SpreadsheetApp.getUi().alert(
-    'Распознавание текста из PDF\n\n' +
-      '1) Расширения → Apps Script → слева «Свойства проекта» (шестерёнка) → «Свойства скрипта».\n\n' +
-      '2) Добавьте свойство:\n' +
-      '   • GEMINI_API_KEY — ключ: https://aistudio.google.com/apikey\n' +
-      '     (модель ' +
-      GEMINI_MODEL +
-      ' читает PDF; при ошибке модели смените константу GEMINI_MODEL в коде.)\n\n' +
-      '   ИЛИ свойство:\n' +
-      '   • OCR_SPACE_API_KEY — регистрация: https://ocr.space/ocrapi\n' +
-      '     (часто лимит ~1 МБ на файл на бесплатном плане; включено определение ориентации страницы.)\n\n' +
-      '3) Сохраните свойства и снова запустите «Загрузить данные из папки Drive». При запросе разрешите доступ к внешней сети (UrlFetchApp).\n\n' +
-      'Сначала Gemini (несколько повторов при 429/5xx и пустом ответе), при слабом ответе — OCR.space. Без ключей — только конвертация Google.\n\n' +
-      'При нестабильности: подождите минуту и повторите запуск или задайте оба ключа (OCR как запасной).'
+/** OCR.space по публичной ссылке Drive (все страницы). */
+function tryOcrSpacePdfExtractByDriveUrl_(pdfFileId, apiKey, file) {
+  const origAccess = file.getSharingAccess();
+  const origPerm = file.getSharingPermission();
+  let changedSharing = false;
+  try {
+    if (origAccess !== DriveApp.Access.ANYONE_WITH_LINK && origAccess !== DriveApp.Access.ANYONE) {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      changedSharing = true;
+      Logger.log('OCR.space: временно «доступ по ссылке» для загрузки PDF по URL.');
+    }
+    Utilities.sleep(2000);
+    const driveUrl = 'https://drive.google.com/uc?export=download&id=' + pdfFileId;
+    const r = ocrSpacePost_(apiKey, {
+      apikey: apiKey,
+      url: driveUrl,
+      filetype: 'PDF',
+      language: 'rus',
+      isOverlayRequired: 'false',
+      isTable: 'true',
+      detectOrientation: 'true',
+      scale: 'true',
+      OCREngine: '2',
+    });
+    if (r && r.text && r.text.length > 15) {
+      Logger.log('OCR.space (URL): получен текст (' + r.text.length + ' симв.).');
+      return { text: r.text, viaUrl: true };
+    }
+    Logger.log('OCR.space (URL): не удалось распознать.');
+    return null;
+  } catch (e) {
+    Logger.log('OCR.space (URL): ' + e.message);
+    return null;
+  } finally {
+    if (changedSharing) {
+      try {
+        file.setSharing(origAccess, origPerm);
+        Logger.log('OCR.space: доступ к файлу на Drive восстановлен.');
+      } catch (restoreErr) {
+        Logger.log('OCR.space: не удалось восстановить доступ: ' + restoreErr.message);
+      }
+    }
+  }
+}
+
+function isDeprecatedGeminiModel_(name) {
+  return /^gemini-1\.5-(flash|pro)(-|$)/i.test(name || '') || name === 'gemini-1.5-flash' || name === 'gemini-1.5-pro';
+}
+
+function geminiUseTabRetry_() {
+  const v = (PropertiesService.getScriptProperties().getProperty('GEMINI_TAB_RETRY') || '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') {
+    return true;
+  }
+  if (v === 'false' || v === '0' || v === 'no') {
+    return false;
+  }
+  return GEMINI_TAB_RETRY_DEFAULT;
+}
+
+function geminiUseJsonSchema_() {
+  const v = (PropertiesService.getScriptProperties().getProperty('GEMINI_USE_JSON_SCHEMA') || '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') {
+    return true;
+  }
+  if (v === 'false' || v === '0' || v === 'no') {
+    return false;
+  }
+  return GEMINI_USE_JSON_SCHEMA_DEFAULT;
+}
+
+function getGeminiModelsForPdf_() {
+  const all = getGeminiModelsToTry_();
+  const raw = PropertiesService.getScriptProperties().getProperty('GEMINI_MODELS_PER_PDF');
+  let n = GEMINI_MODELS_PER_PDF_DEFAULT;
+  if (raw) {
+    const parsed = parseInt(String(raw).replace(/[^0-9]/g, ''), 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      n = parsed;
+    }
+  }
+  return all.slice(0, Math.min(n, all.length));
+}
+
+function geminiRateLimitReturn_(rawOcr, httpCode, quotaExceeded) {
+  return {
+    rawOcr: rawOcr,
+    structured: '',
+    source: 'ocr.space',
+    rateLimited: true,
+    httpCode: httpCode || 429,
+    quotaExceeded: !!quotaExceeded,
+  };
+}
+
+function getGeminiModelsToTry_() {
+  const props = PropertiesService.getScriptProperties();
+  const fromProps = (props.getProperty('GEMINI_MODEL') || '').trim();
+  const candidates = [GEMINI_MODEL];
+  if (fromProps && fromProps !== GEMINI_MODEL) {
+    candidates.unshift(fromProps);
+  }
+  for (let i = 0; i < GEMINI_FALLBACK_MODELS.length; i++) {
+    candidates.push(GEMINI_FALLBACK_MODELS[i]);
+  }
+  const out = [];
+  for (let c = 0; c < candidates.length; c++) {
+    const m = candidates[c];
+    if (!m || out.indexOf(m) !== -1 || isDeprecatedGeminiModel_(m)) {
+      continue;
+    }
+    out.push(m);
+  }
+  return out.length ? out : [GEMINI_MODEL];
+}
+
+/** HTTP 429 / 503 или quota в теле ответа Gemini API. */
+function geminiApiIsRateLimited_(httpCode, responseText) {
+  if (httpCode === 429 || httpCode === 503) {
+    return true;
+  }
+  try {
+    const j = JSON.parse(responseText || '{}');
+    const err = j.error;
+    if (!err) {
+      return false;
+    }
+    const code = err.code;
+    if (code === 429 || code === 503) {
+      return true;
+    }
+    const msg = String(err.message || err.status || '');
+    if (/resource exhausted|quota exceeded|rate limit|too many requests|overloaded/i.test(msg)) {
+      return true;
+    }
+  } catch (ignore) {}
+  return false;
+}
+
+/** Квота Free tier / billing — повтор бесполезен. */
+function geminiApiIsQuotaExceeded_(httpCode, responseText) {
+  const body = String(responseText || '');
+  if (/free_tier|quota exceeded|exceeded your current quota|billing details/i.test(body)) {
+    return true;
+  }
+  try {
+    const j = JSON.parse(body || '{}');
+    const msg = String((j.error && j.error.message) || '');
+    if (/free_tier|quota exceeded|exceeded your current quota|billing/i.test(msg)) {
+      return true;
+    }
+  } catch (ignore) {}
+  return httpCode === 429 && /quota/i.test(body);
+}
+
+/**
+ * @return {{rateLimited:boolean, httpCode:number, quotaExceeded?:boolean}|null} rateLimited — стоп; null — retry
+ */
+function geminiEvaluateRateLimit_(httpCode, responseText, model, mode, attempt, maxAttempts) {
+  if (!geminiApiIsRateLimited_(httpCode, responseText)) {
+    return null;
+  }
+  const quota = geminiApiIsQuotaExceeded_(httpCode, responseText);
+  logGeminiRateLimit_(httpCode, responseText, model, mode);
+  if (quota) {
+    Logger.log('Gemini: квота исчерпана — повтор запроса не выполняется.');
+    return { rateLimited: true, httpCode: httpCode, quotaExceeded: true };
+  }
+  if (attempt >= maxAttempts) {
+    return { rateLimited: true, httpCode: httpCode, quotaExceeded: false };
+  }
+  return null;
+}
+
+function formatGemini429Note_(httpCode, quotaExceeded) {
+  const code = httpCode || 429;
+  if (quotaExceeded) {
+    return (
+      'Gemini: квота API исчерпана (HTTP ' +
+      code +
+      ', Free tier ~20 запросов). OCR выполнен. Включите биллинг в Google AI Studio или дождитесь сброса лимита. ' +
+      'На PDF — один запрос HEADER/TABLE (JSON schema отключён).'
+    );
+  }
+  return (
+    'Gemini: лимит запросов (HTTP ' +
+    code +
+    '). OCR выполнен. Подождите и повторите (пауза ' +
+    Math.round(PAUSE_BETWEEN_PDF_MS / 1000) +
+    ' с между PDF).'
   );
 }
 
-/**
- * Эвристика: конвертер Google иногда выдаёт «мусор» вместо русского текста УПД (артефакты шрифтов, скан без слоя).
- * @return {{readable:boolean, reason:string}}
- */
-function analyzeDocTextQuality_(text) {
-  if (!text || text.length < 25) {
-    return { readable: false, reason: 'Почти пустой текст после конвертации PDF.' };
-  }
-  const cyr = (text.match(/[а-яА-ЯёЁ]/g) || []).length;
-  const lat = (text.match(/[a-zA-Z]/g) || []).length;
-  const letters = cyr + lat;
-  const junkChars = (text.match(/[<>[\]{}|\\`~^'"″«»?&]/g) || []).length;
-  const lower = text.toLowerCase();
-  const keywords = [
-    'счет',
-    'фактур',
-    'продавец',
-    'покупатель',
-    'наименован',
-    'упд',
-    'инн',
-    'стоимость',
-    'ндс',
-    'товар',
-    'услуг',
-    'документ',
-    'передач',
-    'платежно',
-    'расчетн',
-    'к оплате',
-  ];
-  let kwHits = 0;
-  for (let k = 0; k < keywords.length; k++) {
-    if (lower.indexOf(keywords[k]) !== -1) {
-      kwHits++;
-    }
-  }
-
-  if (text.length > 150 && letters < 25) {
-    return {
-      readable: false,
-      reason:
-        'Длинный «текст», но почти нет букв — похоже на мусор после конвертации (не текстовый PDF или битое извлечение).',
-    };
-  }
-  if (text.length > 250 && kwHits === 0 && cyr < 30) {
-    return {
-      readable: false,
-      reason:
-        'Нет характерных слов русского счёта/УПД — конвертация не дала нормальный текстовый слой (часто скан или защищённый/нестандартный PDF).',
-    };
-  }
-  if (letters > 100 && cyr / Math.max(1, letters) < 0.045 && kwHits < 2) {
-    return {
-      readable: false,
-      reason:
-        'Очень мало кириллицы для российского документа — вероятно артефакты шрифтов или изображение страниц вместо текста.',
-    };
-  }
-  if (junkChars / text.length > 0.055 && kwHits < 3 && cyr < 40) {
-    return {
-      readable: false,
-      reason: 'Много служебных символов при почти отсутствии осмысленного русского текста — извлечение из PDF непригодно.',
-    };
-  }
-  return { readable: true, reason: '' };
-}
-
-/**
- * Ищет в документе таблицу с графами товаров (по тексту ячеек УПД/счёт-фактура).
- * @return {{header:Array<string>, rows:Array<Array<string>>, width:number}|null}
- */
-function extractMainGoodsTableFromDoc_(body) {
-  const tables = [];
-  collectTablesFromBody_(body, tables);
-  let best = null;
-  let bestScore = 0;
-  for (let ti = 0; ti < tables.length; ti++) {
-    const matrix = tableToMatrix_(tables[ti]);
-    if (matrix.length < 2) {
-      continue;
-    }
-    const score = scoreTableAsGoods_(matrix);
-    if (score > bestScore) {
-      bestScore = score;
-      best = matrix;
-    }
-  }
-  if (!best || bestScore < 5) {
-    Logger.log('Таблица товаров в Doc не найдена (оценка лучшей ' + bestScore + ', всего таблиц ' + tables.length + ')');
-    return null;
-  }
-  const split = splitHeaderAndDataFromMatrix_(best);
-  return split;
-}
-
-function collectTablesFromBody_(body, out) {
-  for (let i = 0; i < body.getNumChildren(); i++) {
-    collectTablesFromElement_(body.getChild(i), out);
-  }
-}
-
-function collectTablesFromElement_(el, out) {
-  if (el.getType() === DocumentApp.ElementType.TABLE) {
-    const table = el.asTable();
-    out.push(table);
-    for (let r = 0; r < table.getNumRows(); r++) {
-      const row = table.getRow(r);
-      for (let c = 0; c < row.getNumCells(); c++) {
-        const cell = row.getCell(c);
-        for (let k = 0; k < cell.getNumChildren(); k++) {
-          collectTablesFromElement_(cell.getChild(k), out);
-        }
-      }
-    }
+function geminiLogHttpIssue_(code, raw, model, mode) {
+  const body = String(raw || '');
+  if (code === 401 || code === 403) {
+    Logger.log('Gemini [' + mode + '] HTTP ' + code + ': проверьте GEMINI_API_KEY, модель ' + model);
     return;
   }
-  if (el.getNumChildren && el.getNumChildren() > 0) {
-    for (let i = 0; i < el.getNumChildren(); i++) {
-      collectTablesFromElement_(el.getChild(i), out);
-    }
+  if (code === 400 && /API key|API_KEY|apiKey|permission|invalid/i.test(body)) {
+    Logger.log('Gemini [' + mode + '] HTTP 400: ключ API (' + model + '): ' + body.substring(0, 220));
+    return;
+  }
+  if (code !== 200 && code !== 429 && code !== 503) {
+    Logger.log('Gemini [' + mode + '] HTTP ' + code + ' (' + model + '): ' + body.substring(0, 280));
   }
 }
 
-function tableToMatrix_(table) {
-  const out = [];
-  for (let r = 0; r < table.getNumRows(); r++) {
-    const row = table.getRow(r);
-    const cells = [];
-    for (let c = 0; c < row.getNumCells(); c++) {
-      cells.push(
-        row
-          .getCell(c)
-          .getText()
-          .replace(/\u00a0/g, ' ')
-          .replace(/\s+/g, ' ')
-          .trim()
-      );
-    }
-    out.push(cells);
+function logGeminiRateLimit_(httpCode, responseText, model, mode) {
+  Logger.log(
+    'Gemini' +
+      (mode ? ' [' + mode + ']' : '') +
+      ': ошибка ' +
+      (httpCode || 429) +
+      ' (лимит / квота)' +
+      (model ? ', модель ' + model : '') +
+      '.'
+  );
+  if (responseText) {
+    Logger.log('Gemini тело ошибки: ' + String(responseText).substring(0, 400));
   }
-  return out;
 }
 
-function scoreTableAsGoods_(matrix) {
-  const head = matrix
-    .slice(0, Math.min(8, matrix.length))
-    .map(function (row) {
-      return row.join(' ');
-    })
-    .join('\n');
-  let score = 0;
-  if (/наименован/i.test(head)) {
-    score += 12;
-  }
-  if (/код\s*товара|товар\/работ|работ,\s*услуг/i.test(head)) {
-    score += 6;
-  }
-  if (/п\/п|№\s*п/i.test(head)) {
-    score += 4;
-  }
-  if (/стоимость.*без\s*налог|без\s+налог.*всего/i.test(head)) {
-    score += 6;
-  }
-  if (/единиц/i.test(head) && /измерен/i.test(head)) {
-    score += 4;
-  }
-  let maxCols = 0;
-  for (let i = 0; i < matrix.length; i++) {
-    maxCols = Math.max(maxCols, matrix[i].length);
-  }
-  if (maxCols >= 12) {
-    score += 8;
-  } else if (maxCols >= 8) {
-    score += 4;
-  }
-  return score;
-}
-
-function isProbableSubheaderRow_(row) {
-  const j = row.join(' ');
-  if (/наименован|стоимость\s+товаров\s*\(/i.test(j)) {
-    return false;
-  }
-  if (/код|условное|цифров|краткое|обознач/i.test(j)) {
-    return true;
-  }
-  let sum = 0;
-  let n = 0;
-  for (let i = 0; i < row.length; i++) {
-    const t = (row[i] || '').length;
-    if (t) {
-      sum += t;
-      n++;
-    }
-  }
-  const avg = n ? sum / n : 0;
-  return avg > 0 && avg < 22 && row.length >= 6;
-}
-
-function mergeHeaderRows_(r1, r2) {
-  const w = Math.max(r1.length, r2.length);
-  const out = [];
-  for (let c = 0; c < w; c++) {
-    const a = (r1[c] || '').trim();
-    const b = (r2[c] || '').trim();
-    if (a && b && a !== b) {
-      out.push(a + ' — ' + b);
-    } else {
-      out.push(a || b);
-    }
-  }
-  return out;
-}
-
-function splitHeaderAndDataFromMatrix_(matrix) {
-  let stopIdx = matrix.length;
-  for (let s = 0; s < matrix.length; s++) {
-    if (/Всего\s+к\s+оплате/i.test(matrix[s].join(' '))) {
-      stopIdx = s;
-      break;
-    }
-  }
-  const sub = matrix.slice(0, stopIdx);
-
-  let hdrStart = -1;
-  for (let i = 0; i < sub.length; i++) {
-    const line = sub[i].join(' ');
-    if (/наименован/i.test(line) && sub[i].length >= 4) {
-      hdrStart = i;
-      break;
-    }
-  }
-  if (hdrStart === -1) {
-    for (let j = 0; j < sub.length; j++) {
-      const line2 = sub[j].join(' ');
-      if (/код\s*товара|№\s*п\/п/i.test(line2) && sub[j].length >= 4) {
-        hdrStart = j;
-        break;
+function geminiBackoffMs_(attempt, resp) {
+  try {
+    const h = resp.getHeaders();
+    const raw = h['Retry-After'] || h['retry-after'];
+    if (raw) {
+      const sec = parseInt(String(raw).replace(/[^0-9]/g, ''), 10);
+      if (!isNaN(sec) && sec > 0) {
+        return Math.min(sec * 1000, GEMINI_MAX_BACKOFF_MS);
       }
     }
-  }
-  if (hdrStart === -1) {
-    return null;
-  }
+  } catch (ignore) {}
+  return Math.min(GEMINI_RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), GEMINI_MAX_BACKOFF_MS);
+}
 
-  const headerRow1 = sub[hdrStart];
-  let dataStart = hdrStart + 1;
-  let header = headerRow1.slice();
-  const nextRow = hdrStart + 1 < sub.length ? sub[hdrStart + 1] : null;
-  if (nextRow && isProbableSubheaderRow_(nextRow)) {
-    header = mergeHeaderRows_(headerRow1, nextRow);
-    dataStart = hdrStart + 2;
+function geminiStructuredResponseIsUsable_(text) {
+  if (!text || text.length < 20) {
+    return false;
   }
-
-  const dataRows = [];
-  for (let r = dataStart; r < sub.length; r++) {
-    const lineText = sub[r].join(' ');
-    if (/Всего\s+к\s+оплате/i.test(lineText)) {
-      break;
+  if (/===\s*TABLE\s*===/i.test(text)) {
+    const table = parseGeminiTableSection_(text);
+    if (table && table.rows && table.rows.length) {
+      return true;
     }
-    if (/^Итого\b/i.test(lineText) && sub[r].length < Math.max(4, header.length / 2)) {
-      continue;
-    }
-    const nonLetter = lineText.replace(/[\s\d.,\-–—/%№]/gi, '').length;
-    if (nonLetter < 2 && sub[r].length < 4) {
-      continue;
-    }
-    dataRows.push(sub[r]);
   }
+  const parsed = parseGeminiJsonResponse_(text, true);
+  return !!(parsed && parsed.tableRows && parsed.tableRows.length);
+}
 
-  if (!dataRows.length) {
-    return null;
+function normalizeGeminiStructuredText_(text) {
+  let t = normalizeText_(text);
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    t = fence[1].trim();
   }
+  t = t.replace(/\*{1,2}\s*(===\s*HEADER\s*===)\s*\*{0,2}/gi, '$1');
+  t = t.replace(/\*{1,2}\s*(===\s*TABLE\s*===)\s*\*{0,2}/gi, '$1');
+  t = t.replace(/\*{1,2}\s*(===\s*END\s*===)\s*\*{0,2}/gi, '$1');
+  return t;
+}
 
-  const width = Math.max(header.length, maxRowLen_(dataRows));
+function getGeminiInvoiceRowSchema_() {
   return {
-    header: padRow_(header, width),
-    rows: dataRows.map(function (x) {
-      return padRow_(x, width);
-    }),
-    width: width,
+    type: 'OBJECT',
+    properties: {
+      seq: { type: 'STRING' },
+      name: { type: 'STRING' },
+      productCode: { type: 'STRING' },
+      unitCode: { type: 'STRING' },
+      unit: { type: 'STRING' },
+      qty: { type: 'STRING' },
+      price: { type: 'STRING' },
+      costNoVat: { type: 'STRING' },
+      excise: { type: 'STRING' },
+      vatRate: { type: 'STRING' },
+      vatAmount: { type: 'STRING' },
+      costWithVat: { type: 'STRING' },
+      countryCode: { type: 'STRING' },
+      countryName: { type: 'STRING' },
+      declaration: { type: 'STRING' },
+    },
   };
 }
 
-/**
- * @param {string} raw
- * @param {{header:Array,rows:Array,width:number}|null} docTable
- * @param {number} textLength
- * @param {boolean} [conversionOk]
- * @param {string} [conversionNote]
- */
-function parseInvoiceData_(raw, docTable, textLength, conversionOk, conversionNote) {
-  if (conversionOk === false) {
-    const advice =
-      ' Рекомендации: распознать текст в Acrobat/ABBYY и сохранить поисковый PDF; или выгрузить PDF из учётной системы с текстовым слоем; повёрнутые страницы — выпрямить до OCR. В Google — Document AI / Vision API; на ПК — Python (PyMuPDF, pytesseract).';
-    return {
-      invoiceLine: (conversionNote || 'Конвертация PDF→Google Doc не дала читаемый текст.') + advice,
-      seller: '',
-      paymentDoc: '',
-      tableHeader: [],
-      tableRows: [],
-      basis: '',
-      tableWidth: 0,
-    };
-  }
-
-  const text = normalizeText_(raw);
-  const textHint =
-    !text || textLength < 80
-      ? ' Мало текста после конвертации PDF (часто скан или «картинка»). Нужен OCR или PDF с текстовым слоем.'
-      : '';
-
-  let invoiceLine = extractInvoiceHeader_(text);
-  if (!invoiceLine) {
-    invoiceLine = extractInvoiceHeaderAlt_(text);
-  }
-  const seller = extractSeller_(text);
-  const paymentDoc = extractPaymentDoc_(text);
-
-  let table = null;
-  if (docTable && docTable.rows && docTable.rows.length) {
-    table = docTable;
-    Logger.log('Таблица из Google Doc: строк данных ' + table.rows.length + ', колонок ' + table.width);
-  } else {
-    const tableBlock = extractTableBlock_(text);
-    table = parseTableFromBlock_(tableBlock);
-    Logger.log('Таблица из текста: строк ' + (table.rows ? table.rows.length : 0));
-  }
-
-  if ((!table || !table.rows.length) && textHint) {
-    invoiceLine = (invoiceLine || '') + textHint.trim();
-  }
-
-  const basis = extractBasis_(text);
-
-  const tw = table && table.width ? table.width : 0;
+function getGeminiInvoiceResponseSchema_() {
   return {
-    invoiceLine: invoiceLine,
-    seller: seller,
-    paymentDoc: paymentDoc,
-    tableHeader: table && table.header ? table.header : [],
-    tableRows: table && table.rows ? table.rows : [],
-    basis: basis,
-    tableWidth: tw,
+    type: 'OBJECT',
+    properties: {
+      invoiceLine: { type: 'STRING' },
+      seller: { type: 'STRING' },
+      paymentDoc: { type: 'STRING' },
+      basis: { type: 'STRING' },
+      rows: {
+        type: 'ARRAY',
+        items: getGeminiInvoiceRowSchema_(),
+      },
+    },
+    required: ['invoiceLine', 'seller', 'rows'],
   };
 }
 
-function extractInvoiceHeaderAlt_(text) {
-  const re2 = /Универсальн(ый|ое|ая)\s+передаточн(ый|ое|ая)\s+документ[^\n]{0,200}?№\s*([\s\S]{1,200}?)\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
-  const m2 = text.match(re2);
-  if (m2) {
-    return ('УПД № ' + m2[2].replace(/\s+/g, ' ').trim() + ' от ' + m2[3].trim()).replace(/\s+/g, ' ');
+function getGeminiJsonSchemaPrompt_() {
+  return (
+    'Извлеки из OCR-текста счёт-фактуры/УПД все реквизиты и КАЖДУЮ строку товаров (№ п/п по порядку). ' +
+    'Числа и наименования — как в OCR, не выдумывай. Без итоговой строки «Всего к оплате».'
+  );
+}
+
+function logGeminiApiDiagnostics_(json, model) {
+  const pf = json.promptFeedback;
+  if (pf && pf.blockReason) {
+    Logger.log('Gemini blockReason: ' + pf.blockReason + (model ? ' (' + model + ')' : ''));
   }
+  const list = json.candidates || [];
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    if (c.finishReason) {
+      Logger.log('Gemini candidate[' + i + '] finishReason=' + c.finishReason + (model ? ' ' + model : ''));
+    }
+  }
+}
+
+function extractGeminiCandidateText_(json, model) {
+  const list = json.candidates || [];
+  for (let ci = 0; ci < list.length; ci++) {
+    const parts = list[ci].content && list[ci].content.parts;
+    if (!parts || !parts.length) {
+      continue;
+    }
+    let out = '';
+    for (let i = 0; i < parts.length; i++) {
+      out += parts[i].text || '';
+    }
+    if (out.length >= 10) {
+      return out;
+    }
+  }
+  logGeminiApiDiagnostics_(json, model);
   return '';
 }
 
-
-function normalizeText_(t) {
-  return t.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-}
-
-function extractInvoiceHeader_(text) {
-  const re = /Счет[-\s]*фактура\s*№\s*([\s\S]{1,400}?)\s+от\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})/i;
-  const m = text.match(re);
-  if (!m) {
-    return '';
-  }
-  const num = m[1].replace(/\s+/g, ' ').trim();
-  return ('Счет-фактура № ' + num + ' от ' + m[2].trim()).replace(/\s+/g, ' ');
-}
-
-/** Текст после слова «Продавец» (с двоеточием или без). */
-function extractSeller_(text) {
-  const m = text.match(/\bПродавец\s*:?\s*/i);
-  if (!m || m.index === undefined) {
-    return '';
-  }
-  const startContent = m.index + m[0].length;
-  let rest = text.substring(startContent);
-  const stop = rest.search(/\n(?=\s*(Покупатель|Плательщик|Грузоотправитель|Грузополучатель|К платежно|Идентификатор|Адрес|Счет[-\s]*фактура|Универсальн))/i);
-  let chunk = stop === -1 ? rest : rest.substring(0, stop);
-  chunk = chunk.replace(/\n+/g, ' ').trim();
-  return chunk;
-}
-
-function extractAfterLabel_(text, label) {
-  const idx = text.indexOf(label);
-  if (idx === -1) {
-    return '';
-  }
-  let rest = text.substring(idx + label.length);
-  // до следующего известного заголовка или двойного перевода строки
-  const stop = rest.search(/\n(?=\s*(Покупатель|Плательщик|Грузоотправитель|Грузополучатель|К платежно|Идентификатор|Адрес|Счет[-\s]*фактура|Универсальн))/i);
-  let chunk = stop === -1 ? rest : rest.substring(0, stop);
-  chunk = chunk.replace(/\n+/g, ' ').trim();
-  return chunk;
-}
-
-function extractPaymentDoc_(text) {
-  const re = /К\s+платежно[-\s]*расчетному\s+документу\s*№\s*([^\n\r]+)/i;
-  const m = text.match(re);
-  return m ? m[1].trim() : '';
-}
-
-function extractTableBlock_(text) {
-  const marker = /К\s+платежно[-\s]*расчетному\s+документу\s*№/i;
-  const m = text.match(marker);
-  if (!m || m.index === undefined) {
-    return text;
-  }
-  return text.substring(m.index);
-}
-
-function parseTableFromBlock_(block) {
-  const lines = block.split('\n').map(function (l) {
-    return l.replace(/\u00a0/g, ' ').trim();
-  });
-
-  let totalIdx = -1;
-  for (let ti = 0; ti < lines.length; ti++) {
-    if (/Всего\s+к\s+оплате/i.test(lines[ti])) {
-      totalIdx = ti;
-      break;
+function tryGeminiJsonSchemaFromOcrTextAllModels_(ocrText, apiKey) {
+  const models = getGeminiModelsForPdf_();
+  for (let mi = 0; mi < models.length; mi++) {
+    const r = tryGeminiJsonSchemaExtract_(ocrText, apiKey, models[mi]);
+    if (r && r.rateLimited) {
+      return { rateLimited: true, httpCode: r.httpCode || 429, quotaExceeded: r.quotaExceeded };
+    }
+    if (r && r.text) {
+      r.model = models[mi];
+      return r;
+    }
+    if (mi < models.length - 1) {
+      Utilities.sleep(2000);
     }
   }
-  const sliceEnd = totalIdx === -1 ? lines.length : totalIdx;
-  const relevant = lines.slice(0, sliceEnd);
+  return null;
+}
 
-  // Ищем строку заголовка таблицы (УПД / счёт-фактура: много вариантов вёрстки)
-  let headerIndex = -1;
-  for (let i = 0; i < relevant.length; i++) {
-    const l = relevant[i];
-    if (
-      /(наименован|наименование\s+товара)/i.test(l) &&
-      (/№\s*п\/п|п\/п/i.test(l) || /код\s*товара/i.test(l) || /количество|кол-во/i.test(l) || /единиц/i.test(l))
-    ) {
-      headerIndex = i;
-      break;
+function tryGeminiJsonSchemaExtract_(plainText, apiKey, modelName) {
+  const model = modelName || GEMINI_MODEL;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    model +
+    ':generateContent?key=' +
+    encodeURIComponent(apiKey);
+  const snippet =
+    plainText.length > GEMINI_OCR_TEXT_MAX_CHARS
+      ? plainText.substring(0, GEMINI_OCR_TEXT_MAX_CHARS)
+      : plainText;
+  const prompt = getGeminiJsonSchemaPrompt_() + '\n\n--- OCR-текст ---\n\n' + snippet;
+
+  for (let attempt = 1; attempt <= GEMINI_TEXT_MAX_ATTEMPTS; attempt++) {
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0,
+          maxOutputTokens: 8192,
+          responseMimeType: 'application/json',
+          responseSchema: getGeminiInvoiceResponseSchema_(),
+        },
+      }),
+    });
+    const code = resp.getResponseCode();
+    const raw = resp.getContentText();
+    if (code === 404) {
+      Logger.log('Gemini JSON schema 404: ' + model);
+      return null;
     }
-  }
-  if (headerIndex === -1) {
-    for (let i = 0; i < relevant.length; i++) {
-      const l = relevant[i];
-      if (/(наименован|наименование\s+товара)/i.test(l) && l.length > 40) {
-        headerIndex = i;
-        break;
+    if (code === 400) {
+      geminiLogHttpIssue_(code, raw, model, 'JSON schema');
+      const mimeOnly = tryGeminiJsonMimeOnlyExtract_(plainText, apiKey, model);
+      if (mimeOnly) {
+        return mimeOnly;
       }
+      return null;
     }
-  }
-  if (headerIndex === -1) {
-    for (let i = 0; i < relevant.length; i++) {
-      if (/\bкод\b/i.test(relevant[i]) && /наименован/i.test(relevant[i])) {
-        headerIndex = i;
-        break;
-      }
+    const limit = geminiEvaluateRateLimit_(code, raw, model, 'JSON schema', attempt, GEMINI_TEXT_MAX_ATTEMPTS);
+    if (limit && limit.rateLimited) {
+      return limit;
     }
-  }
-
-  if (headerIndex === -1) {
-    return { header: [], rows: [], width: 0 };
-  }
-
-  const headerLine = relevant[headerIndex];
-  const header = splitTableLine_(headerLine);
-
-  const dataRows = [];
-  for (let j = headerIndex + 1; j < relevant.length; j++) {
-    const line = relevant[j];
-    if (!line) {
+    if (!limit && geminiApiIsRateLimited_(code, raw)) {
+      Utilities.sleep(geminiBackoffMs_(attempt, resp));
       continue;
     }
-    if (/Всего\s+к\s+оплате/i.test(line)) {
-      break;
+    if (code !== 200) {
+      geminiLogHttpIssue_(code, raw, model, 'JSON schema');
+      return null;
     }
-    if (/^Основание\s+передачи/i.test(line)) {
-      break;
-    }
-    const cells = splitTableLine_(line);
-    if (cells.length === 0) {
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (e2) {
       continue;
     }
-    // отсекаем «шапку» после таблицы
-    if (/Итого|^Всего\b/i.test(line) && cells.length < header.length / 2) {
-      continue;
+    const out = extractGeminiCandidateText_(json, model);
+    if (out.length >= 10) {
+      Logger.log('Gemini JSON schema: получено ' + out.length + ' симв. (' + model + ')');
+      return { text: out };
     }
-    dataRows.push(padRow_(cells, header.length));
+    Logger.log('Gemini JSON schema: пустой candidate (' + model + ')');
   }
+  return null;
+}
 
-  const width = Math.max(header.length, maxRowLen_(dataRows));
-  return {
-    header: padRow_(header, width),
-    rows: dataRows.map(function (r) {
-      return padRow_(r, width);
+/** JSON без responseSchema (если schema не поддерживается моделью). */
+function tryGeminiJsonMimeOnlyExtract_(plainText, apiKey, modelName) {
+  const model = modelName || GEMINI_MODEL;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    model +
+    ':generateContent?key=' +
+    encodeURIComponent(apiKey);
+  const snippet =
+    plainText.length > GEMINI_OCR_TEXT_MAX_CHARS
+      ? plainText.substring(0, GEMINI_OCR_TEXT_MAX_CHARS)
+      : plainText;
+  const prompt =
+    getGeminiJsonSchemaPrompt_() +
+    '\n\nВерни один JSON-объект с полями invoiceLine, seller, paymentDoc, basis, rows[].\n\n--- OCR ---\n\n' +
+    snippet;
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0,
+        maxOutputTokens: 8192,
+        responseMimeType: 'application/json',
+      },
     }),
-    width: width,
+  });
+  const code = resp.getResponseCode();
+  const raw = resp.getContentText();
+  if (code !== 200) {
+    geminiLogHttpIssue_(code, raw, model, 'JSON mime');
+    return null;
+  }
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+  const out = extractGeminiCandidateText_(json, model);
+  if (out.length >= 10) {
+    Logger.log('Gemini JSON mime: получено ' + out.length + ' симв. (' + model + ')');
+    return { text: out };
+  }
+  return null;
+}
+
+function tryGeminiStructureFromOcrTextAllModels_(ocrText, apiKey, tabFormatOnly) {
+  const models = getGeminiModelsForPdf_();
+  for (let mi = 0; mi < models.length; mi++) {
+    const r = tryGeminiTextExtract_(ocrText, apiKey, models[mi], tabFormatOnly);
+    if (r && r.rateLimited) {
+      return { rateLimited: true, httpCode: r.httpCode || 429, quotaExceeded: r.quotaExceeded };
+    }
+    if (r && r.text) {
+      r.model = models[mi];
+      return r;
+    }
+    if (mi < models.length - 1) {
+      Utilities.sleep(2000);
+    }
+  }
+  return null;
+}
+
+function getGeminiInvoiceTabPrompt_() {
+  return (
+    'По сырому тексту УПД/счёт-фактуры (OCR, возможны ошибки) заполни данные для Google Таблицы.\n' +
+    'Ответ только текстом, без markdown, без JSON.\n' +
+    '===HEADER===\n' +
+    'Счёт-фактура или УПД (№ и дата)\n' +
+    'Продавец: …\n' +
+    'К платежно-расчетному документу № …\n' +
+    'Основание передачи (сдачи) / получения (приемки): …\n' +
+    '===TABLE===\n' +
+    'Ровно ' +
+    CANONICAL_UPD_HEADERS.length +
+    ' колонок в строке, разделитель TAB (\\t). Порядок колонок:\n' +
+    CANONICAL_UPD_HEADERS.join(' | ') +
+    '\n' +
+    'Далее все строки товаров из OCR (№ п/п 1, 2, 3…). Не пропускай позиции. Без «Всего к оплате».\n' +
+    '===END==='
+  );
+}
+
+function getGeminiInvoicePrompt_() {
+  return (
+    getGeminiInvoiceTabPrompt_() +
+    '\n\nЕсли TAB неудобен — один валидный JSON: {"invoiceLine":"…","seller":"…","paymentDoc":"…","basis":"…",' +
+    '"rows":[{"seq":"1","name":"…","productCode":"","unitCode":"796","unit":"шт","qty":"…","price":"…",' +
+    '"costNoVat":"…","excise":"","vatRate":"22%","vatAmount":"…","costWithVat":"…",' +
+    '"countryCode":"","countryName":"","declaration":""}]} — предпочитай HEADER/TABLE.'
+  );
+}
+
+function tryGeminiTextExtract_(plainText, apiKey, modelName, tabFormatOnly) {
+  const model = modelName || GEMINI_MODEL;
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' +
+    model +
+    ':generateContent?key=' +
+    encodeURIComponent(apiKey);
+  const snippet =
+    plainText.length > GEMINI_OCR_TEXT_MAX_CHARS
+      ? plainText.substring(0, GEMINI_OCR_TEXT_MAX_CHARS)
+      : plainText;
+  if (plainText.length > GEMINI_OCR_TEXT_MAX_CHARS) {
+    Logger.log(
+      'Gemini: OCR-текст обрезан до ' + GEMINI_OCR_TEXT_MAX_CHARS + ' симв. (лимит запроса Apps Script).'
+    );
+  }
+  const prompt =
+    (tabFormatOnly ? getGeminiInvoiceTabPrompt_() : getGeminiInvoicePrompt_()) +
+    '\n\n--- Полный OCR-текст документа ---\n\n' +
+    snippet;
+
+  for (let attempt = 1; attempt <= GEMINI_TEXT_MAX_ATTEMPTS; attempt++) {
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      muteHttpExceptions: true,
+      payload: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0, maxOutputTokens: 8192 },
+      }),
+    });
+    const code = resp.getResponseCode();
+    const raw = resp.getContentText();
+    if (code === 404) {
+      Logger.log('Gemini 404: модель ' + model);
+      return null;
+    }
+    const limit = geminiEvaluateRateLimit_(code, raw, model, tabFormatOnly ? 'TAB' : 'text', attempt, GEMINI_TEXT_MAX_ATTEMPTS);
+    if (limit && limit.rateLimited) {
+      return limit;
+    }
+    if (!limit && geminiApiIsRateLimited_(code, raw)) {
+      Utilities.sleep(geminiBackoffMs_(attempt, resp));
+      continue;
+    }
+    if (code !== 200) {
+      geminiLogHttpIssue_(code, raw, model, tabFormatOnly ? 'TAB' : 'text');
+      return null;
+    }
+    let json;
+    try {
+      json = JSON.parse(raw);
+    } catch (e2) {
+      continue;
+    }
+    const out = extractGeminiCandidateText_(json, model);
+    if (out.length >= 10) {
+      Logger.log('Gemini text: получено ' + out.length + ' симв. (' + model + (tabFormatOnly ? ', TAB' : '') + ')');
+      return { text: out };
+    }
+    Logger.log('Gemini text: пустой candidate (' + model + ')');
+  }
+  return null;
+}
+
+function parseInvoiceData_(pack) {
+  if (!pack.conversionOk) {
+    return emptyParsedInvoice_(pack.conversionNote || 'Нет текста OCR');
+  }
+
+  const structured = pack.externalStructured || '';
+  const fromJson = parseGeminiJsonResponse_(structured, false);
+  if (fromJson && fromJson.tableRows.length) {
+    let note = pack.conversionNote || '';
+    if (note) {
+      fromJson.invoiceLine = (fromJson.invoiceLine + ' ' + note).trim();
+    }
+    return fromJson;
+  }
+
+  const hdr = parseStructuredHeaderBlock_(structured) || parseLooseHeaderFromText_(structured) || {};
+  let table = parseGeminiTableSection_(structured);
+  let rows = table && table.rows ? table.rows : [];
+  if (!rows.length) {
+    rows = parseLooseProductTableFromText_(structured);
+  }
+  rows = alignRowsToCanonical_(rows);
+
+  let note = pack.conversionNote || '';
+  if (!rows.length) {
+    if (!structured) {
+      Logger.log(
+        'parseInvoiceData_: externalStructured пустой. ' +
+          (pack.conversionNote || pack.geminiDiag || 'См. строки Gemini выше (ключ, 429, HTTP).')
+      );
+    } else {
+      Logger.log(
+        'parseInvoiceData_: 0 строк, structured ' +
+          structured.length +
+          ' симв.: ' +
+          structured.substring(0, 400).replace(/\n/g, ' ')
+      );
+    }
+    note = (note ? note + ' ' : '') + 'Таблица пуста — проверьте ответ Gemini в логе.';
+  }
+
+  return {
+    invoiceLine: (hdr.invoiceLine || '') + (note ? ' ' + note : ''),
+    seller: hdr.seller || '',
+    paymentDoc: hdr.paymentDoc || '',
+    tableHeader: CANONICAL_UPD_HEADERS.slice(),
+    tableRows: rows,
+    basis: hdr.basis || '',
+    tableWidth: CANONICAL_UPD_HEADERS.length,
   };
 }
 
+function emptyParsedInvoice_(note) {
+  return {
+    invoiceLine: note,
+    seller: '',
+    paymentDoc: '',
+    tableHeader: CANONICAL_UPD_HEADERS.slice(),
+    tableRows: [],
+    basis: '',
+    tableWidth: CANONICAL_UPD_HEADERS.length,
+  };
+}
+
+function parseGeminiJsonResponse_(text, silent) {
+  let raw = String(text || '').trim();
+  if (!raw) {
+    return null;
+  }
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start === -1) {
+    return null;
+  }
+  const jsonSlice = end > start ? raw.substring(start, end + 1) : raw.substring(start);
+  let obj = tryParseGeminiJsonObject_(jsonSlice, silent);
+  if (!obj) {
+    const rowObjs = extractRowObjectsFromJsonText_(raw);
+    if (rowObjs.length) {
+      obj = extractScalarFieldsFromJsonText_(raw) || {};
+      obj.rows = rowObjs;
+      if (!silent) {
+        Logger.log('Gemini JSON: извлечено строк из битого ответа: ' + rowObjs.length);
+      }
+    }
+  }
+  if (!obj) {
+    return null;
+  }
+  return geminiJsonObjectToParsed_(obj);
+}
+
+function tryParseGeminiJsonObject_(jsonSlice, silent) {
+  try {
+    return JSON.parse(jsonSlice);
+  } catch (e) {
+    if (!silent) {
+      Logger.log('Gemini JSON: ' + e.message);
+    }
+  }
+  const repaired = repairGeminiJsonString_(jsonSlice);
+  try {
+    const obj = JSON.parse(repaired);
+    if (!silent) {
+      Logger.log('Gemini JSON: восстановлено (repair).');
+    }
+    return obj;
+  } catch (e2) {
+    if (!silent) {
+      Logger.log('Gemini JSON (repair): ' + e2.message);
+    }
+  }
+  return null;
+}
+
+function repairGeminiJsonString_(s) {
+  let t = String(s || '').trim();
+  t = t.replace(/,\s*([}\]])/g, '$1');
+  t = t
+    .split('')
+    .map(function (ch) {
+      const code = ch.charCodeAt(0);
+      return code < 32 && code !== 9 && code !== 10 && code !== 13 ? ' ' : ch;
+    })
+    .join('');
+  const openBraces = (t.match(/\{/g) || []).length;
+  const closeBraces = (t.match(/\}/g) || []).length;
+  const openBrackets = (t.match(/\[/g) || []).length;
+  const closeBrackets = (t.match(/\]/g) || []).length;
+  for (let i = 0; i < openBrackets - closeBrackets; i++) {
+    t += ']';
+  }
+  for (let j = 0; j < openBraces - closeBraces; j++) {
+    t += '}';
+  }
+  return t;
+}
+
+function extractScalarFieldsFromJsonText_(text) {
+  const out = {};
+  const fields = ['invoiceLine', 'seller', 'paymentDoc', 'basis'];
+  for (let i = 0; i < fields.length; i++) {
+    const key = fields[i];
+    const re = new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"', 'i');
+    const m = String(text || '').match(re);
+    if (m) {
+      out[key] = m[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function extractRowObjectsFromJsonText_(text) {
+  const slice = String(text || '');
+  const rowsKey = slice.search(/"rows"\s*:\s*\[/i);
+  const searchFrom = rowsKey >= 0 ? rowsKey : 0;
+  const out = [];
+  let depth = 0;
+  let start = -1;
+  for (let i = searchFrom; i < slice.length; i++) {
+    const ch = slice.charAt(i);
+    if (ch === '{') {
+      if (depth === 0) {
+        start = i;
+      }
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        const chunk = slice.substring(start, i + 1);
+        if (/"(name|seq)"\s*:/i.test(chunk)) {
+          try {
+            const row = JSON.parse(chunk);
+            if (row && (row.name || row.seq)) {
+              out.push(row);
+            }
+          } catch (ignore) {
+            const fixed = repairGeminiJsonString_(chunk);
+            try {
+              const row2 = JSON.parse(fixed);
+              if (row2 && (row2.name || row2.seq)) {
+                out.push(row2);
+              }
+            } catch (ignore2) {}
+          }
+        }
+        start = -1;
+      }
+    }
+  }
+  return out;
+}
+
+function geminiJsonObjectToParsed_(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return null;
+  }
+  const rowsIn = obj.rows || obj.tableRows || obj.items || [];
+  if (!rowsIn || !rowsIn.length) {
+    return null;
+  }
+  const matrix = [];
+  for (let i = 0; i < rowsIn.length; i++) {
+    const row = rowsIn[i];
+    if (Object.prototype.toString.call(row) === '[object Array]') {
+      matrix.push(row);
+      continue;
+    }
+    if (row && typeof row === 'object') {
+      matrix.push([
+        row.seq != null ? String(row.seq) : '',
+        row.name != null ? String(row.name) : '',
+        row.productCode != null ? String(row.productCode) : '',
+        row.unitCode != null ? String(row.unitCode) : '',
+        row.unit != null ? String(row.unit) : '',
+        row.qty != null ? String(row.qty) : '',
+        row.price != null ? String(row.price) : '',
+        row.costNoVat != null ? String(row.costNoVat) : '',
+        row.excise != null ? String(row.excise) : '',
+        row.vatRate != null ? String(row.vatRate) : '',
+        row.vatAmount != null ? String(row.vatAmount) : '',
+        row.costWithVat != null ? String(row.costWithVat) : '',
+        row.countryCode != null ? String(row.countryCode) : '',
+        row.countryName != null ? String(row.countryName) : '',
+        row.declaration != null ? String(row.declaration) : '',
+      ]);
+    }
+  }
+  const rows = alignRowsToCanonical_(matrix);
+  if (!rows.length) {
+    return null;
+  }
+  return {
+    invoiceLine: String(obj.invoiceLine || obj.invoice || ''),
+    seller: String(obj.seller || ''),
+    paymentDoc: String(obj.paymentDoc || obj.payment || ''),
+    basis: String(obj.basis || ''),
+    tableHeader: CANONICAL_UPD_HEADERS.slice(),
+    tableRows: rows,
+    tableWidth: CANONICAL_UPD_HEADERS.length,
+  };
+}
+
+function parseStructuredHeaderBlock_(text) {
+  const n = normalizeText_(text);
+  if (!/===\s*HEADER\s*===/i.test(n)) {
+    return null;
+  }
+  const hm = n.match(/===\s*HEADER\s*===\s*([\s\S]*?)(?====\s*TABLE\s*===|$)/i);
+  if (!hm) {
+    return null;
+  }
+  const lines = hm[1]
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  let invoiceLine = '';
+  let seller = '';
+  let paymentDoc = '';
+  let basis = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!invoiceLine && /^(Сч[её]т|УПД|Универсальн)/i.test(line)) {
+      invoiceLine = line;
+    } else if (!seller && /\bПродавец\s*:?/i.test(line)) {
+      seller = line.replace(/^.*?Продавец\s*:?\s*/i, '').trim();
+    } else if (!seller && /^(ООО|АО|ЗАО|ПАО|ИП)\s/i.test(line)) {
+      seller = line;
+    } else if (!paymentDoc && /платежно[-\s]*расчетному\s+документу/i.test(line)) {
+      paymentDoc = line.replace(/^.*документу\s*№?\s*/i, '').trim();
+    } else if (!basis && /Основание\s+передачи/i.test(line)) {
+      basis = line.replace(/^.*при[её]мки\)\s*/i, '').trim();
+    }
+  }
+  return { invoiceLine: invoiceLine, seller: seller, paymentDoc: paymentDoc, basis: basis };
+}
+
+/** Заголовок без маркеров ===HEADER=== */
+function parseLooseHeaderFromText_(text) {
+  const n = normalizeText_(text);
+  if (/===\s*HEADER\s*===/i.test(n)) {
+    return null;
+  }
+  const lines = n
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  let invoiceLine = '';
+  let seller = '';
+  let paymentDoc = '';
+  let basis = '';
+  for (let i = 0; i < Math.min(lines.length, 25); i++) {
+    const line = lines[i];
+    if (!invoiceLine && /^(Сч[её]т|УПД|Универсальн)/i.test(line)) {
+      invoiceLine = line;
+    } else if (!seller && /\bПродавец\s*:?/i.test(line)) {
+      seller = line.replace(/^.*?Продавец\s*:?\s*/i, '').trim();
+    } else if (!seller && /^(ООО|АО|ЗАО|ПАО|ИП)\s/i.test(line)) {
+      seller = line;
+    } else if (!paymentDoc && /платежно[-\s]*расчетному\s+документу/i.test(line)) {
+      paymentDoc = line.replace(/^.*документу\s*№?\s*/i, '').trim();
+    } else if (!basis && /Основание\s+передачи/i.test(line)) {
+      basis = line.replace(/^.*при[её]мки\)\s*/i, '').trim();
+    }
+  }
+  if (!invoiceLine && !seller) {
+    return null;
+  }
+  return { invoiceLine: invoiceLine, seller: seller, paymentDoc: paymentDoc, basis: basis };
+}
+
+/** Строки товаров: TAB, несколько табов/пробелов, или JSON уже обработан выше. */
+function parseLooseProductTableFromText_(text) {
+  const n = normalizeText_(text);
+  if (!n || n.indexOf('{') === 0) {
+    return [];
+  }
+  const lines = n.split('\n');
+  const rows = [];
+  const seen = {};
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\u00a0/g, ' ').trim();
+    if (!line || /^(===|```)/.test(line)) {
+      continue;
+    }
+    if (/Всего\s+к\s+оплате|^Итого\b|===\s*END/i.test(line)) {
+      break;
+    }
+    if (/^(наименование|№\s*п\/п|код\s+вида)/i.test(line)) {
+      continue;
+    }
+    let cells = normalizeLooseRowCells_(splitTableLine_(line));
+    if (!cells || cells.length < 3) {
+      continue;
+    }
+    const key = cells.join('\t');
+    if (!seen[key]) {
+      rows.push(cells);
+      seen[key] = true;
+    }
+  }
+
+  // Фолбэк: Gemini иногда склеивает HEADER и TABLE в одну строку.
+  const inline = n.match(/\d{1,4}\t[^\n]+/g) || [];
+  for (let j = 0; j < inline.length; j++) {
+    const cellsInline = normalizeLooseRowCells_(splitTableLine_(inline[j]));
+    if (!cellsInline || cellsInline.length < 3) {
+      continue;
+    }
+    const keyInline = cellsInline.join('\t');
+    if (!seen[keyInline]) {
+      rows.push(cellsInline);
+      seen[keyInline] = true;
+    }
+  }
+  return rows;
+}
+
+function normalizeLooseRowCells_(cells) {
+  if (!cells || !cells.length) {
+    return null;
+  }
+  let idx = -1;
+  for (let i = 0; i < cells.length; i++) {
+    if (/^\d{1,4}$/.test(String(cells[i] || '').trim())) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx === -1) {
+    return null;
+  }
+  let out = cells.slice(idx);
+  if (out.length > CANONICAL_UPD_HEADERS.length) {
+    out = out.slice(0, CANONICAL_UPD_HEADERS.length);
+  }
+  if (!/^\d{1,4}$/.test(String(out[0] || '').trim())) {
+    return null;
+  }
+  return out;
+}
+
+function parseGeminiTableSection_(text) {
+  const n = normalizeText_(text);
+  let tm = n.match(/===\s*TABLE\s*===\s*([\s\S]*?)(?====\s*END\s*===|$)/i);
+  if (!tm) {
+    tm = n.match(/(?:^|\n)\s*TABLE\s*:?\s*\n([\s\S]*?)(?====\s*END\s*===|$)/i);
+  }
+  if (!tm) {
+    return null;
+  }
+  const lines = tm[1]
+    .split('\n')
+    .map(function (l) {
+      return l.replace(/\u00a0/g, ' ').trim();
+    })
+    .filter(function (l) {
+      return l.length > 0;
+    });
+  if (!lines.length) {
+    return null;
+  }
+  let start = 0;
+  if (/наименован|№\s*п\/п/i.test(lines[0]) && lines[0].indexOf('\t') === -1) {
+    start = 1;
+  }
+  const rows = [];
+  for (let i = start; i < lines.length; i++) {
+    if (/Всего\s+к\s+оплате|^Итого\b/i.test(lines[i])) {
+      break;
+    }
+    const cells = splitTableLine_(lines[i]);
+    if (cells.length) {
+      rows.push(cells);
+    }
+  }
+  if (!rows.length) {
+    return null;
+  }
+  return { header: CANONICAL_UPD_HEADERS.slice(), rows: rows, width: CANONICAL_UPD_HEADERS.length };
+}
+
+function alignRowsToCanonical_(rows) {
+  const w = CANONICAL_UPD_HEADERS.length;
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const cells = padRow_(rows[i], w);
+    const name = String(cells[1] || '').trim();
+    if (/^(наименование|№\s*п\/п|код\s+вида)/i.test(name)) {
+      continue;
+    }
+    out.push(cells.slice(0, w));
+  }
+  return out;
+}
+
+function normalizeText_(t) {
+  return String(t || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+}
+
 function splitTableLine_(line) {
-  // Табы — самый частый разделитель после конвертации из Doc
   if (line.indexOf('\t') !== -1) {
     return line.split('\t').map(function (c) {
       return c.trim();
     });
   }
-  // Fallback: два и более пробела
+  if (line.indexOf('|') !== -1) {
+    return line.split('|').map(function (c) {
+      return c.trim();
+    });
+  }
   return line
     .split(/\s{2,}/)
     .map(function (c) {
@@ -1032,60 +1505,55 @@ function padRow_(cells, width) {
   return out;
 }
 
-function maxRowLen_(rows) {
-  let m = 0;
-  for (let i = 0; i < rows.length; i++) {
-    m = Math.max(m, rows[i].length);
+function writeParsedRows_(sheet, items, maxTableCols, folderUrl) {
+  if (!items || !items.length) {
+    return;
   }
-  return m;
-}
+  const tableCols = Math.max(maxTableCols, CANONICAL_UPD_HEADERS.length);
+  const globalHeader = [
+    'Файл',
+    'Счет-фактура (№ и дата)',
+    'Продавец',
+    'К платежно-расчетному документу №',
+  ]
+    .concat(CANONICAL_UPD_HEADERS.slice())
+    .concat(['Основание передачи / счет']);
+  const totalCols = globalHeader.length;
 
-function extractBasis_(text) {
-  const label = 'Основание передачи (сдачи) / получения (приемки)';
-  const idx = text.indexOf(label);
-  if (idx === -1) {
-    return '';
-  }
-  const fromLabel = text.substring(idx + label.length).replace(/^[\s:\-–—]*/, '');
-  const firstLine = (fromLabel.split('\n')[0] || fromLabel).replace(/\s+/g, ' ').trim();
-  const accMatch = fromLabel.match(/Счет\s*№\s*([^\n\r]+)/i);
-  if (accMatch) {
-    return (firstLine + ' | Счет № ' + accMatch[1].trim()).trim();
-  }
-  return firstLine;
-}
-
-function writeParsedRows_(sheet, items, maxTableCols) {
-  sheet.clearContents();
-
-  let globalWidth = maxTableCols;
-  for (let gi = 0; gi < items.length; gi++) {
-    globalWidth = Math.max(globalWidth, items[gi].parsed.tableWidth);
+  const lastRow = sheet.getLastRow();
+  const headerCell = sheet.getRange(1, 1, 1, 1).getValue();
+  const needHeader = lastRow < 1 || String(headerCell) !== 'Файл';
+  if (needHeader && lastRow < 1) {
+    sheet.getRange(1, 1, 1, totalCols).setValues([globalHeader]);
+  } else if (needHeader) {
+    // Лист уже содержит данные, поэтому заголовок не перезаписываем.
+    Logger.log('writeParsedRows_: заголовок не найден (ожидается "Файл"), но данные уже есть — не перезаписываю A1.');
   }
 
-  const globalHeader = buildGlobalHeader_(items, globalWidth);
-  sheet.getRange(1, 1, 1, globalHeader.length).setValues([globalHeader]);
-  const tableCols = globalHeader.length - 5;
+  // Стартуем с конца существующих данных.
+  let rowPtr = Math.max(1, lastRow) + 1;
 
-  let rowPtr = 2;
+  // Строка с ссылкой на папку (одна на пачку запуска).
+  const folderLabel = folderUrl ? 'Папка: ' + folderUrl : 'Папка';
+  sheet.getRange(rowPtr, 1, 1, totalCols).setValues([padRow_([folderLabel], totalCols)]);
+  rowPtr++;
+
+  const dataRows = [];
   for (let i = 0; i < items.length; i++) {
+    if (i > 0) {
+      for (let b = 0; b < BLANK_ROWS_BETWEEN_PDF_FILES; b++) {
+        dataRows.push(padRow_([], totalCols));
+      }
+    }
     const it = items[i];
     const p = it.parsed;
-
-    if (p.tableRows.length === 0) {
-      const single = [
-        it.fileName,
-        p.invoiceLine,
-        p.seller,
-        p.paymentDoc,
-      ]
-        .concat(padRow_(p.tableHeader, tableCols))
+    if (!p.tableRows.length) {
+      const single = [it.fileName, p.invoiceLine, p.seller, p.paymentDoc]
+        .concat(padRow_([], tableCols))
         .concat([p.basis]);
-      sheet.getRange(rowPtr, 1, 1, globalHeader.length).setValues([padRow_(single, globalHeader.length)]);
-      rowPtr++;
+      dataRows.push(padRow_(single, totalCols));
       continue;
     }
-
     for (let r = 0; r < p.tableRows.length; r++) {
       const tr = padRow_(p.tableRows[r], tableCols);
       const row = [
@@ -1096,52 +1564,9 @@ function writeParsedRows_(sheet, items, maxTableCols) {
       ]
         .concat(tr)
         .concat([r === 0 ? p.basis : '']);
-      sheet.getRange(rowPtr, 1, 1, globalHeader.length).setValues([padRow_(row, globalHeader.length)]);
-      rowPtr++;
+      dataRows.push(padRow_(row, totalCols));
     }
   }
-}
 
-function buildGlobalHeader_(items, globalWidth) {
-  let wData = globalWidth;
-  for (let i = 0; i < items.length; i++) {
-    wData = Math.max(wData, items[i].parsed.tableWidth);
-  }
-
-  const base = [
-    'Файл',
-    'Счет-фактура (№ и дата)',
-    'Продавец',
-    'К платежно-расчетному документу №',
-  ];
-
-  if (USE_CANONICAL_TABLE_HEADERS) {
-    const canonLen = CANONICAL_UPD_HEADERS.length;
-    const w = Math.max(wData, canonLen);
-    const cols = [];
-    for (let c = 0; c < w; c++) {
-      if (c < CANONICAL_UPD_HEADERS.length) {
-        cols.push(CANONICAL_UPD_HEADERS[c]);
-      } else {
-        cols.push('Доп. столбец ' + (c + 1));
-      }
-    }
-    return base.concat(cols).concat(['Основание передачи / счет']);
-  }
-
-  let sampleHeader = [];
-  for (let j = 0; j < items.length; j++) {
-    const h = items[j].parsed.tableHeader;
-    if (h.length > sampleHeader.length) {
-      sampleHeader = h.slice();
-    }
-  }
-  const w = Math.max(wData, sampleHeader.length);
-  sampleHeader = padRow_(sampleHeader, w);
-  const cols = [];
-  for (let c = 0; c < w; c++) {
-    const name = sampleHeader[c] && sampleHeader[c].length ? sampleHeader[c] : 'Колонка ' + (c + 1);
-    cols.push(name);
-  }
-  return base.concat(cols).concat(['Основание передачи / счет']);
+  sheet.getRange(rowPtr, 1, dataRows.length, totalCols).setValues(dataRows);
 }

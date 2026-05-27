@@ -1,0 +1,26 @@
+{
+  "env": {
+    "googleappsscript/googleappsscript": true
+  },
+  "plugins": ["googleappsscript"],
+  "extends": ["eslint:recommended"],
+  "parserOptions": {
+    "ecmaVersion": 2020,
+    "sourceType": "script"
+  },
+  "rules": {
+    "no-unused-vars": ["warn", { "args": "none", "varsIgnorePattern": "^(onOpen|runProcessFolder|runProcessFolderForSpreadsheet|showRecognitionSetupHelp)$" }],
+    "no-undef": "error",
+    "no-redeclare": "warn",
+    "no-prototype-builtins": "off",
+    "no-empty": ["error", { "allowEmptyCatch": true }]
+  },
+  "overrides": [
+    {
+      "files": ["*.gs"],
+      "globals": {
+        "MimeType": "readonly"
+      }
+    }
+  ]
+}

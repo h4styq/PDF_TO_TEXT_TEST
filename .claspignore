@@ -1,0 +1,9 @@
+**/**
+!*.gs
+!appsscript.json
+node_modules/**
+fixtures/**
+.git/**
+*.md
+package*.json
+.eslintrc.json
